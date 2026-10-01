@@ -31,6 +31,8 @@ import (
 const (
 	defaultSliceFlushWait = time.Second * 5
 	defaultSliceFlushIdle = time.Second
+	// AutoWriterFlushTimeout explicitly selects the legacy retry-derived flush deadline.
+	AutoWriterFlushTimeout time.Duration = -1
 )
 
 type FileWriter interface {
@@ -184,6 +186,7 @@ func (c *chunkWriter) findWritableSlice(pos uint32, size uint32) *sliceWriter {
 	return nil
 }
 
+// commitThread commits slices in creation order and reports slow metadata calls.
 func (c *chunkWriter) commitThread() {
 	f := c.file
 	defer f.w.free(f)
@@ -206,7 +209,12 @@ func (c *chunkWriter) commitThread() {
 
 		if err == 0 {
 			var ss = meta.Slice{Id: s.id, Size: s.length, Off: s.soff, Len: s.slen}
+			start := time.Now()
+			logger.Debugf("slice commit inode=%d chunk=%d slice=%d phase=metadata", f.inode, c.indx, s.id)
 			err = f.w.m.Write(meta.Background(), f.inode, c.indx, s.off, ss, s.lastMod)
+			if elapsed := time.Since(start); elapsed >= time.Second {
+				logger.Warnf("slow slice commit inode=%d chunk=%d slice=%d metadata=%s errno=%s", f.inode, c.indx, s.id, elapsed, err)
+			}
 			f.w.reader.Invalidate(f.inode, uint64(c.indx)*meta.ChunkSize+uint64(s.off), uint64(ss.Len))
 		}
 
@@ -384,6 +392,7 @@ func (f *fileWriter) updateMtime(t time.Time) {
 	}
 }
 
+// flush waits for pending commits, reporting actual failures and only explicitly configured deadlines.
 func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 	s := time.Now()
 	f.Lock()
@@ -391,12 +400,17 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 	f.flushwaiting++
 
 	var err syscall.Errno
-	var wait = time.Second * time.Duration((f.w.maxRetries+2)*(f.w.maxRetries+2)/2)
-	if wait < time.Minute*5 {
-		wait = time.Minute * 5
+	wait := f.w.flushTimeout()
+	var deadline time.Time
+	if wait > 0 {
+		deadline = s.Add(wait)
 	}
-	var deadline = time.Now().Add(wait)
+	nextWarning := s.Add(5 * time.Minute)
 	for len(f.chunks) > 0 && err == 0 {
+		if f.err != 0 {
+			err = f.err
+			break
+		}
 		for _, c := range f.chunks {
 			for _, s := range c.slices {
 				if !s.freezed {
@@ -405,12 +419,25 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 				}
 			}
 		}
-		if f.flushcond.WaitWithTimeout(time.Second*3) && ctx.Canceled() && time.Since(s) > f.w.conf.Chunk.PutTimeout*2 {
+		poll := 3 * time.Second
+		if !deadline.IsZero() {
+			poll = min(poll, max(time.Until(deadline), 0))
+		}
+		f.flushcond.WaitWithTimeout(poll)
+		// A completed commit wins even if the deadline elapsed while acquiring the lock.
+		if len(f.chunks) == 0 {
+			break
+		}
+		if f.err != 0 {
+			err = f.err
+			break
+		}
+		if ctx.Canceled() && time.Since(s) > f.w.conf.Chunk.PutTimeout*2 {
 			logger.Warnf("flush %d interrupted after %d", f.inode, time.Since(s))
 			err = syscall.EINTR
 			break
 		}
-		if time.Now().After(deadline) {
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
 			logger.Errorf("flush %d timeout after waited %s", f.inode, wait)
 			for _, c := range f.chunks {
 				for _, s := range c.slices {
@@ -422,6 +449,14 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 			logger.Warnf("All goroutines (%d):\n%s", runtime.NumGoroutine(), buf[:n])
 			err = syscall.EIO
 			break
+		}
+		if deadline.IsZero() && !time.Now().Before(nextWarning) {
+			pending := 0
+			for _, c := range f.chunks {
+				pending += len(c.slices)
+			}
+			logger.Warnf("flush %d still waiting after %s: pending_chunks=%d pending_slices=%d; no flush deadline configured", f.inode, time.Since(s), len(f.chunks), pending)
+			nextWarning = time.Now().Add(5 * time.Minute)
 		}
 	}
 	f.flushwaiting--
@@ -468,7 +503,27 @@ type dataWriter struct {
 	maxRetries uint32
 }
 
+// flushTimeout keeps legacy retry coupling opt-in and lets zero mean completion-based waiting.
+func (w *dataWriter) flushTimeout() time.Duration {
+	if w.conf.WriterFlushTimeout == AutoWriterFlushTimeout {
+		const maxTimeout time.Duration = 1<<63 - 1
+		retries := uint64(w.maxRetries) + 2
+		// Check before squaring or converting seconds to nanoseconds to avoid a shorter deadline.
+		maxSeconds := uint64(maxTimeout / time.Second)
+		if retries > (maxSeconds*2+1)/retries {
+			return maxTimeout
+		}
+		return max(time.Second*time.Duration(retries*retries/2), 5*time.Minute)
+	}
+	return w.conf.WriterFlushTimeout
+}
+
+// NewDataWriter validates scheduling settings before starting the background slice flusher.
 func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader DataReader) DataWriter {
+	if conf.WriterFlushTimeout < 0 && conf.WriterFlushTimeout != AutoWriterFlushTimeout {
+		logger.Warnf("invalid writer flush timeout %s: using no deadline; use AutoWriterFlushTimeout for the legacy deadline", conf.WriterFlushTimeout)
+		conf.WriterFlushTimeout = 0
+	}
 	if conf.SliceFlushWait <= 0 {
 		conf.SliceFlushWait = defaultSliceFlushWait
 	}

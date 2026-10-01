@@ -121,6 +121,7 @@ type SecurityConfig struct {
 	EnableSELinux bool
 }
 
+// Config controls VFS caching, write scheduling and flush completion policy.
 type Config struct {
 	Meta                 *meta.Config
 	Format               meta.Format
@@ -137,9 +138,10 @@ type Config struct {
 	BackupSkipTrash      bool
 	SliceFlushWait       time.Duration
 	SliceFlushIdle       time.Duration
-	FastResolve          bool   `json:",omitempty"`
-	AccessLog            string `json:",omitempty"`
-	Subdir               string `json:",omitempty"`
+	WriterFlushTimeout   time.Duration // 0 waits without a deadline; AutoWriterFlushTimeout uses the legacy deadline.
+	FastResolve          bool          `json:",omitempty"`
+	AccessLog            string        `json:",omitempty"`
+	Subdir               string        `json:",omitempty"`
 	PrefixInternal       bool
 	HideInternal         bool
 	RootSquash           *AnonymousAccount `json:",omitempty"`
@@ -692,6 +694,7 @@ func hasReadPerm(flag uint32) bool {
 	return (flag & O_ACCMODE) != syscall.O_WRONLY
 }
 
+// Read flushes pending writes before fetching data and preserves preflush failures.
 func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n int, err syscall.Errno) {
 	size := uint32(len(buf))
 	if IsSpecialNode(ino) {
@@ -787,8 +790,12 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 		return
 	}
 	defer h.Runlock()
+	defer h.removeOp(ctx)
 
-	_ = v.writer.Flush(ctx, ino)
+	// Reads must not expose old metadata when pending writes could not be committed.
+	if err = v.writer.Flush(ctx, ino); err != 0 {
+		return
+	}
 	n, err = h.reader.Read(ctx, off, buf)
 	for err == syscall.EAGAIN {
 		n, err = h.reader.Read(ctx, off, buf)
@@ -796,7 +803,6 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 	if err == syscall.ENOENT {
 		err = syscall.EBADF
 	}
-	h.removeOp(ctx)
 	return
 }
 

@@ -147,7 +147,7 @@ func storageFlags() []cli.Flag {
 		&cli.IntFlag{
 			Name:  "max-deletes",
 			Value: 10,
-			Usage: "number of threads to delete objects",
+			Usage: "number of background threads to delete objects; 0 disables deletion, negative values delete synchronously in the caller (not unlimited concurrency)",
 		},
 		&cli.StringFlag{
 			Name:  "upload-limit",
@@ -226,6 +226,15 @@ func dataCacheFlags() []cli.Flag {
 			Name:  "slice-flush-idle",
 			Value: "1s",
 			Usage: "idle duration before flushing a pending slice",
+		},
+		&cli.StringFlag{
+			Name:  "writer-flush-timeout",
+			Value: "0s",
+			Usage: "deadline for pending file writes; 0s waits until completion, auto uses the legacy retry-derived deadline, positive durations opt into timeout errors",
+			Action: func(_ *cli.Context, value string) error {
+				_, err := parseWriterFlushTimeout(value)
+				return err
+			},
 		},
 		&cli.StringFlag{
 			Name:  "upload-delay",

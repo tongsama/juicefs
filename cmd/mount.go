@@ -280,7 +280,27 @@ func expandPathForEmbedded(addr string) string {
 	return addr
 }
 
+// parseWriterFlushTimeout rejects invalid values rather than silently disabling a deadline.
+func parseWriterFlushTimeout(value string) (time.Duration, error) {
+	if value == "auto" {
+		return vfs.AutoWriterFlushTimeout, nil
+	}
+	if value == "" {
+		return 0, nil
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil || timeout < 0 {
+		return 0, fmt.Errorf("invalid writer-flush-timeout %q: use 0s, auto, or a positive duration", value)
+	}
+	return timeout, nil
+}
+
+// getVfsConf carries validated CLI settings into the VFS completion policy.
 func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chunkConf *chunk.Config) *vfs.Config {
+	flushTimeout, err := parseWriterFlushTimeout(c.String("writer-flush-timeout"))
+	if err != nil {
+		logger.Fatalf("%s", err)
+	}
 	cfg := &vfs.Config{
 		Meta:   metaConf,
 		Format: *format,
@@ -288,18 +308,19 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 			EnableCap:     c.Bool("enable-cap"),
 			EnableSELinux: c.Bool("enable-selinux"),
 		},
-		Version:         version.Version(),
-		Chunk:           chunkConf,
-		BackupMeta:      utils.Duration(c.String("backup-meta")),
-		BackupSkipTrash: c.Bool("backup-skip-trash"),
-		SliceFlushWait:  utils.Duration(c.String("slice-flush-wait")),
-		SliceFlushIdle:  utils.Duration(c.String("slice-flush-idle")),
-		Port:            &vfs.Port{DebugAgent: debugAgent, PyroscopeAddr: c.String("pyroscope")},
-		PrefixInternal:  c.Bool("prefix-internal"),
-		Pid:             os.Getpid(),
-		PPid:            os.Getppid(),
-		UMask:           0xFFFF,
-		HideInternal:    c.Bool("hide-internal"),
+		Version:            version.Version(),
+		Chunk:              chunkConf,
+		BackupMeta:         utils.Duration(c.String("backup-meta")),
+		BackupSkipTrash:    c.Bool("backup-skip-trash"),
+		SliceFlushWait:     utils.Duration(c.String("slice-flush-wait")),
+		SliceFlushIdle:     utils.Duration(c.String("slice-flush-idle")),
+		WriterFlushTimeout: flushTimeout,
+		Port:               &vfs.Port{DebugAgent: debugAgent, PyroscopeAddr: c.String("pyroscope")},
+		PrefixInternal:     c.Bool("prefix-internal"),
+		Pid:                os.Getpid(),
+		PPid:               os.Getppid(),
+		UMask:              0xFFFF,
+		HideInternal:       c.Bool("hide-internal"),
 	}
 
 	if c.IsSet("umask") {

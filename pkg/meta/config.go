@@ -60,7 +60,11 @@ func DefaultConf() *Config {
 	return &Config{Retries: 10, MaxDeletes: 2, Heartbeat: 12 * time.Second, AtimeMode: NoAtime, DirStatFlushPeriod: 1 * time.Second}
 }
 
+// SelfCheck validates client settings and warns about potentially disruptive modes.
 func (c *Config) SelfCheck() {
+	if c.MaxDeletes < 0 {
+		logger.Warnf("max-deletes=%d means synchronous object deletion in the caller, not unlimited deletion concurrency; this can delay compaction and writes. Use a positive max-deletes value for background deletion workers", c.MaxDeletes)
+	}
 	if c.MaxDeletes == 0 {
 		logger.Warnf("Deleting object will be disabled since max-deletes is 0")
 	}
