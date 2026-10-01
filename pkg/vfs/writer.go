@@ -29,7 +29,8 @@ import (
 )
 
 const (
-	flushDuration = time.Second * 5
+	defaultSliceFlushWait = time.Second * 5
+	defaultSliceFlushIdle = time.Second
 )
 
 type FileWriter interface {
@@ -192,7 +193,7 @@ func (c *chunkWriter) commitThread() {
 	for len(c.slices) > 0 {
 		s := c.slices[0]
 		for !s.done {
-			if s.notify.WaitWithTimeout(time.Millisecond*100) && !s.freezed && time.Since(s.started) > flushDuration*2 {
+			if s.notify.WaitWithTimeout(time.Millisecond*100) && !s.freezed && time.Since(s.started) > f.w.conf.SliceFlushWait*2 {
 				s.freezed = true
 				go s.flushData()
 			}
@@ -468,6 +469,12 @@ type dataWriter struct {
 }
 
 func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader DataReader) DataWriter {
+	if conf.SliceFlushWait <= 0 {
+		conf.SliceFlushWait = defaultSliceFlushWait
+	}
+	if conf.SliceFlushIdle <= 0 {
+		conf.SliceFlushIdle = defaultSliceFlushIdle
+	}
 	w := &dataWriter{
 		m:          m,
 		store:      store,
@@ -496,7 +503,8 @@ func (w *dataWriter) flushAll() {
 			for i, c := range f.chunks {
 				hs := len(c.slices) / 2
 				for j, s := range c.slices {
-					if !s.freezed && (now.Sub(s.started) > flushDuration || now.Sub(s.lastMod) > time.Second && now.Sub(s.started) > time.Second ||
+					if !s.freezed && (now.Sub(s.started) > w.conf.SliceFlushWait ||
+						now.Sub(s.lastMod) > w.conf.SliceFlushIdle && now.Sub(s.started) > w.conf.SliceFlushIdle ||
 						tooMany && i%2 == lastBit && j <= hs) {
 						s.freezed = true
 						go s.flushData()

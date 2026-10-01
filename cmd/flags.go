@@ -218,6 +218,16 @@ func dataCacheFlags() []cli.Flag {
 			Usage: "blocks smaller than this size will be staged, 0 means all staged.",
 		},
 		&cli.StringFlag{
+			Name:  "slice-flush-wait",
+			Value: "5s",
+			Usage: "maximum duration before flushing a pending slice",
+		},
+		&cli.StringFlag{
+			Name:  "slice-flush-idle",
+			Value: "1s",
+			Usage: "idle duration before flushing a pending slice",
+		},
+		&cli.StringFlag{
 			Name:  "upload-delay",
 			Value: "0s",
 			Usage: "delayed duration for uploading blocks",

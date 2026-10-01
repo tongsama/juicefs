@@ -292,6 +292,8 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 		Chunk:           chunkConf,
 		BackupMeta:      utils.Duration(c.String("backup-meta")),
 		BackupSkipTrash: c.Bool("backup-skip-trash"),
+		SliceFlushWait:  utils.Duration(c.String("slice-flush-wait")),
+		SliceFlushIdle:  utils.Duration(c.String("slice-flush-idle")),
 		Port:            &vfs.Port{DebugAgent: debugAgent, PyroscopeAddr: c.String("pyroscope")},
 		PrefixInternal:  c.Bool("prefix-internal"),
 		Pid:             os.Getpid(),
