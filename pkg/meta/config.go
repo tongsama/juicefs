@@ -36,24 +36,26 @@ import (
 
 // Config for clients.
 type Config struct {
-	Retries            int
-	MaxDeletes         int
-	SkipDirNlink       int
-	CaseInsensi        bool
-	ReadOnly           bool
-	NoBGJob            bool // disable background jobs like clean-up, backup, etc.
-	OpenCache          time.Duration
-	OpenCacheLimit     uint64 // max number of files to cache (soft limit)
-	Heartbeat          time.Duration
-	MountPoint         string
-	Subdir             string
-	AtimeMode          string
-	DirStatFlushPeriod time.Duration
-	SkipDirMtime       time.Duration
-	Sid                uint64
-	SortDir            bool
-	FastStatfs         bool
-	NetworkInterfaces  []string // list of network interfaces to use for IP discovery (empty means all)
+	Retries             int
+	MaxDeletes          int
+	CompactionGCMode    string // empty or legacy keeps synchronous notification; deferred requires recovery
+	CompactionScheduler string // empty or legacy keeps opportunistic admission; priority uses bounded hints
+	SkipDirNlink        int
+	CaseInsensi         bool
+	ReadOnly            bool
+	NoBGJob             bool // disable background jobs like clean-up, backup, etc.
+	OpenCache           time.Duration
+	OpenCacheLimit      uint64 // max number of files to cache (soft limit)
+	Heartbeat           time.Duration
+	MountPoint          string
+	Subdir              string
+	AtimeMode           string
+	DirStatFlushPeriod  time.Duration
+	SkipDirMtime        time.Duration
+	Sid                 uint64
+	SortDir             bool
+	FastStatfs          bool
+	NetworkInterfaces   []string // list of network interfaces to use for IP discovery (empty means all)
 }
 
 func DefaultConf() *Config {
@@ -62,6 +64,14 @@ func DefaultConf() *Config {
 
 // SelfCheck validates client settings and warns about potentially disruptive modes.
 func (c *Config) SelfCheck() {
+	if err := c.ValidateCompactionScheduler(); err != nil {
+		logger.Warnf("%s; falling back to legacy compaction scheduler", err)
+		c.CompactionScheduler = "legacy"
+	}
+	if err := c.ValidateCompactionGC(); err != nil {
+		logger.Warnf("%s; falling back to legacy compaction GC", err)
+		c.CompactionGCMode = "legacy"
+	}
 	if c.MaxDeletes < 0 {
 		logger.Warnf("max-deletes=%d means synchronous object deletion in the caller, not unlimited deletion concurrency; this can delay compaction and writes. Use a positive max-deletes value for background deletion workers", c.MaxDeletes)
 	}
@@ -76,6 +86,14 @@ func (c *Config) SelfCheck() {
 		logger.Warnf("heartbeat should not be greater than 10 minutes")
 		c.Heartbeat = time.Minute * 10
 	}
+}
+
+// ValidateCompactionScheduler accepts only legacy and bounded advisory priority scheduling.
+func (c *Config) ValidateCompactionScheduler() error {
+	if c.CompactionScheduler == "" || c.CompactionScheduler == "legacy" || c.CompactionScheduler == "priority" {
+		return nil
+	}
+	return fmt.Errorf("invalid compaction-scheduler %q (want legacy or priority)", c.CompactionScheduler)
 }
 
 type Format struct {
@@ -299,4 +317,19 @@ func (f *Format) Decrypt() error {
 	decrypt(&f.SessionToken)
 	f.KeyEncrypted = false
 	return err
+}
+
+// ValidateCompactionGC rejects settings without durable-marker recovery and background deletion.
+func (c *Config) ValidateCompactionGC() error {
+	switch c.CompactionGCMode {
+	case "", "legacy":
+		return nil
+	case "deferred":
+		if c.MaxDeletes <= 0 || c.NoBGJob || c.ReadOnly {
+			return fmt.Errorf("deferred compaction GC requires positive max-deletes and writable session background recovery")
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid compaction-gc-mode %q (want legacy or deferred)", c.CompactionGCMode)
+	}
 }

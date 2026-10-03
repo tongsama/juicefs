@@ -639,7 +639,15 @@ func (cache *cacheStore) getPathFromKey(k cacheKey) string {
 	}
 }
 
+// remove drops cached data and retains the historical warning-only eviction API.
 func (cache *cacheStore) remove(key string, staging bool) {
+	if err := cache.removeLocal(key, staging); err != nil {
+		logger.Warnf("remove local block %s failed: %s", key, err)
+	}
+}
+
+// removeLocal returns unlink failures and retries staged paths even after index removal.
+func (cache *cacheStore) removeLocal(key string, staging bool) error {
 	cache.Lock()
 	delete(cache.pages, key)
 	path := cache.cachePath(key)
@@ -648,21 +656,21 @@ func (cache *cacheStore) remove(key string, staging bool) {
 		if it.size > 0 {
 			cache.used -= int64(it.size + 4096)
 		}
-	} else if cache.scanned || !staging {
-		path = "" // not existed or staging block
+	} else if !staging {
+		path = ""
 	}
 	cache.Unlock()
-
+	var err error
 	if path != "" {
-		if err := cache.removeFile(path); err != nil && !os.IsNotExist(err) {
-			logger.Warnf("remove %s failed: %s", path, err)
-		}
-		if staging {
-			if err := cache.removeStage(key); err != nil && !os.IsNotExist(err) {
-				logger.Warnf("remove stage %s failed: %s", cache.stagePath(key), err)
-			}
+		if e := cache.removeFile(path); e != nil && !os.IsNotExist(e) {
+			err = e
 		}
 	}
+	// Stage files may survive a previous unlink failure even when the cache index is gone.
+	if staging {
+		err = errors.Join(err, cache.removeStage(key))
+	}
+	return err
 }
 
 func (cache *cacheStore) load(key string) (ReadCloser, error) {
@@ -1319,6 +1327,15 @@ func (m *cacheManager) exist(key string) (string, bool) {
 		}
 	}
 	return loc, existed
+}
+
+// retire returns local cache/stage cleanup errors for durably obsolete slices.
+func (m *cacheManager) retire(key string) error {
+	store := m.getStore(key)
+	if store == nil {
+		return errCacheDown
+	}
+	return store.removeLocal(key, true)
 }
 
 func (m *cacheManager) remove(key string, staging bool) {

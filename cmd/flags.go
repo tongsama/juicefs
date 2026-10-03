@@ -23,6 +23,7 @@ import (
 	"runtime"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
+	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/urfave/cli/v2"
 )
 
@@ -150,6 +151,20 @@ func storageFlags() []cli.Flag {
 			Usage: "number of background threads to delete objects; 0 disables deletion, negative values delete synchronously in the caller (not unlimited concurrency)",
 		},
 		&cli.StringFlag{
+			Name: "compaction-gc-mode", Value: "legacy",
+			Usage: "obsolete-slice cleanup notification: legacy waits for queue space; deferred uses durable references and bounded asynchronous hints",
+			Action: func(c *cli.Context, value string) error {
+				return (&meta.Config{CompactionGCMode: value, MaxDeletes: c.Int("max-deletes"), NoBGJob: c.Bool("no-bgjob"), ReadOnly: c.Bool("read-only")}).ValidateCompactionGC()
+			},
+		},
+		&cli.StringFlag{
+			Name: "compaction-scheduler", Value: "legacy",
+			Usage: "background compaction admission: legacy or bounded advisory priority scheduling",
+			Action: func(_ *cli.Context, value string) error {
+				return (&meta.Config{CompactionScheduler: value}).ValidateCompactionScheduler()
+			},
+		},
+		&cli.StringFlag{
 			Name:  "upload-limit",
 			Usage: "bandwidth limit for upload in Mbps",
 		},
@@ -226,6 +241,16 @@ func dataCacheFlags() []cli.Flag {
 			Name:  "slice-flush-idle",
 			Value: "1s",
 			Usage: "idle duration before flushing a pending slice",
+		},
+		&cli.IntFlag{
+			Name: "writer-reuse-window", Value: 4,
+			Usage: "pending slice search distance before freezing old candidates (1..64); does not bypass flush barriers or merge gaps",
+			Action: func(_ *cli.Context, value int) error {
+				if value < 1 || value > 64 {
+					return fmt.Errorf("writer-reuse-window must be between 1 and 64")
+				}
+				return nil
+			},
 		},
 		&cli.StringFlag{
 			Name:  "writer-flush-timeout",

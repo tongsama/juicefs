@@ -3184,6 +3184,7 @@ func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, sli
 	}, m.inodeKey(inode)))
 }
 
+// CopyFileRange copies only a watched source chunk snapshot and commits its shared references atomically.
 func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut uint64, size uint64, flags uint32, copied, outLength *uint64) syscall.Errno {
 	defer m.timeit("CopyFileRange", time.Now())
 	f := m.of.find(fout)
@@ -3245,9 +3246,18 @@ func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, 
 			*outLength = attr.Length
 		}
 
-		var vals [][]string
+		// Watch every source chunk before reading it: compaction changes chunk
+		// lists without changing the inode, and a stale copy must not revive dead refs.
+		var sourceKeys []string
 		for i := offIn / ChunkSize; i <= (offIn+size)/ChunkSize; i++ {
-			val, err := tx.LRange(ctx, m.chunkKey(fin, uint32(i)), 0, -1).Result()
+			sourceKeys = append(sourceKeys, m.chunkKey(fin, uint32(i)))
+		}
+		if err := tx.Watch(ctx, sourceKeys...).Err(); err != nil {
+			return err
+		}
+		var vals [][]string
+		for _, key := range sourceKeys {
+			val, err := tx.LRange(ctx, key, 0, -1).Result()
 			if err != nil {
 				return err
 			}
@@ -3793,6 +3803,7 @@ func (r *redisMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error)
 	return count, err
 }
 
+// doCompactChunk atomically replaces references before notifying obsolete-slice cleanup.
 func (m *redisMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*slice, skipped int, pos uint32, id uint64, size uint32, delayed []byte) syscall.Errno {
 	var rs []*redis.IntCmd // trash disabled: check reference of slices
 	if delayed == nil {
@@ -3855,7 +3866,7 @@ func (m *redisMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*
 		if delayed == nil {
 			for i, s := range ss {
 				if s.id > 0 && rs[i].Err() == nil && rs[i].Val() < 0 {
-					m.deleteSlice(s.id, s.size)
+					m.enqueueCompactionDelete(s.id, s.size)
 				}
 			}
 		}
@@ -5299,6 +5310,7 @@ func (m *redisMeta) loadQuotasForDump(ctx Context, quotaKey string) map[uint64]*
 	return quotas
 }
 
+// doCloneEntry clones one entry while detecting concurrent source chunk replacement.
 func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, ino Ino, originAttr *Attr, cmode uint8, cumask uint16, top bool) syscall.Errno {
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
 		a, err := tx.Get(ctx, m.inodeKey(srcIno)).Bytes()
@@ -5352,6 +5364,18 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 			}
 			if eno := m.Access(ctx, parent, MODE_MASK_W|MODE_MASK_X, &pattr); eno != 0 {
 				return eno
+			}
+		}
+
+		// Pin the source snapshot before any chunk LRANGE. A concurrent
+		// compaction then aborts EXEC instead of restoring an obsolete slice ref.
+		if attr.Typ == TypeFile && attr.Length != 0 {
+			var sourceKeys []string
+			for i := uint64(0); i <= attr.Length/ChunkSize; i++ {
+				sourceKeys = append(sourceKeys, m.chunkKey(srcIno, uint32(i)))
+			}
+			if err := tx.Watch(ctx, sourceKeys...).Err(); err != nil {
+				return err
 			}
 		}
 
@@ -5427,6 +5451,7 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 	}, m.inodeKey(srcIno), m.xattrKey(srcIno)))
 }
 
+// doBatchClone clones a batch with watched source chunk snapshots and shared-reference updates.
 func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries []*Entry, cmode uint8, cumask uint16, result *batchCloneResult) syscall.Errno {
 	type cloneInfo struct {
 		entry   *Entry
@@ -5569,6 +5594,7 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 				cmd    *redis.StringSliceCmd
 			}
 			var ccmds []chunkCmd
+			var sourceKeys []string
 			for _, ino := range srcList {
 				sd, ok := srcData[ino]
 				if !ok {
@@ -5582,7 +5608,9 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 						chunkNum := int(a.Length/ChunkSize) + 1
 						sd.chunks = make([]chunkData, chunkNum)
 						for i := 0; i < chunkNum; i++ {
-							cmd := readPipe.LRange(ctx, m.chunkKey(ino, uint32(i)), 0, -1)
+							key := m.chunkKey(ino, uint32(i))
+							sourceKeys = append(sourceKeys, key)
+							cmd := readPipe.LRange(ctx, key, 0, -1)
 							ccmds = append(ccmds, chunkCmd{srcIno: ino, indx: uint32(i), cmd: cmd})
 						}
 					}
@@ -5591,6 +5619,13 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 				default:
 					logger.Warnf("doBatchClone: unsupported type %d for inode %d, skipping", a.Typ, ino)
 					delete(srcData, ino)
+				}
+			}
+			// All source chunk reads are still only queued locally. Batch WATCH
+			// before executing them so a concurrent compaction invalidates this snapshot.
+			if len(sourceKeys) > 0 {
+				if err := tx.Watch(ctx, sourceKeys...).Err(); err != nil {
+					return err
 				}
 			}
 			if _, err := readPipe.Exec(ctx); err != nil && err != redis.Nil {

@@ -295,8 +295,10 @@ type baseMeta struct {
 	sessCtx Context
 	sessWG  sync.WaitGroup
 
-	dSliceMu sync.Mutex
-	dSliceWG sync.WaitGroup
+	dSliceMu          sync.Mutex
+	dSliceWG          sync.WaitGroup
+	compactionGC      atomic.Pointer[compactionGC]
+	priorityCompactor atomic.Pointer[compactionScheduler]
 
 	dirStatsLock sync.RWMutex
 	dirStats     map[Ino]dirStat
@@ -352,8 +354,9 @@ type baseMeta struct {
 	groupQuotaUsedSpaceG  *prometheus.GaugeVec
 	groupQuotaUsedInodesG *prometheus.GaugeVec
 
-	bgjobDels     *prometheus.CounterVec
-	bgjobDuration *prometheus.HistogramVec
+	compactionGCEvents *prometheus.CounterVec
+	bgjobDels          *prometheus.CounterVec
+	bgjobDuration      *prometheus.HistogramVec
 
 	en engine
 }
@@ -530,6 +533,11 @@ func newBaseMeta(addr string, conf *Config) *baseMeta {
 			[]string{"job"},
 		),
 
+		compactionGCEvents: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "compaction_gc_events_total",
+			Help: "Compaction GC phase outcomes; local success counts callbacks, not removed files; deferred remote intent remains durable.",
+		}, []string{"event"}),
+
 		dirQuotaMetricKeys:   make(map[uint64]bool),
 		userQuotaMetricKeys:  make(map[uint64]bool),
 		groupQuotaMetricKeys: make(map[uint64]bool),
@@ -560,6 +568,7 @@ func (m *baseMeta) InitSharedMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(m.groupQuotaUsedInodesG)
 	reg.MustRegister(m.bgjobDuration)
 	reg.MustRegister(m.bgjobDels)
+	reg.MustRegister(m.compactionGCEvents)
 	reg.MustRegister(m.subdirInfoG)
 
 	// Initialize subdir info metric
@@ -764,6 +773,7 @@ func (m *baseMeta) newSessionInfo() []byte {
 	return buf
 }
 
+// NewSession attaches session workers and optional request-derived compaction scheduling.
 func (m *baseMeta) NewSession(record bool) error {
 	m.sessCtx = Background()
 	ctx := m.sessCtx
@@ -803,6 +813,7 @@ func (m *baseMeta) NewSession(record bool) error {
 	go m.flushDirStat(ctx)
 	go m.flushQuotas(ctx)
 	m.startDeleteSliceTasks() // start MaxDeletes tasks
+	m.startPriorityCompactor()
 
 	if !m.conf.NoBGJob {
 		m.sessWG.Add(4)
@@ -824,6 +835,7 @@ const (
 	bgJobCanceled = "canceled"
 )
 
+// startDeleteSliceTasks starts physical deletion workers and optional nonblocking GC hints.
 func (m *baseMeta) startDeleteSliceTasks() {
 	m.Lock()
 	defer m.Unlock()
@@ -850,9 +862,14 @@ func (m *baseMeta) startDeleteSliceTasks() {
 			}
 		}(m.dslices)
 	}
+	m.startCompactionGC()
 }
 
+// stopDeleteSliceTasks joins the hint dispatcher before closing its deletion transport.
 func (m *baseMeta) stopDeleteSliceTasks() {
+	if g := m.compactionGC.Swap(nil); g != nil {
+		g.close()
+	}
 	m.dSliceMu.Lock()
 	if m.conf.MaxDeletes <= 0 || m.dslices == nil {
 		m.dSliceMu.Unlock()
@@ -966,6 +983,7 @@ func (m *baseMeta) CleanStaleSessions(ctx Context) {
 	}
 }
 
+// CloseSession joins asynchronous metadata work before disconnecting session resources.
 func (m *baseMeta) CloseSession() error {
 	m.FlushSession()
 	m.sesMu.Lock()
@@ -978,6 +996,7 @@ func (m *baseMeta) CloseSession() error {
 	if m.sessCtx != nil {
 		m.sessCtx.Cancel()
 	}
+	m.stopPriorityCompactor()
 	m.sessWG.Wait()
 	m.stopDeleteSliceTasks()
 	logger.Infof("close session %d: %v", m.sid, err)
@@ -2078,6 +2097,7 @@ func (m *baseMeta) InvalidateChunkCache(ctx Context, inode Ino, indx uint32) sys
 	return 0
 }
 
+// Read resolves committed slices and requests advisory compaction from counts already fetched.
 func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (st syscall.Errno) {
 	defer func() {
 		if st == 0 {
@@ -2122,7 +2142,7 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 		if f != nil {
 			tierID = int(f.attr.Tier)
 		}
-		go m.compactChunk(inode, indx, false, false, tierID)
+		m.requestBackgroundCompaction(inode, indx, len(ss), tierID)
 	}
 	return 0
 }
@@ -2193,7 +2213,7 @@ func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice 
 		statTime = time.Since(phaseStart)
 		if numSlices%100 == 99 || numSlices > 350 {
 			if numSlices < maxSlices {
-				go m.compactChunk(inode, indx, false, false, int(attr.Tier))
+				m.requestBackgroundCompaction(inode, indx, numSlices, int(attr.Tier))
 			} else {
 				logger.Debugf("metadata write inode=%d chunk=%d slice=%d phase=compact slices=%d", inode, indx, slice.Id, numSlices)
 				phaseStart = time.Now()

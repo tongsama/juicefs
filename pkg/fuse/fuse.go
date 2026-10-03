@@ -544,6 +544,7 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 	return nil
 }
 
+// GenFuseOpt leaves request deadlines to the operation and preserves explicit kernel interrupts.
 func GenFuseOpt(conf *vfs.Config, options string, mt int, noxattr, noacl bool, maxWrite int) fuse.MountOptions {
 	var opt fuse.MountOptions
 	opt.FsName = "JuiceFS:" + conf.Format.Name
@@ -559,7 +560,9 @@ func GenFuseOpt(conf *vfs.Config, options string, mt int, noxattr, noacl bool, m
 	opt.MaxReadAhead = 1 << 20
 	opt.DirectMount = true
 	opt.DontUmask = true
-	opt.Timeout = time.Minute * 15
+	// A server watchdog can reply EINTR before a pending data/metadata commit finishes.
+	// Zero disables that watchdog; explicit writer deadlines and kernel cancellation still apply.
+	opt.Timeout = 0
 	opt.EnableReadDirPlusAuto = true
 	for _, n := range strings.Split(options, ",") {
 		// TODO allow_root
