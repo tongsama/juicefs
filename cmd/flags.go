@@ -232,6 +232,11 @@ func dataCacheFlags() []cli.Flag {
 			Value: "0",
 			Usage: "blocks smaller than this size will be staged, 0 means all staged.",
 		},
+		&cli.BoolFlag{
+			Name:  "writeback-fsync",
+			Value: true,
+			Usage: "fdatasync staged blocks and fsync their directories before acknowledging writes in writeback mode; disabling it is faster but staged data may be lost on an OS crash",
+		},
 		&cli.StringFlag{
 			Name:  "slice-flush-wait",
 			Value: "5s",
