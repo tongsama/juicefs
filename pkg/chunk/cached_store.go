@@ -564,6 +564,7 @@ type Config struct {
 	DownloadLimit          int64 // bytes per second
 	Writeback              bool
 	WritebackThresholdSize int
+	StagingNoSync          bool // skip fdatasync/directory fsync of staged writeback blocks (unsafe on OS crash)
 	UploadDelay            time.Duration
 	UploadHours            string
 	HashPrefix             bool

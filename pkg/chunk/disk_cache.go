@@ -105,6 +105,9 @@ type cacheStore struct {
 	// newBlockCooldown reduces the initial access time for newly cached staged blocks.
 	// This helps prevent a surge of writes from evicting active read blocks.
 	stagedBlockCooldown time.Duration
+	stagingSync         bool // make staged blocks durable before acknowledging writeback
+	durableMu           sync.Mutex
+	durableDirs         map[string]struct{} // staging dirs whose entries in their parents were synced by this process
 }
 
 func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64, pendingPages int, config *Config, uploader func(key, path string, force bool) bool) *cacheStore {
@@ -138,6 +141,8 @@ func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64
 		uploader:            uploader,
 		opTs:                make(map[time.Duration]func() error),
 		stagedBlockCooldown: config.CacheExpire / 2,
+		stagingSync:         !config.StagingNoSync,
+		durableDirs:         make(map[string]struct{}),
 	}
 	c.stateLock = sync.Mutex{}
 	if config.Writeback {
@@ -507,7 +512,10 @@ func (cache *cacheStore) curFreeRatio() DiskFreeRatio {
 	return usage
 }
 
-func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool, tierID uint8) (err error) {
+// flushPage writes data to path via a tmp file and rename. With durable set, the data is synced before the
+// rename publishes the name, and the rename plus the directory chain are synced afterwards, so an OS crash
+// cannot leave a published block with missing contents or lose its name.
+func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool, tierID uint8, durable bool) (err error) {
 	if !cache.available() {
 		return errCacheDown
 	}
@@ -518,7 +526,8 @@ func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool, tie
 	defer func() {
 		cache.m.cacheWriteHist.Observe(time.Since(start).Seconds())
 	}()
-	cache.createDir(filepath.Dir(path))
+	dir := filepath.Dir(path)
+	cache.createDir(dir)
 	tmp := path + ".tmp"
 
 	var f *os.File
@@ -565,6 +574,13 @@ func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool, tie
 			return
 		}
 	}
+	if durable {
+		if err = cache.checkErr(func() error { return syncStagingFile(f) }); err != nil {
+			logger.Warnf("Sync cache file %s failed: %s", tmp, err)
+			_ = f.Close()
+			return
+		}
+	}
 	if dropCache {
 		dropOSCache(f)
 	}
@@ -574,8 +590,54 @@ func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool, tie
 	}
 	if err = cache.renameFile(tmp, path); err != nil {
 		logger.Warnf("Rename cache file %s -> %s failed: %s", tmp, path, err)
+		return
+	}
+	if durable {
+		if err = cache.syncDirs(dir); err != nil {
+			logger.Warnf("Sync directory of cache file %s failed: %s", path, err)
+			// The name may not survive a crash; withdraw it so the caller falls back to a direct upload.
+			_ = cache.removeFile(path)
+		}
 	}
 	return
+}
+
+// syncDirs persists the entry renamed into dir, then the entry of dir and each ancestor below cache.dir in
+// its parent, stopping at the first dir this process already made durable. A dir is recorded only after its
+// whole chain is synced, so a concurrent writer never skips a parent sync that is still in progress.
+func (cache *cacheStore) syncDirs(dir string) error {
+	if err := cache.checkErr(func() error { return syncStagingDir(dir) }); err != nil {
+		return err
+	}
+	root := filepath.Clean(cache.dir)
+	var chain []string
+	cache.durableMu.Lock()
+	for d := filepath.Clean(dir); d != root && strings.HasPrefix(d, root+string(filepath.Separator)); d = filepath.Dir(d) {
+		if _, ok := cache.durableDirs[d]; ok {
+			break
+		}
+		chain = append(chain, d)
+	}
+	cache.durableMu.Unlock()
+	for _, d := range chain {
+		parent := filepath.Dir(d)
+		if err := cache.checkErr(func() error { return syncStagingDir(parent) }); err != nil {
+			return err
+		}
+	}
+	cache.durableMu.Lock()
+	for _, d := range chain {
+		cache.durableDirs[d] = struct{}{}
+	}
+	cache.durableMu.Unlock()
+	return nil
+}
+
+// forgetDurableDir drops dir after it is removed, so a recreated dir is synced into its parent again.
+func (cache *cacheStore) forgetDurableDir(dir string) {
+	cache.durableMu.Lock()
+	delete(cache.durableDirs, filepath.Clean(dir))
+	cache.durableMu.Unlock()
 }
 
 func (cache *cacheStore) createDir(dir string) {
@@ -746,7 +808,7 @@ func (cache *cacheStore) flush() {
 	for {
 		w := <-cache.pending
 		path := cache.cachePath(w.key)
-		if cache.enabled() && cache.flushPage(path, w.page.Data, w.dropCache, 0) == nil {
+		if cache.enabled() && cache.flushPage(path, w.page.Data, w.dropCache, 0, false) == nil {
 			cache.add(w.key, int32(len(w.page.Data)), uint32(time.Now().Unix()))
 		}
 		cache.Lock()
@@ -798,7 +860,7 @@ func (cache *cacheStore) stage(key string, data []byte, tierID uint8) (string, e
 	}
 	stagingBlocks.Add(1)
 	defer stagingBlocks.Add(-1)
-	err := cache.flushPage(stagingPath, data, false, tierID)
+	err := cache.flushPage(stagingPath, data, false, tierID, cache.stagingSync)
 	if err == nil {
 		cache.m.stageBlocks.Add(1)
 		cache.m.stageBlockBytes.Add(float64(len(data)))
@@ -1044,6 +1106,7 @@ func (cache *cacheStore) scanStaging() {
 			if fi.ModTime().Before(oneMinAgo) {
 				// try to remove empty directory
 				if cache.removeFile(path) == nil {
+					cache.forgetDurableDir(path)
 					logger.Debugf("Remove empty directory: %s", path)
 				}
 			}
@@ -1598,3 +1661,9 @@ func (cf *cacheFile) ReadAt(b []byte, off int64) (n int, err error) {
 	}
 	return
 }
+
+// syncStagingFile and syncStagingDir make staged writeback blocks durable; tests replace them to observe ordering.
+var (
+	syncStagingFile = fdatasyncFile
+	syncStagingDir  = fsyncDir
+)

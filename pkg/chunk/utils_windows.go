@@ -52,3 +52,13 @@ func getDiskUsage(path string) (uint64, uint64, uint64, uint64) {
 func changeMode(dir string, st os.FileInfo, mode os.FileMode) {}
 
 func inRootVolume(dir string) bool { return false }
+
+// fdatasyncFile flushes file data with FlushFileBuffers.
+func fdatasyncFile(f *os.File) error {
+	return f.Sync()
+}
+
+// fsyncDir is a no-op on Windows, where directories cannot be opened for flushing.
+func fsyncDir(dir string) error {
+	return nil
+}
