@@ -77,6 +77,21 @@ func (m *gatedWriteMeta) Write(ctx meta.Context, inode Ino, indx, off uint32, sl
 	return m.Meta.Write(ctx, inode, indx, off, slice, mtime)
 }
 
+// WriteSlices passes the same gate as Write before committing the batch.
+func (m *gatedWriteMeta) WriteSlices(ctx meta.Context, inode Ino, indx uint32, slices []meta.SliceWrite, mtime time.Time) (int, syscall.Errno) {
+	m.mu.Lock()
+	g := m.gates[indx]
+	m.mu.Unlock()
+	select {
+	case m.started <- indx:
+	default:
+	}
+	if g != nil {
+		<-g
+	}
+	return m.Meta.WriteSlices(ctx, inode, indx, slices, mtime)
+}
+
 // awaitCommitStart waits until a commit of chunk indx reaches the gated metadata layer.
 func (m *gatedWriteMeta) awaitCommitStart(t *testing.T, indx uint32) {
 	t.Helper()

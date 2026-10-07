@@ -141,6 +141,7 @@ type Config struct {
 	WriterReuseWindow    int           // Distance before freezing nonmatching old slices; zero uses four.
 	WriterFlushTimeout   time.Duration // 0 waits without a deadline; AutoWriterFlushTimeout uses the legacy deadline.
 	WriterFlushScope     string        // WriterFlushScopeFile (default) or WriterFlushScopeRange for Read/Fallocate barriers.
+	MetaWriteBatch       int           // Maximum slices of one chunk committed per metadata transaction; 0 disables batching.
 	FastResolve          bool          `json:",omitempty"`
 	AccessLog            string        `json:",omitempty"`
 	Subdir               string        `json:",omitempty"`

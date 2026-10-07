@@ -25,6 +25,7 @@ import (
 	"os"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -81,6 +82,8 @@ func createTestVFS(applyMetaConfOption func(metaConfig *meta.Config), metaUri st
 		FuseOpts: &FuseOptions{},
 		// JFS_TEST_WRITER_FLUSH_SCOPE=range reruns the suite with range barriers.
 		WriterFlushScope: os.Getenv("JFS_TEST_WRITER_FLUSH_SCOPE"),
+		// JFS_TEST_META_WRITE_BATCH=N reruns the suite with batched slice commits.
+		MetaWriteBatch: testMetaWriteBatch(),
 	}
 	blob, _ := object.CreateStorage("mem", "", "", "", "")
 	registry := prometheus.NewRegistry() // replace default so only JuiceFS metrics are exposed
@@ -208,6 +211,17 @@ type failingWriteMeta struct {
 // Write rejects the new slice so reads can only see previously committed data.
 func (m *failingWriteMeta) Write(ctx meta.Context, inode meta.Ino, indx, off uint32, slice meta.Slice, mtime time.Time) syscall.Errno {
 	return m.err
+}
+
+// WriteSlices rejects the whole batch like Write rejects a single slice.
+func (m *failingWriteMeta) WriteSlices(ctx meta.Context, inode meta.Ino, indx uint32, slices []meta.SliceWrite, mtime time.Time) (int, syscall.Errno) {
+	return 0, m.err
+}
+
+// testMetaWriteBatch reads the batch size for suite reruns; unset or invalid means disabled.
+func testMetaWriteBatch() int {
+	n, _ := strconv.Atoi(os.Getenv("JFS_TEST_META_WRITE_BATCH"))
+	return n
 }
 
 // TestVFSReadFlushError prevents successful stale reads after a failed slice commit.

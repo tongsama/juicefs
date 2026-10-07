@@ -748,6 +748,10 @@ func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader Dat
 		logger.Warnf("invalid writer flush scope %q: using %q", conf.WriterFlushScope, WriterFlushScopeFile)
 		conf.WriterFlushScope = WriterFlushScopeFile
 	}
+	if conf.MetaWriteBatch < 0 || conf.MetaWriteBatch > 1024 {
+		logger.Warnf("invalid meta write batch %d: disabling batching (valid range 0..1024)", conf.MetaWriteBatch)
+		conf.MetaWriteBatch = 0
+	}
 	if conf.SliceFlushWait <= 0 {
 		conf.SliceFlushWait = defaultSliceFlushWait
 	}
