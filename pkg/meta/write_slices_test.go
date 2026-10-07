@@ -274,3 +274,16 @@ func TestWriteSlicesNoRetryOnUnknownError(t *testing.T) {
 		b.en = orig
 	}
 }
+
+// TestWriteSlicesRedis runs the shared WriteSlices checks on Redis and requires
+// the single-transaction implementation.
+func TestWriteSlicesRedis(t *testing.T) {
+	m, err := newRedisMeta("redis", "127.0.0.1:6379/11", testConfig())
+	if err != nil {
+		t.Skipf("redis not available: %s", err)
+	}
+	if _, ok := m.getBase().en.(sliceBatchWriter); !ok {
+		t.Fatal("redis engine does not implement doWriteSlices")
+	}
+	testWriteSlices(t, newWriteSlicesMeta(t, m))
+}
