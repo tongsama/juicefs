@@ -317,6 +317,7 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 		WriterReuseWindow:  c.Int("writer-reuse-window"),
 		WriterFlushTimeout: flushTimeout,
 		WriterFlushScope:   c.String("writer-flush-scope"),
+		MetaWriteBatch:     c.Int("meta-write-batch"),
 		Port:               &vfs.Port{DebugAgent: debugAgent, PyroscopeAddr: c.String("pyroscope")},
 		PrefixInternal:     c.Bool("prefix-internal"),
 		Pid:                os.Getpid(),

@@ -114,3 +114,38 @@ func TestWriterFlushScopeOptionRejectsInvalid(t *testing.T) {
 		})
 	}
 }
+
+// TestMetaWriteBatchOption carries --meta-write-batch into the VFS configuration, disabled by default.
+func TestMetaWriteBatchOption(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want int
+	}{
+		{nil, 0}, {[]string{"--meta-write-batch", "64"}, 64}, {[]string{"--meta-write-batch", "1024"}, 1024},
+	} {
+		set := flag.NewFlagSet("batch-test", flag.ContinueOnError)
+		for _, f := range clientFlags(1) {
+			if err := f.Apply(set); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := set.Parse(tc.args); err != nil {
+			t.Fatal(err)
+		}
+		cfg := getVfsConf(cli.NewContext(nil, set, nil), meta.DefaultConf(), &meta.Format{}, &chunk.Config{})
+		if cfg.MetaWriteBatch != tc.want {
+			t.Fatalf("%v: batch=%d, want %d", tc.args, cfg.MetaWriteBatch, tc.want)
+		}
+	}
+}
+
+// TestMetaWriteBatchOptionRejectsInvalid rejects sizes outside 0..1024 before a command runs.
+func TestMetaWriteBatchOptionRejectsInvalid(t *testing.T) {
+	for _, input := range []string{"-1", "1025"} {
+		called := false
+		app := &cli.App{Flags: clientFlags(1), Action: func(*cli.Context) error { called = true; return nil }}
+		if err := app.Run([]string{"test", "--meta-write-batch", input}); err == nil || called {
+			t.Fatalf("%s: accepted=%v called=%v", input, err == nil, called)
+		}
+	}
+}

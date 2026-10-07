@@ -278,6 +278,17 @@ func dataCacheFlags() []cli.Flag {
 				return nil
 			},
 		},
+		&cli.IntFlag{
+			Name:  "meta-write-batch",
+			Value: 0,
+			Usage: "maximum slices of one chunk committed in one metadata transaction (0 disables, up to 1024); applies to every commit including fsync",
+			Action: func(_ *cli.Context, value int) error {
+				if value < 0 || value > 1024 {
+					return fmt.Errorf("meta-write-batch must be between 0 and 1024")
+				}
+				return nil
+			},
+		},
 		&cli.StringFlag{
 			Name:  "upload-delay",
 			Value: "0s",
