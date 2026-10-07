@@ -2268,10 +2268,15 @@ func (m *baseMeta) afterWrite(ctx Context, inode Ino, indx uint32, attr *Attr, d
 	}
 }
 
+// errWriteSlicesFallback is returned by doWriteSlices, before changing anything,
+// for a batch the engine will not commit at once (for example one that would
+// take a chunk past maxSlices); WriteSlices then writes the slices one by one.
+const errWriteSlicesFallback = syscall.E2BIG
+
 // batchErrorUnapplied reports errors that a write transaction returns before
 // changing anything, so its slices can safely be retried one by one.
 func batchErrorUnapplied(st syscall.Errno) bool {
-	return st == syscall.ENOENT || st == syscall.EPERM || st == syscall.ENOSPC || st == syscall.EDQUOT
+	return st == syscall.ENOENT || st == syscall.EPERM || st == syscall.ENOSPC || st == syscall.EDQUOT || st == errWriteSlicesFallback
 }
 
 // WriteSlices appends slices to chunk indx in creation order. Engines that

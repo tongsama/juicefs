@@ -3418,6 +3418,16 @@ func (m *dbMeta) doWriteSlices(ctx Context, inode Ino, indx uint32, slices []Sli
 		if nodeAttr.Type != TypeFile {
 			return syscall.EPERM
 		}
+		// Single writes compact a chunk synchronously at maxSlices; a batch must not
+		// jump past it (MySQL keeps a chunk's slices in a 64 KiB BLOB).
+		ck := chunk{Inode: inode, Indx: indx}
+		if _, err := s.MustCols("indx").Get(&ck); err != nil {
+			return err
+		}
+		current := len(ck.Slices) / sliceBytes
+		if current+len(slices) > maxSlices {
+			return errWriteSlicesFallback
+		}
 		oldLength := nodeAttr.Length
 		for _, w := range slices {
 			if newleng := uint64(indx)*ChunkSize + uint64(w.Off) + uint64(w.Slice.Len); newleng > nodeAttr.Length {
@@ -3440,7 +3450,7 @@ func (m *dbMeta) doWriteSlices(ctx Context, inode Ino, indx uint32, slices []Sli
 			buf = append(buf, marshalSlice(w.Off, w.Slice.Id, w.Slice.Size, w.Slice.Off, w.Slice.Len)...)
 			refs[i] = sliceRef{w.Slice.Id, w.Slice.Size, 1}
 		}
-		var insert bool // no compaction check for a newly inserted chunk
+		var insert bool
 		if err = m.upsertSlice(s, inode, indx, buf, &insert); err != nil {
 			return err
 		}
@@ -3451,10 +3461,8 @@ func (m *dbMeta) doWriteSlices(ctx Context, inode Ino, indx uint32, slices []Sli
 			return fmt.Errorf("%d of %d slice references inserted", n, len(refs))
 		}
 		_, err = s.Cols("length", "mtime", "ctime", "mtimensec", "ctimensec").Update(&nodeAttr, &node{Inode: inode})
-		if err == nil && !insert {
-			ck := chunk{Inode: inode, Indx: indx}
-			_, _ = s.MustCols("indx").Get(&ck)
-			*numSlices = len(ck.Slices) / sliceBytes
+		if err == nil {
+			*numSlices = current + len(slices)
 		}
 		if err == nil {
 			for _, w := range slices {

@@ -343,3 +343,52 @@ func TestWriteSlicesSQLite(t *testing.T) {
 	}
 	testWriteSlices(t, newWriteSlicesMeta(t, m))
 }
+
+// fakeSlices builds count slices at offset 0 with IDs from base, without allocating them.
+func fakeSlices(base uint64, count int) []SliceWrite {
+	ws := make([]SliceWrite, count)
+	for i := range ws {
+		ws[i] = SliceWrite{Slice: Slice{Id: base + uint64(i), Size: 4096, Len: 4096}}
+	}
+	return ws
+}
+
+// TestWriteSlicesSQLKeepsChunkBelowMaxSlices refuses, before writing anything, a
+// batch that would take a chunk past maxSlices, so the caller writes it one by
+// one and synchronous compaction runs at maxSlices as for single writes (MySQL
+// stores a chunk's slices in a 64 KiB BLOB).
+func TestWriteSlicesSQLKeepsChunkBelowMaxSlices(t *testing.T) {
+	m, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "jfs-max-slices.db"), testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	m = newWriteSlicesMeta(t, m)
+	bw := m.getBase().en.(sliceBatchWriter)
+	_, f := createIn(t, m, "max")
+	ctx := Background()
+	var n int
+	var delta dirStat
+	var attr Attr
+	if st := bw.doWriteSlices(ctx, f, 0, fakeSlices(1<<40, maxSlices-2), time.Now(), &n, &delta, &attr); st != 0 || n != maxSlices-2 {
+		t.Fatalf("prefill: st=%s slices=%d", st, n)
+	}
+	if st := bw.doWriteSlices(ctx, f, 0, fakeSlices(1<<41, 5), time.Now(), &n, &delta, &attr); st != errWriteSlicesFallback {
+		t.Fatalf("batch past maxSlices: st=%s, want the fallback errno", st)
+	}
+	if !batchErrorUnapplied(errWriteSlicesFallback) {
+		t.Fatal("the fallback errno must make WriteSlices retry one by one")
+	}
+	var ss []Slice
+	if st := m.Read(ctx, f, 0, &ss); st != 0 {
+		t.Fatal(st)
+	}
+	for _, s := range ss {
+		if s.Id >= 1<<41 {
+			t.Fatalf("refused batch was written: %+v", s)
+		}
+	}
+	// A new chunk reports the exact count, so compaction triggers are evaluated as for single writes.
+	if st := bw.doWriteSlices(ctx, f, 1, fakeSlices(1<<42, 3), time.Now(), &n, &delta, &attr); st != 0 || n != 3 {
+		t.Fatalf("new chunk: st=%s slices=%d", st, n)
+	}
+}
