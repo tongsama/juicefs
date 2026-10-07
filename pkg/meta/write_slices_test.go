@@ -18,6 +18,7 @@ package meta
 
 import (
 	"fmt"
+	"path"
 	"reflect"
 	"sync/atomic"
 	"syscall"
@@ -284,6 +285,19 @@ func TestWriteSlicesRedis(t *testing.T) {
 	}
 	if _, ok := m.getBase().en.(sliceBatchWriter); !ok {
 		t.Fatal("redis engine does not implement doWriteSlices")
+	}
+	testWriteSlices(t, newWriteSlicesMeta(t, m))
+}
+
+// TestWriteSlicesSQLite runs the shared WriteSlices checks on SQLite and requires
+// the single-transaction implementation.
+func TestWriteSlicesSQLite(t *testing.T) {
+	m, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "jfs-write-slices.db"), testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	if _, ok := m.getBase().en.(sliceBatchWriter); !ok {
+		t.Fatal("sql engine does not implement doWriteSlices")
 	}
 	testWriteSlices(t, newWriteSlicesMeta(t, m))
 }

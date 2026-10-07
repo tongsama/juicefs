@@ -3401,6 +3401,70 @@ func (m *dbMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice 
 	}, inode))
 }
 
+// doWriteSlices appends slices to one chunk in a single transaction: one
+// upsert of the concatenated slices, one multi-row insert of their references
+// and one update of the inode.
+func (m *dbMeta) doWriteSlices(ctx Context, inode Ino, indx uint32, slices []SliceWrite, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
+	return errno(m.txn(func(s *xorm.Session) error {
+		*delta = dirStat{}
+		nodeAttr := node{Inode: inode}
+		ok, err := s.ForUpdate().Get(&nodeAttr)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return syscall.ENOENT
+		}
+		if nodeAttr.Type != TypeFile {
+			return syscall.EPERM
+		}
+		oldLength := nodeAttr.Length
+		for _, w := range slices {
+			if newleng := uint64(indx)*ChunkSize + uint64(w.Off) + uint64(w.Slice.Len); newleng > nodeAttr.Length {
+				nodeAttr.Length = newleng
+			}
+		}
+		delta.length = int64(nodeAttr.Length - oldLength)
+		delta.space = align4K(nodeAttr.Length) - align4K(oldLength)
+		if err := m.checkQuota(ctx, delta.space, 0, nodeAttr.Uid, nodeAttr.Gid, m.getParents(s, inode, nodeAttr.Parent)...); err != 0 {
+			return err
+		}
+		now := time.Now().UnixNano()
+		nodeAttr.setMtime(mtime.UnixNano())
+		nodeAttr.setCtime(now)
+		m.parseAttr(&nodeAttr, attr)
+
+		buf := make([]byte, 0, len(slices)*sliceBytes)
+		refs := make([]sliceRef, len(slices))
+		for i, w := range slices {
+			buf = append(buf, marshalSlice(w.Off, w.Slice.Id, w.Slice.Size, w.Slice.Off, w.Slice.Len)...)
+			refs[i] = sliceRef{w.Slice.Id, w.Slice.Size, 1}
+		}
+		var insert bool // no compaction check for a newly inserted chunk
+		if err = m.upsertSlice(s, inode, indx, buf, &insert); err != nil {
+			return err
+		}
+		// A slice of beans is inserted with one multi-row INSERT.
+		if n, err := s.Insert(refs); err != nil {
+			return err
+		} else if n != int64(len(refs)) {
+			return fmt.Errorf("%d of %d slice references inserted", n, len(refs))
+		}
+		_, err = s.Cols("length", "mtime", "ctime", "mtimensec", "ctimensec").Update(&nodeAttr, &node{Inode: inode})
+		if err == nil && !insert {
+			ck := chunk{Inode: inode, Indx: indx}
+			_, _ = s.MustCols("indx").Get(&ck)
+			*numSlices = len(ck.Slices) / sliceBytes
+		}
+		if err == nil {
+			for _, w := range slices {
+				m.genLog(ctx, s, now, "WRITE(%d,%d,%d,%d,%d,%d,%d):%d", inode, indx, w.Off, w.Slice.Id, w.Slice.Len, attr.Mtime, attr.Mtimensec, *numSlices)
+			}
+		}
+		return err
+	}, inode))
+}
+
 func (m *dbMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut uint64, size uint64, flags uint32, copied, outLength *uint64) syscall.Errno {
 	defer m.timeit("CopyFileRange", time.Now())
 	f := m.of.find(fout)
