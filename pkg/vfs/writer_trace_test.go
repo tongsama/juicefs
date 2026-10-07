@@ -292,7 +292,9 @@ func TestWriterFlushCallerErrors(t *testing.T) {
 	log := logs.String()
 	require.Regexp(t, `origin=vfs.Read barrier=[1-9][0-9]* phase=begin`, log)
 	require.Regexp(t, `origin=vfs.Fsync barrier=[1-9][0-9]* phase=end errno=28`, log)
-	require.Regexp(t, `origin=vfs.Read barrier=[1-9][0-9]* phase=end errno=28`, log)
+	// With --writer-flush-scope=range the failure may surface in the barrier taken
+	// before the handle lock.
+	require.Regexp(t, `origin=vfs.Read(\.prelock)? barrier=[1-9][0-9]* phase=end errno=28`, log)
 }
 
 // TestWriterReuseRestrictions keeps gaps, intervening overlaps and complete blocks immutable.

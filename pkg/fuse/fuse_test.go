@@ -100,6 +100,8 @@ func mount(url, mp string) {
 		Format:   *format,
 		Chunk:    &chunkConf,
 		FuseOpts: &vfs.FuseOptions{},
+		// JFS_TEST_WRITER_FLUSH_SCOPE=range reruns the suite with range barriers.
+		WriterFlushScope: os.Getenv("JFS_TEST_WRITER_FLUSH_SCOPE"),
 	}
 
 	err = m.NewSession(true)

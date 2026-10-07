@@ -24,6 +24,7 @@ import (
 
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/urfave/cli/v2"
 )
 
@@ -264,6 +265,17 @@ func dataCacheFlags() []cli.Flag {
 			Action: func(_ *cli.Context, value string) error {
 				_, err := parseWriterFlushTimeout(value)
 				return err
+			},
+		},
+		&cli.StringFlag{
+			Name:  "writer-flush-scope",
+			Value: vfs.WriterFlushScopeFile,
+			Usage: "pending writes committed before read and fallocate: file waits for the whole file, range only for the touched chunks; fsync and close always wait for the whole file",
+			Action: func(_ *cli.Context, value string) error {
+				if value != vfs.WriterFlushScopeFile && value != vfs.WriterFlushScopeRange {
+					return fmt.Errorf("invalid writer-flush-scope %q: use file or range", value)
+				}
+				return nil
 			},
 		},
 		&cli.StringFlag{

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"os"
 	"reflect"
 	"slices"
 	"strings"
@@ -78,6 +79,8 @@ func createTestVFS(applyMetaConfOption func(metaConfig *meta.Config), metaUri st
 			CacheDir:    "memory",
 		},
 		FuseOpts: &FuseOptions{},
+		// JFS_TEST_WRITER_FLUSH_SCOPE=range reruns the suite with range barriers.
+		WriterFlushScope: os.Getenv("JFS_TEST_WRITER_FLUSH_SCOPE"),
 	}
 	blob, _ := object.CreateStorage("mem", "", "", "", "")
 	registry := prometheus.NewRegistry() // replace default so only JuiceFS metrics are exposed

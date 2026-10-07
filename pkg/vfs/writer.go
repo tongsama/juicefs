@@ -33,6 +33,12 @@ const (
 	defaultSliceFlushIdle = time.Second
 	// AutoWriterFlushTimeout explicitly selects the legacy retry-derived flush deadline.
 	AutoWriterFlushTimeout time.Duration = -1
+
+	// WriterFlushScopeFile makes Read and Fallocate wait for every pending write of the file.
+	WriterFlushScopeFile = "file"
+	// WriterFlushScopeRange makes Read and Fallocate wait only for pending writes of the
+	// chunks they touch (and the slices those depend on); fsync and close stay whole-file.
+	WriterFlushScopeRange = "range"
 )
 
 type FileWriter interface {
@@ -46,8 +52,11 @@ type FileWriter interface {
 type DataWriter interface {
 	Open(inode Ino, fleng uint64, tierID uint8) FileWriter
 	Flush(ctx meta.Context, inode Ino) syscall.Errno
+	FlushRange(ctx meta.Context, inode Ino, off, size uint64) syscall.Errno
 	GetLength(inode Ino) uint64
 	Truncate(inode Ino, length uint64)
+	GrowTo(inode Ino, length uint64)
+	UpdateMeta(inode Ino, update func() syscall.Errno) syscall.Errno
 	UpdateMtime(inode Ino, mtime time.Time)
 	FlushAll() error
 }
@@ -220,11 +229,24 @@ func (c *chunkWriter) commitThread() {
 		err := s.err
 		f.Unlock()
 
-		if err == 0 {
+		var mtime time.Time
+		var gen uint64
+		ordered := err == 0
+		if ordered {
+			// Chunks commit concurrently; choosing the mtime and applying it in the
+			// same order (metadata writes of an inode are serialized anyway) keeps an
+			// older slice from moving the file mtime back.
+			f.commitMu.Lock()
+			f.Lock()
+			mtime, gen = s.lastMod, f.mtimeGen
+			if mtime.Before(f.mtimeFloor) {
+				mtime = f.mtimeFloor
+			}
+			f.Unlock()
 			var ss = meta.Slice{Id: s.id, Size: s.length, Off: s.soff, Len: s.slen}
 			start := time.Now()
 			logger.Debugf("slice commit inode=%d chunk=%d slice=%d phase=metadata", f.inode, c.indx, s.id)
-			err = f.w.m.Write(meta.Background(), f.inode, c.indx, s.off, ss, s.lastMod)
+			err = f.w.m.Write(meta.Background(), f.inode, c.indx, s.off, ss, mtime)
 			if elapsed := time.Since(start); elapsed >= time.Second {
 				logger.Warnf("slow slice commit inode=%d chunk=%d slice=%d metadata=%s errno=%s", f.inode, c.indx, s.id, elapsed, err)
 			}
@@ -243,10 +265,19 @@ func (c *chunkWriter) commitThread() {
 			}
 			f.err = err
 			logger.Errorf("write inode:%d indx:%d %s", f.inode, c.indx, err)
+		} else if gen == f.mtimeGen {
+			f.raiseMtimeFloor(mtime)
+		}
+		if ordered {
+			f.commitMu.Unlock()
 		}
 		s.committed = true
 		if s.growing {
 			f.commitcond.Broadcast()
+		}
+		if f.rangewaiting > 0 {
+			// Range barriers wait for specific slices rather than for every chunk to drain.
+			f.flushcond.Broadcast()
 		}
 		c.slices = c.slices[1:]
 	}
@@ -263,11 +294,15 @@ type fileWriter struct {
 	tierID       uint8
 	err          syscall.Errno
 	flushwaiting uint16
+	rangewaiting uint16 // range barriers in progress; they never block writes
 	writewaiting uint16
 	refs         uint16
 	chunks       map[uint32]*chunkWriter
+	mtimeFloor   time.Time  // newest mtime this writer has recorded; later commits never go below it
+	mtimeGen     uint64     // bumped by explicit mtime updates so in-flight commits do not restore the floor
+	commitMu     sync.Mutex // orders mtime choice with metadata updates; taken before the file lock
 
-	flushcond  *utils.Cond // wait for chunks==nil (flush)
+	flushcond  *utils.Cond // wait for chunks==nil (flush) or committed slices (flushRange)
 	writecond  *utils.Cond // wait for flushwaiting==0 (write)
 	commitcond *utils.Cond // wait for committed==true of dependency slice (commit)
 }
@@ -395,14 +430,88 @@ func (f *fileWriter) Write(ctx meta.Context, off uint64, data []byte) syscall.Er
 	return f.err
 }
 
+// raiseMtimeFloor records that the file's mtime has reached t; the caller holds the file lock.
+func (f *fileWriter) raiseMtimeFloor(t time.Time) {
+	if t.After(f.mtimeFloor) {
+		f.mtimeFloor = t
+	}
+}
+
+// updateMtime applies an explicit mtime (utimes) to pending slices and drops the
+// floor, so an older explicit time is not overridden by earlier commits.
 func (f *fileWriter) updateMtime(t time.Time) {
+	f.commitMu.Lock()
+	defer f.commitMu.Unlock()
 	f.Lock()
 	defer f.Unlock()
+	f.mtimeFloor = time.Time{}
+	f.mtimeGen++
 	for _, c := range f.chunks {
 		for _, s := range c.slices {
 			s.lastMod = t
 		}
 	}
+}
+
+// flushWait describes what a writer barrier must commit before it returns.
+// All callbacks run with the file lock held.
+type flushWait struct {
+	done    func() bool                  // reports that every slice of the barrier is committed
+	freeze  func(trace writerFlushTrace) // freezes the slices the barrier needs; repeated each round
+	pending func() (chunks, slices int)  // counts what is still pending, for progress warnings
+	dump    func()                       // logs the pending slices when an explicit deadline expires
+}
+
+// waitFlushed blocks with the file lock held until the barrier completes, a real
+// writer error appears, the caller is interrupted, or an explicitly configured
+// deadline elapses. Elapsed time alone never turns a healthy wait into an error.
+func (f *fileWriter) waitFlushed(ctx meta.Context, trace writerFlushTrace, start time.Time, fw flushWait) (err syscall.Errno) {
+	wait := f.w.flushTimeout()
+	var deadline time.Time
+	if wait > 0 {
+		deadline = start.Add(wait)
+	}
+	nextWarning := start.Add(5 * time.Minute)
+	for !fw.done() && err == 0 {
+		if f.err != 0 {
+			err = f.err
+			break
+		}
+		fw.freeze(trace)
+		poll := 3 * time.Second
+		if !deadline.IsZero() {
+			poll = min(poll, max(time.Until(deadline), 0))
+		}
+		f.flushcond.WaitWithTimeout(poll)
+		// A completed commit wins even if the deadline elapsed while acquiring the lock.
+		if fw.done() {
+			break
+		}
+		if f.err != 0 {
+			err = f.err
+			break
+		}
+		if ctx.Canceled() && time.Since(start) > f.w.conf.Chunk.PutTimeout*2 {
+			logger.Warnf("flush %d interrupted after %d", f.inode, time.Since(start))
+			err = syscall.EINTR
+			break
+		}
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			logger.Errorf("flush %d timeout after waited %s", f.inode, wait)
+			fw.dump()
+			buf := make([]byte, 1<<20)
+			n := runtime.Stack(buf, true)
+			logger.Warnf("All goroutines (%d):\n%s", runtime.NumGoroutine(), buf[:n])
+			err = syscall.EIO
+			break
+		}
+		if deadline.IsZero() && !time.Now().Before(nextWarning) {
+			chunks, slices := fw.pending()
+			logger.Warnf("flush %d still waiting after %s: pending_chunks=%d pending_slices=%d; no flush deadline configured", f.inode, time.Since(start), chunks, slices)
+			nextWarning = time.Now().Add(5 * time.Minute)
+		}
+	}
+	return err
 }
 
 // flush waits for pending commits, reporting actual failures and only explicitly configured deadlines.
@@ -414,68 +523,142 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) (err syscall.Errno)
 	defer f.Unlock()
 	f.flushwaiting++
 
-	wait := f.w.flushTimeout()
-	var deadline time.Time
-	if wait > 0 {
-		deadline = s.Add(wait)
-	}
-	nextWarning := s.Add(5 * time.Minute)
-	for len(f.chunks) > 0 && err == 0 {
-		if f.err != 0 {
-			err = f.err
-			break
-		}
-		for _, c := range f.chunks {
-			for _, s := range c.slices {
-				if !s.freezed {
-					s.freezeWithTrace("explicit_flush", trace)
+	err = f.waitFlushed(ctx, trace, s, flushWait{
+		done: func() bool { return len(f.chunks) == 0 },
+		freeze: func(trace writerFlushTrace) {
+			for _, c := range f.chunks {
+				for _, s := range c.slices {
+					if !s.freezed {
+						s.freezeWithTrace("explicit_flush", trace)
+					}
 				}
 			}
-		}
-		poll := 3 * time.Second
-		if !deadline.IsZero() {
-			poll = min(poll, max(time.Until(deadline), 0))
-		}
-		f.flushcond.WaitWithTimeout(poll)
-		// A completed commit wins even if the deadline elapsed while acquiring the lock.
-		if len(f.chunks) == 0 {
-			break
-		}
-		if f.err != 0 {
-			err = f.err
-			break
-		}
-		if ctx.Canceled() && time.Since(s) > f.w.conf.Chunk.PutTimeout*2 {
-			logger.Warnf("flush %d interrupted after %d", f.inode, time.Since(s))
-			err = syscall.EINTR
-			break
-		}
-		if !deadline.IsZero() && !time.Now().Before(deadline) {
-			logger.Errorf("flush %d timeout after waited %s", f.inode, wait)
+		},
+		pending: func() (int, int) {
+			pending := 0
+			for _, c := range f.chunks {
+				pending += len(c.slices)
+			}
+			return len(f.chunks), pending
+		},
+		dump: func() {
 			for _, c := range f.chunks {
 				for _, s := range c.slices {
 					logger.Errorf("pending slice %d-%d: %+v", f.inode, c.indx, *s)
 				}
 			}
-			buf := make([]byte, 1<<20)
-			n := runtime.Stack(buf, true)
-			logger.Warnf("All goroutines (%d):\n%s", runtime.NumGoroutine(), buf[:n])
-			err = syscall.EIO
-			break
-		}
-		if deadline.IsZero() && !time.Now().Before(nextWarning) {
-			pending := 0
-			for _, c := range f.chunks {
-				pending += len(c.slices)
-			}
-			logger.Warnf("flush %d still waiting after %s: pending_chunks=%d pending_slices=%d; no flush deadline configured", f.inode, time.Since(s), len(f.chunks), pending)
-			nextWarning = time.Now().Add(5 * time.Minute)
-		}
-	}
+		},
+	})
 	f.flushwaiting--
 	if f.flushwaiting == 0 && f.writewaiting > 0 {
 		f.writecond.Broadcast()
 	}
+	if err == 0 {
+		err = f.err
+	}
+	return err
+}
+
+// rangeFlushSet returns the uncommitted slices a barrier for [off, off+size) must
+// wait for: every slice pending in the chunks the range touches at this moment,
+// plus their dependency closure. A slice whose dep (the growing slice of an
+// earlier chunk) is uncommitted cannot commit before it, and that chunk commits
+// in creation order, so its slices up to dep are included, recursively.
+// Writes that arrive later are not included, so a busy file cannot starve the barrier.
+// The caller holds the file lock.
+func (f *fileWriter) rangeFlushSet(off, size uint64) []*sliceWriter {
+	var set []*sliceWriter
+	seen := make(map[*sliceWriter]bool)
+	add := func(s *sliceWriter) {
+		if !seen[s] {
+			seen[s] = true
+			set = append(set, s)
+		}
+	}
+	if size == 0 {
+		size = 1
+	}
+	first, last := off/meta.ChunkSize, (off+size-1)/meta.ChunkSize
+	if uint64(len(f.chunks)) < last-first+1 {
+		for indx, c := range f.chunks {
+			if uint64(indx) >= first && uint64(indx) <= last {
+				for _, s := range c.slices {
+					add(s)
+				}
+			}
+		}
+	} else {
+		for indx := first; indx <= last; indx++ {
+			if c := f.chunks[uint32(indx)]; c != nil {
+				for _, s := range c.slices {
+					add(s)
+				}
+			}
+		}
+	}
+	for i := 0; i < len(set); i++ {
+		d := set[i].dep
+		if d == nil || d.committed {
+			continue
+		}
+		for _, s := range d.chunk.slices {
+			add(s)
+			if s == d {
+				break
+			}
+		}
+	}
+	return set
+}
+
+// flushRange commits the pending writes that a Read or Fallocate of [off, off+size)
+// depends on, without stopping writes elsewhere in the file. It shares flush's
+// error, interruption and deadline handling; a failure of any earlier commit of
+// the file is still returned, as with a whole-file flush.
+func (f *fileWriter) flushRange(ctx meta.Context, off, size uint64) (err syscall.Errno) {
+	trace := beginWriterFlush(ctx, f.inode)
+	defer func() { trace.end(err) }()
+	s := time.Now()
+	f.Lock()
+	defer f.Unlock()
+	set := f.rangeFlushSet(off, size)
+	f.rangewaiting++
+	err = f.waitFlushed(ctx, trace, s, flushWait{
+		done: func() bool {
+			for _, s := range set {
+				if !s.committed {
+					return false
+				}
+			}
+			return true
+		},
+		freeze: func(trace writerFlushTrace) {
+			for _, s := range set {
+				if !s.freezed {
+					s.freezeWithTrace("explicit_flush", trace)
+				}
+			}
+		},
+		pending: func() (int, int) {
+			chunks := make(map[*chunkWriter]struct{})
+			pending := 0
+			for _, s := range set {
+				if !s.committed {
+					chunks[s.chunk] = struct{}{}
+					pending++
+				}
+			}
+			return len(chunks), pending
+		},
+		dump: func() {
+			for _, s := range set {
+				if !s.committed {
+					logger.Errorf("pending slice %d-%d: %+v", f.inode, s.chunk.indx, *s)
+				}
+			}
+		},
+	})
+	f.rangewaiting--
 	if err == 0 {
 		err = f.err
 	}
@@ -499,6 +682,17 @@ func (f *fileWriter) GetLength() uint64 {
 	f.Lock()
 	defer f.Unlock()
 	return f.length
+}
+
+// GrowTo raises the writer length to at least length and never shrinks it.
+// Fallocate uses it after a range barrier, where the metadata length may not yet
+// include uncommitted appends outside the range.
+func (f *fileWriter) GrowTo(length uint64) {
+	f.Lock()
+	defer f.Unlock()
+	if length > f.length {
+		f.length = length
+	}
 }
 
 func (f *fileWriter) Truncate(length uint64) {
@@ -547,6 +741,12 @@ func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader Dat
 	}
 	if conf.WriterReuseWindow == 0 {
 		conf.WriterReuseWindow = 4
+	}
+	if conf.WriterFlushScope == "" {
+		conf.WriterFlushScope = WriterFlushScopeFile
+	} else if conf.WriterFlushScope != WriterFlushScopeFile && conf.WriterFlushScope != WriterFlushScopeRange {
+		logger.Warnf("invalid writer flush scope %q: using %q", conf.WriterFlushScope, WriterFlushScopeFile)
+		conf.WriterFlushScope = WriterFlushScopeFile
 	}
 	if conf.SliceFlushWait <= 0 {
 		conf.SliceFlushWait = defaultSliceFlushWait
@@ -649,6 +849,15 @@ func (w *dataWriter) Flush(ctx meta.Context, inode Ino) syscall.Errno {
 	return 0
 }
 
+// FlushRange commits the pending writes that a Read or Fallocate of [off, off+size) depends on.
+func (w *dataWriter) FlushRange(ctx meta.Context, inode Ino, off, size uint64) syscall.Errno {
+	f := w.find(inode)
+	if f != nil {
+		return f.flushRange(ctx, off, size)
+	}
+	return 0
+}
+
 func (w *dataWriter) GetLength(inode Ino) uint64 {
 	f := w.find(inode)
 	if f != nil {
@@ -662,6 +871,33 @@ func (w *dataWriter) Truncate(inode Ino, len uint64) {
 	if f != nil {
 		f.Truncate(len)
 	}
+}
+
+// GrowTo raises the writer length of inode without shrinking it.
+func (w *dataWriter) GrowTo(inode Ino, length uint64) {
+	f := w.find(inode)
+	if f != nil {
+		f.GrowTo(length)
+	}
+}
+
+// UpdateMeta runs a metadata update that sets the file mtime to about now (such as
+// fallocate) in order with the inode's slice commits, and keeps later commits
+// from recording an older mtime.
+func (w *dataWriter) UpdateMeta(inode Ino, update func() syscall.Errno) syscall.Errno {
+	f := w.find(inode)
+	if f == nil {
+		return update()
+	}
+	f.commitMu.Lock()
+	defer f.commitMu.Unlock()
+	st := update()
+	if st == 0 {
+		f.Lock()
+		f.raiseMtimeFloor(time.Now())
+		f.Unlock()
+	}
+	return st
 }
 
 func (w *dataWriter) UpdateMtime(inode Ino, mtime time.Time) {
