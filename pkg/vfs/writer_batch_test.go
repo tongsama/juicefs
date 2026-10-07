@@ -47,7 +47,7 @@ type batchRecordingMeta struct {
 	mtimes []time.Time
 	hold   chan struct{} // when set, the first call waits until it is closed
 	held   chan struct{} // closed when the first call starts waiting
-	inject func(slices []meta.SliceWrite) (int, syscall.Errno, bool)
+	inject func(slices []meta.SliceWrite) (n int, st syscall.Errno, uncertain, used bool)
 	once   sync.Once
 }
 
@@ -71,7 +71,7 @@ func (m *batchRecordingMeta) Write(ctx meta.Context, inode Ino, indx, off uint32
 }
 
 // WriteSlices records a batch and applies an injected result once, if any.
-func (m *batchRecordingMeta) WriteSlices(ctx meta.Context, inode Ino, indx uint32, slices []meta.SliceWrite, mtime time.Time) (int, syscall.Errno) {
+func (m *batchRecordingMeta) WriteSlices(ctx meta.Context, inode Ino, indx uint32, slices []meta.SliceWrite, mtime time.Time) (int, syscall.Errno, bool) {
 	ids := make([]uint64, len(slices))
 	for i, w := range slices {
 		ids[i] = w.Slice.Id
@@ -80,10 +80,10 @@ func (m *batchRecordingMeta) WriteSlices(ctx meta.Context, inode Ino, indx uint3
 	if m.inject != nil {
 		var n int
 		var st syscall.Errno
-		var used bool
-		m.once.Do(func() { n, st, used = m.inject(slices) })
+		var uncertain, used bool
+		m.once.Do(func() { n, st, uncertain, used = m.inject(slices) })
 		if used {
-			return n, st
+			return n, st, uncertain
 		}
 	}
 	return m.Meta.WriteSlices(ctx, inode, indx, slices, mtime)
@@ -183,9 +183,9 @@ func heldBatch(t *testing.T, rm *batchRecordingMeta, f *rangeTestFile) {
 // failing slice's errno and still commits the slices after it.
 func TestMetaWriteBatchPartialFailure(t *testing.T) {
 	f, rm := newBatchTestFile(t, 64)
-	rm.inject = func(slices []meta.SliceWrite) (int, syscall.Errno, bool) {
+	rm.inject = func(slices []meta.SliceWrite) (int, syscall.Errno, bool, bool) {
 		require.Zero(t, rm.Meta.Write(meta.Background(), f.ino, 0, slices[0].Off, slices[0].Slice, time.Now()))
-		return 1, syscall.EDQUOT, true
+		return 1, syscall.EDQUOT, false, true
 	}
 	heldBatch(t, rm, f)
 	fsynced := make(chan syscall.Errno, 1)
@@ -217,7 +217,9 @@ func committedIDs(t *testing.T, f *rangeTestFile) map[uint64]bool {
 // unknown again, and marks the file failed with EIO.
 func TestMetaWriteBatchUnknownFailure(t *testing.T) {
 	f, rm := newBatchTestFile(t, 64)
-	rm.inject = func(slices []meta.SliceWrite) (int, syscall.Errno, bool) { return 0, syscall.EIO, true }
+	rm.inject = func(slices []meta.SliceWrite) (int, syscall.Errno, bool, bool) { return 0, syscall.EIO, true, true }
+	rr := &invalidationRecorder{DataReader: f.v.writer.(*dataWriter).reader}
+	f.v.writer.(*dataWriter).reader = rr
 	heldBatch(t, rm, f)
 	fsynced := make(chan syscall.Errno, 1)
 	go func() { fsynced <- f.v.Fsync(f.ctx, f.ino, 0, f.fh) }()
@@ -234,6 +236,56 @@ func TestMetaWriteBatchUnknownFailure(t *testing.T) {
 			require.False(t, inBatch[id], "slice %d of an unknown-outcome batch was resent: %v", id, calls)
 		}
 	}
+	// The batch may have been applied, so readahead buffers of its slices must be dropped.
+	for _, off := range []uint64{0, 1 << 20, 2 << 20} {
+		require.True(t, rr.has(off), "no invalidation at %d for an uncertain commit", off)
+	}
+}
+
+// invalidationRecorder records reader invalidations of chunk 0.
+type invalidationRecorder struct {
+	DataReader
+	mu   sync.Mutex
+	offs map[uint64]bool
+}
+
+// Invalidate records the offset and forwards the call.
+func (r *invalidationRecorder) Invalidate(inode Ino, off, length uint64) {
+	r.mu.Lock()
+	if r.offs == nil {
+		r.offs = map[uint64]bool{}
+	}
+	r.offs[off] = true
+	r.mu.Unlock()
+	r.DataReader.Invalidate(inode, off, length)
+}
+
+// has reports whether an invalidation started at off.
+func (r *invalidationRecorder) has(off uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.offs[off]
+}
+
+// TestMetaWriteBatchFallbackFailureRetriesRest retries the slices that a
+// one-by-one fallback never sent after one of them failed.
+func TestMetaWriteBatchFallbackFailureRetriesRest(t *testing.T) {
+	f, rm := newBatchTestFile(t, 64)
+	rm.inject = func(slices []meta.SliceWrite) (int, syscall.Errno, bool, bool) {
+		require.Zero(t, rm.Meta.Write(meta.Background(), f.ino, 0, slices[0].Off, slices[0].Slice, time.Now()))
+		return 1, syscall.EIO, false, true // the second slice failed alone; the third was never sent
+	}
+	heldBatch(t, rm, f)
+	fsynced := make(chan syscall.Errno, 1)
+	go func() { fsynced <- f.v.Fsync(f.ctx, f.ino, 0, f.fh) }()
+	awaitAllDone(t, f.fileWriter(t), 0)
+	close(rm.hold)
+	require.Equal(t, syscall.EIO, <-fsynced)
+	batch := rm.snapshot()[1]
+	ids := committedIDs(t, f)
+	require.True(t, ids[batch[0]])
+	require.False(t, ids[batch[1]])
+	require.True(t, ids[batch[2]], "a slice the fallback never sent must still be committed")
 }
 
 // TestMetaWriteBatchStopsAtFailedSlice cuts a batch before a slice whose data upload failed.

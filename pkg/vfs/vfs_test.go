@@ -213,9 +213,9 @@ func (m *failingWriteMeta) Write(ctx meta.Context, inode meta.Ino, indx, off uin
 	return m.err
 }
 
-// WriteSlices rejects the whole batch like Write rejects a single slice.
-func (m *failingWriteMeta) WriteSlices(ctx meta.Context, inode meta.Ino, indx uint32, slices []meta.SliceWrite, mtime time.Time) (int, syscall.Errno) {
-	return 0, m.err
+// WriteSlices rejects the whole batch, without writing it, like Write rejects a single slice.
+func (m *failingWriteMeta) WriteSlices(ctx meta.Context, inode meta.Ino, indx uint32, slices []meta.SliceWrite, mtime time.Time) (int, syscall.Errno, bool) {
+	return 0, m.err, false
 }
 
 // testMetaWriteBatch reads the batch size for suite reruns; unset or invalid means disabled.

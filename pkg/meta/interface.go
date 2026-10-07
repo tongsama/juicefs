@@ -482,8 +482,10 @@ type Meta interface {
 	Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno
 	// WriteSlices appends slices to chunk indx in order, using one metadata
 	// transaction when the engine supports it. The first n slices are committed;
-	// if n < len(slices), slices[n] failed with st and the rest were not written.
-	WriteSlices(ctx Context, inode Ino, indx uint32, slices []SliceWrite, mtime time.Time) (n int, st syscall.Errno)
+	// if n < len(slices), slices[n] failed with st. When uncertain is true, a
+	// batch transaction failed with an unknown outcome and slices[n:] may or may
+	// not have been written; otherwise the slices after slices[n] were not written.
+	WriteSlices(ctx Context, inode Ino, indx uint32, slices []SliceWrite, mtime time.Time) (n int, st syscall.Errno, uncertain bool)
 	// InvalidateChunkCache invalidate chunk cache
 	InvalidateChunkCache(ctx Context, inode Ino, indx uint32) syscall.Errno
 	// CopyFileRange copies part of a file to another one.

@@ -141,7 +141,7 @@ func testWriteSlices(t *testing.T, m Meta) {
 				t.Fatalf("write: %s", st)
 			}
 		}
-		if n, st := m.WriteSlices(ctx, b, 1, wb, mtime); n != len(wb) || st != 0 {
+		if n, st, _ := m.WriteSlices(ctx, b, 1, wb, mtime); n != len(wb) || st != 0 {
 			t.Fatalf("WriteSlices = %d, %s", n, st)
 		}
 		if la, lb := chunkLayout(t, m, a, 1, wa), chunkLayout(t, m, b, 1, wb); !reflect.DeepEqual(la, lb) {
@@ -166,7 +166,7 @@ func testWriteSlices(t *testing.T, m Meta) {
 	t.Run("single slice uses Write", func(t *testing.T) {
 		_, f := createIn(t, m, "single")
 		ws := sliceShapes(t, m, 1, 0)
-		if n, st := m.WriteSlices(ctx, f, 0, ws, mtime); n != 1 || st != 0 {
+		if n, st, _ := m.WriteSlices(ctx, f, 0, ws, mtime); n != 1 || st != 0 {
 			t.Fatalf("WriteSlices = %d, %s", n, st)
 		}
 		if l := chunkLayout(t, m, f, 0, ws); len(l) != 1 || l[0].Id != 1 {
@@ -183,7 +183,7 @@ func testWriteSlices(t *testing.T, m Meta) {
 		m.getBase().loadQuotas()
 		_ = dir
 		ws := sliceShapes(t, m, 4, 0)
-		n, st := m.WriteSlices(ctx, f, 0, ws, mtime)
+		n, st, _ := m.WriteSlices(ctx, f, 0, ws, mtime)
 		if n != 3 || st != syscall.EDQUOT {
 			t.Fatalf("WriteSlices = %d, %s; want 3, EDQUOT", n, st)
 		}
@@ -194,7 +194,7 @@ func testWriteSlices(t *testing.T, m Meta) {
 
 	t.Run("missing inode", func(t *testing.T) {
 		ws := sliceShapes(t, m, 3, 0)
-		if n, st := m.WriteSlices(ctx, Ino(1<<40), 0, ws, mtime); n != 0 || st != syscall.ENOENT {
+		if n, st, _ := m.WriteSlices(ctx, Ino(1<<40), 0, ws, mtime); n != 0 || st != syscall.ENOENT {
 			t.Fatalf("WriteSlices = %d, %s; want 0, ENOENT", n, st)
 		}
 	})
@@ -202,7 +202,7 @@ func testWriteSlices(t *testing.T, m Meta) {
 	t.Run("directory inode", func(t *testing.T) {
 		dir, _ := createIn(t, m, "notfile")
 		ws := sliceShapes(t, m, 3, 0)
-		if n, st := m.WriteSlices(ctx, dir, 0, ws, mtime); n != 0 || st != syscall.EPERM {
+		if n, st, _ := m.WriteSlices(ctx, dir, 0, ws, mtime); n != 0 || st != syscall.EPERM {
 			t.Fatalf("WriteSlices = %d, %s; want 0, EPERM", n, st)
 		}
 	})
@@ -215,7 +215,7 @@ func testWriteSlices(t *testing.T, m Meta) {
 		}
 		defer m.Close(ctx, f)
 		ws := sliceShapes(t, m, 4, 0)
-		if n, st := m.WriteSlices(ctx, f, 0, ws, mtime); n != 4 || st != 0 {
+		if n, st, _ := m.WriteSlices(ctx, f, 0, ws, mtime); n != 4 || st != 0 {
 			t.Fatalf("WriteSlices = %d, %s", n, st)
 		}
 		// The open-file chunk cache must not keep the pre-batch slice list.
@@ -245,7 +245,7 @@ func TestWriteSlicesTKVDuplicate(t *testing.T) {
 	if st := m.Write(ctx, f, 0, ws[1].Off, ws[1].Slice, time.Now()); st != 0 {
 		t.Fatal(st)
 	}
-	if n, st := m.WriteSlices(ctx, f, 0, ws, time.Now()); n != 3 || st != 0 {
+	if n, st, _ := m.WriteSlices(ctx, f, 0, ws, time.Now()); n != 3 || st != 0 {
 		t.Fatalf("WriteSlices = %d, %s", n, st)
 	}
 	var ss []Slice
@@ -267,8 +267,9 @@ func TestWriteSlicesTKVDuplicate(t *testing.T) {
 // to check which batch errors fall back to one-by-one writes.
 type failingBatchEngine struct {
 	engine
-	err    syscall.Errno
-	single atomic.Int32
+	err       syscall.Errno
+	single    atomic.Int32
+	singleErr syscall.Errno // when set, the second single write fails with it
 }
 
 // doWriteSlices fails without changing anything.
@@ -278,7 +279,9 @@ func (e *failingBatchEngine) doWriteSlices(ctx Context, inode Ino, indx uint32, 
 
 // doWrite counts single-slice writes and delegates to the real engine.
 func (e *failingBatchEngine) doWrite(ctx Context, inode Ino, indx uint32, off uint32, s Slice, mtime time.Time, n *int, delta *dirStat, attr *Attr) syscall.Errno {
-	e.single.Add(1)
+	if e.single.Add(1) == 2 && e.singleErr != 0 {
+		return e.singleErr
+	}
 	return e.engine.doWrite(ctx, inode, indx, off, s, mtime, n, delta, attr)
 }
 
@@ -290,20 +293,26 @@ func TestWriteSlicesNoRetryOnUnknownError(t *testing.T) {
 	orig := b.en
 	defer func() { b.en = orig }()
 	for _, tc := range []struct {
-		err        syscall.Errno
-		wantN      int
-		wantSt     syscall.Errno
-		wantSingle int32
+		err, singleErr syscall.Errno
+		wantN          int
+		wantSt         syscall.Errno
+		wantUncertain  bool
+		wantSingle     int32
 	}{
-		{syscall.EIO, 0, syscall.EIO, 0},
-		{syscall.EDQUOT, 3, 0, 3}, // the real engine accepts each slice individually
+		// The batch transaction may have been applied: no retry, every slice uncertain.
+		{syscall.EIO, 0, 0, syscall.EIO, true, 0},
+		// Nothing was written: retried one by one, all succeed.
+		{syscall.EDQUOT, 0, 3, 0, false, 3},
+		// Retried one by one, the second fails: only that slice is uncertain, the third was never sent.
+		{syscall.EDQUOT, syscall.EIO, 1, syscall.EIO, false, 2},
 	} {
-		fe := &failingBatchEngine{engine: orig, err: tc.err}
+		fe := &failingBatchEngine{engine: orig, err: tc.err, singleErr: tc.singleErr}
 		b.en = fe
-		_, f := createIn(t, m, fmt.Sprint("retry-", int(tc.err)))
-		n, st := m.WriteSlices(Background(), f, 0, sliceShapes(t, m, 3, 0), time.Now())
-		if n != tc.wantN || st != tc.wantSt || fe.single.Load() != tc.wantSingle {
-			t.Errorf("%s: n=%d st=%s single=%d; want %d %s %d", tc.err, n, st, fe.single.Load(), tc.wantN, tc.wantSt, tc.wantSingle)
+		_, f := createIn(t, m, fmt.Sprint("retry-", int(tc.err), "-", int(tc.singleErr)))
+		n, st, uncertain := m.WriteSlices(Background(), f, 0, sliceShapes(t, m, 3, 0), time.Now())
+		if n != tc.wantN || st != tc.wantSt || uncertain != tc.wantUncertain || fe.single.Load() != tc.wantSingle {
+			t.Errorf("%s/%s: n=%d st=%s uncertain=%v single=%d; want %d %s %v %d", tc.err, tc.singleErr,
+				n, st, uncertain, fe.single.Load(), tc.wantN, tc.wantSt, tc.wantUncertain, tc.wantSingle)
 		}
 		b.en = orig
 	}

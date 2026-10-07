@@ -2277,15 +2277,15 @@ func batchErrorUnapplied(st syscall.Errno) bool {
 // WriteSlices appends slices to chunk indx in creation order. Engines that
 // implement sliceBatchWriter commit them in one transaction; otherwise, or for
 // a single slice, they are written one by one with Write.
-func (m *baseMeta) WriteSlices(ctx Context, inode Ino, indx uint32, slices []SliceWrite, mtime time.Time) (int, syscall.Errno) {
+func (m *baseMeta) WriteSlices(ctx Context, inode Ino, indx uint32, slices []SliceWrite, mtime time.Time) (int, syscall.Errno, bool) {
 	bw, ok := m.en.(sliceBatchWriter)
 	if len(slices) <= 1 || !ok {
 		for i, w := range slices {
 			if st := m.Write(ctx, inode, indx, w.Off, w.Slice, mtime); st != 0 {
-				return i, st
+				return i, st, false
 			}
 		}
-		return len(slices), 0
+		return len(slices), 0, false
 	}
 	start := time.Now()
 	defer m.timeit("WriteSlices", start)
@@ -2317,19 +2317,19 @@ func (m *baseMeta) WriteSlices(ctx Context, inode Ino, indx uint32, slices []Sli
 		inode, indx, first, len(slices), lockWait, ph.backend, ph.numSlices, st)
 	if st == 0 {
 		m.afterWrite(ctx, inode, indx, &attr, delta, ph.numSlices-len(slices), &ph)
-		return len(slices), 0
+		return len(slices), 0, false
 	}
 	if !batchErrorUnapplied(st) {
 		// The transaction may have been applied; retrying could register slices twice.
-		return 0, st
+		return 0, st, true
 	}
 	for i, w := range slices {
 		var one writePhases
 		if st = m.writeLocked(ctx, inode, indx, w.Off, w.Slice, mtime, &one); st != 0 {
-			return i, st
+			return i, st, false
 		}
 	}
-	return len(slices), 0
+	return len(slices), 0, false
 }
 
 func (m *baseMeta) Truncate(ctx Context, inode Ino, flags uint8, length uint64, attr *Attr, skipPermCheck bool) syscall.Errno {

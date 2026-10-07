@@ -231,6 +231,7 @@ func (c *chunkWriter) commitThread() {
 		f.Unlock()
 
 		committed := 0
+		uncertain := false
 		var mtime time.Time
 		var gen uint64
 		ordered := err == 0
@@ -251,7 +252,7 @@ func (c *chunkWriter) commitThread() {
 				mtime = f.mtimeFloor
 			}
 			f.Unlock()
-			committed, err = c.commitSlices(batch, mtime)
+			committed, err, uncertain = c.commitSlices(batch, mtime)
 		}
 
 		f.Lock()
@@ -265,11 +266,11 @@ func (c *chunkWriter) commitThread() {
 			c.markCommitted(b)
 		}
 		if err != 0 {
-			// A failure raised before anything was written affects only that slice;
-			// any other failure may have applied the whole batch, so none of the
-			// remaining slices may be sent again.
+			// Only the failed slice fails, unless a batch transaction failed with an
+			// unknown outcome: then the rest may have been applied and must not be
+			// sent again.
 			end := committed + 1
-			if !metaErrorUnapplied(err) {
+			if uncertain {
 				end = len(batch)
 			}
 			if err == syscall.ENOENT || err == syscall.ENOSPC || err == syscall.EDQUOT {
@@ -313,13 +314,15 @@ func (c *chunkWriter) commitBatch() []*sliceWriter {
 }
 
 // commitSlices writes the metadata of a batch without the file lock and
-// invalidates the reader for the slices that were committed. It returns how
-// many leading slices were committed and the errno of the next one, if any.
-func (c *chunkWriter) commitSlices(batch []*sliceWriter, mtime time.Time) (int, syscall.Errno) {
+// invalidates the reader for the slices that were, or may have been, committed.
+// It returns how many leading slices were committed, the errno of the next one,
+// and whether the slices from there on have an unknown outcome.
+func (c *chunkWriter) commitSlices(batch []*sliceWriter, mtime time.Time) (int, syscall.Errno, bool) {
 	f := c.file
 	start := time.Now()
 	var n int
 	var err syscall.Errno
+	var uncertain bool
 	if len(batch) == 1 {
 		s := batch[0]
 		logger.Debugf("slice commit inode=%d chunk=%d slice=%d phase=metadata", f.inode, c.indx, s.id)
@@ -332,15 +335,21 @@ func (c *chunkWriter) commitSlices(batch []*sliceWriter, mtime time.Time) (int, 
 			ws[i] = meta.SliceWrite{Off: s.off, Slice: meta.Slice{Id: s.id, Size: s.length, Off: s.soff, Len: s.slen}}
 			logger.Debugf("slice commit inode=%d chunk=%d slice=%d phase=metadata batch=%d", f.inode, c.indx, s.id, len(batch))
 		}
-		n, err = f.w.m.WriteSlices(meta.Background(), f.inode, c.indx, ws, mtime)
+		n, err, uncertain = f.w.m.WriteSlices(meta.Background(), f.inode, c.indx, ws, mtime)
 	}
 	if elapsed := time.Since(start); elapsed >= time.Second {
 		logger.Warnf("slow slice commit inode=%d chunk=%d slice=%d metadata=%s errno=%s batch=%d", f.inode, c.indx, batch[0].id, elapsed, err, len(batch))
 	}
-	for _, s := range batch[:n] {
+	end := n
+	if uncertain {
+		end = len(batch)
+	} else if err != 0 && !metaErrorUnapplied(err) {
+		end = n + 1 // this slice's commit may have been applied
+	}
+	for _, s := range batch[:end] {
 		f.w.reader.Invalidate(f.inode, uint64(c.indx)*meta.ChunkSize+uint64(s.off), uint64(s.slen))
 	}
-	return n, err
+	return n, err, uncertain
 }
 
 // metaErrorUnapplied reports metadata errors raised before a transaction wrote

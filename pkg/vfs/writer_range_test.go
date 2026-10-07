@@ -78,7 +78,7 @@ func (m *gatedWriteMeta) Write(ctx meta.Context, inode Ino, indx, off uint32, sl
 }
 
 // WriteSlices passes the same gate as Write before committing the batch.
-func (m *gatedWriteMeta) WriteSlices(ctx meta.Context, inode Ino, indx uint32, slices []meta.SliceWrite, mtime time.Time) (int, syscall.Errno) {
+func (m *gatedWriteMeta) WriteSlices(ctx meta.Context, inode Ino, indx uint32, slices []meta.SliceWrite, mtime time.Time) (int, syscall.Errno, bool) {
 	m.mu.Lock()
 	g := m.gates[indx]
 	m.mu.Unlock()
