@@ -2697,6 +2697,11 @@ func (m *kvMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice 
 // slices the chunk already holds (as doWrite does), and sets the chunk and the
 // inode once.
 func (m *kvMeta) doWriteSlices(ctx Context, inode Ino, indx uint32, slices []SliceWrite, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
+	if m.fmt.ChangeLog && len(slices) > 1 {
+		// genLog keys a record by the transaction ID, so several WRITE records in
+		// one transaction could overwrite each other; keep one record per write.
+		return errWriteSlicesFallback
+	}
 	return errno(m.txn(ctx, func(tx *kvTxn) error {
 		*delta = dirStat{}
 		*attr = Attr{}

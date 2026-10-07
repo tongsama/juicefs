@@ -392,3 +392,24 @@ func TestWriteSlicesSQLKeepsChunkBelowMaxSlices(t *testing.T) {
 		t.Fatalf("new chunk: st=%s slices=%d", st, n)
 	}
 }
+
+// TestWriteSlicesTKVChangeLogFallsBack writes slices one by one on TKV when the
+// change log is enabled: the log key of a transaction is derived from its ID, so
+// several WRITE records in one transaction could overwrite each other.
+func TestWriteSlicesTKVChangeLogFallsBack(t *testing.T) {
+	m := newWriteSlicesMemKV(t)
+	b := m.getBase()
+	b.fmt.ChangeLog = true
+	defer func() { b.fmt.ChangeLog = false }()
+	bw := b.en.(sliceBatchWriter)
+	_, f := createIn(t, m, "changelog")
+	var n int
+	var delta dirStat
+	var attr Attr
+	if st := bw.doWriteSlices(Background(), f, 0, sliceShapes(t, m, 3, 0), time.Now(), &n, &delta, &attr); st != errWriteSlicesFallback {
+		t.Fatalf("doWriteSlices with change log: st=%s, want the fallback errno", st)
+	}
+	if n, st, _ := m.WriteSlices(Background(), f, 0, sliceShapes(t, m, 3, 0), time.Now()); n != 3 || st != 0 {
+		t.Fatalf("WriteSlices = %d, %s", n, st)
+	}
+}
