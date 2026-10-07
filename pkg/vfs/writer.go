@@ -226,63 +226,139 @@ func (c *chunkWriter) commitThread() {
 		for s.dep != nil && !s.dep.committed {
 			f.commitcond.WaitWithTimeout(time.Millisecond * 100)
 		}
+		batch := c.commitBatch()
 		err := s.err
 		f.Unlock()
 
+		committed := 0
 		var mtime time.Time
 		var gen uint64
 		ordered := err == 0
 		if ordered {
 			// Chunks commit concurrently; choosing the mtime and applying it in the
-			// same order (metadata writes of an inode are serialized anyway) keeps an
-			// older slice from moving the file mtime back.
+			// same order keeps an older slice from moving the file mtime back.
 			f.commitMu.Lock()
 			f.Lock()
 			mtime, gen = s.lastMod, f.mtimeGen
+			for _, b := range batch[1:] {
+				if b.lastMod.After(mtime) {
+					mtime = b.lastMod
+				}
+			}
 			if mtime.Before(f.mtimeFloor) {
 				mtime = f.mtimeFloor
 			}
 			f.Unlock()
-			var ss = meta.Slice{Id: s.id, Size: s.length, Off: s.soff, Len: s.slen}
-			start := time.Now()
-			logger.Debugf("slice commit inode=%d chunk=%d slice=%d phase=metadata", f.inode, c.indx, s.id)
-			err = f.w.m.Write(meta.Background(), f.inode, c.indx, s.off, ss, mtime)
-			if elapsed := time.Since(start); elapsed >= time.Second {
-				logger.Warnf("slow slice commit inode=%d chunk=%d slice=%d metadata=%s errno=%s", f.inode, c.indx, s.id, elapsed, err)
-			}
-			f.w.reader.Invalidate(f.inode, uint64(c.indx)*meta.ChunkSize+uint64(s.off), uint64(ss.Len))
+			committed, err = c.commitSlices(batch, mtime)
 		}
 
 		f.Lock()
+		if committed > 0 && gen == f.mtimeGen {
+			f.raiseMtimeFloor(mtime)
+		}
+		if ordered {
+			f.commitMu.Unlock()
+		}
+		for _, b := range batch[:committed] {
+			c.markCommitted(b)
+		}
 		if err != 0 {
+			// A failure raised before anything was written affects only that slice;
+			// any other failure may have applied the whole batch, so none of the
+			// remaining slices may be sent again.
+			end := committed + 1
+			if !metaErrorUnapplied(err) {
+				end = len(batch)
+			}
 			if err == syscall.ENOENT || err == syscall.ENOSPC || err == syscall.EDQUOT {
-				go func(id uint64, length int) {
-					_ = f.w.store.Remove(id, length)
-				}(s.id, int(s.length))
+				for _, failed := range batch[committed:end] {
+					go func(id uint64, length int) {
+						_ = f.w.store.Remove(id, length)
+					}(failed.id, int(failed.length))
+				}
 			} else {
 				logger.Warnf("write inode:%d error: %s", f.inode, err)
 				err = syscall.EIO
 			}
 			f.err = err
 			logger.Errorf("write inode:%d indx:%d %s", f.inode, c.indx, err)
-		} else if gen == f.mtimeGen {
-			f.raiseMtimeFloor(mtime)
+			for _, failed := range batch[committed:end] {
+				c.markCommitted(failed)
+			}
+			committed = end
 		}
-		if ordered {
-			f.commitMu.Unlock()
-		}
-		s.committed = true
-		if s.growing {
-			f.commitcond.Broadcast()
-		}
-		if f.rangewaiting > 0 {
-			// Range barriers wait for specific slices rather than for every chunk to drain.
-			f.flushcond.Broadcast()
-		}
-		c.slices = c.slices[1:]
+		c.slices = c.slices[committed:]
 	}
 	f.freeChunk(c)
 	f.Unlock()
+}
+
+// commitBatch returns the head slice and, when batching is enabled, the
+// following slices that are already done without error, up to the batch size.
+// Only a chunk's first slice can have a dependency, so later ones need no wait.
+// The caller holds the file lock.
+func (c *chunkWriter) commitBatch() []*sliceWriter {
+	head := c.slices[0]
+	limit := c.file.w.conf.MetaWriteBatch
+	if head.err != 0 || limit <= 1 {
+		return c.slices[:1]
+	}
+	n := 1
+	for n < len(c.slices) && n < limit && c.slices[n].done && c.slices[n].err == 0 {
+		n++
+	}
+	return c.slices[:n:n]
+}
+
+// commitSlices writes the metadata of a batch without the file lock and
+// invalidates the reader for the slices that were committed. It returns how
+// many leading slices were committed and the errno of the next one, if any.
+func (c *chunkWriter) commitSlices(batch []*sliceWriter, mtime time.Time) (int, syscall.Errno) {
+	f := c.file
+	start := time.Now()
+	var n int
+	var err syscall.Errno
+	if len(batch) == 1 {
+		s := batch[0]
+		logger.Debugf("slice commit inode=%d chunk=%d slice=%d phase=metadata", f.inode, c.indx, s.id)
+		if err = f.w.m.Write(meta.Background(), f.inode, c.indx, s.off, meta.Slice{Id: s.id, Size: s.length, Off: s.soff, Len: s.slen}, mtime); err == 0 {
+			n = 1
+		}
+	} else {
+		ws := make([]meta.SliceWrite, len(batch))
+		for i, s := range batch {
+			ws[i] = meta.SliceWrite{Off: s.off, Slice: meta.Slice{Id: s.id, Size: s.length, Off: s.soff, Len: s.slen}}
+			logger.Debugf("slice commit inode=%d chunk=%d slice=%d phase=metadata batch=%d", f.inode, c.indx, s.id, len(batch))
+		}
+		n, err = f.w.m.WriteSlices(meta.Background(), f.inode, c.indx, ws, mtime)
+	}
+	if elapsed := time.Since(start); elapsed >= time.Second {
+		logger.Warnf("slow slice commit inode=%d chunk=%d slice=%d metadata=%s errno=%s batch=%d", f.inode, c.indx, batch[0].id, elapsed, err, len(batch))
+	}
+	for _, s := range batch[:n] {
+		f.w.reader.Invalidate(f.inode, uint64(c.indx)*meta.ChunkSize+uint64(s.off), uint64(s.slen))
+	}
+	return n, err
+}
+
+// metaErrorUnapplied reports metadata errors raised before a transaction wrote
+// anything; other errors leave it unknown whether the batch was applied.
+func metaErrorUnapplied(err syscall.Errno) bool {
+	return err == syscall.ENOENT || err == syscall.EPERM || err == syscall.ENOSPC || err == syscall.EDQUOT
+}
+
+// markCommitted records that a slice's commit finished (successfully or not)
+// and wakes the waiters that depend on it; the caller holds the file lock.
+func (c *chunkWriter) markCommitted(s *sliceWriter) {
+	f := c.file
+	s.committed = true
+	if s.growing {
+		f.commitcond.Broadcast()
+	}
+	if f.rangewaiting > 0 {
+		// Range barriers wait for specific slices rather than for every chunk to drain.
+		f.flushcond.Broadcast()
+	}
 }
 
 type fileWriter struct {
