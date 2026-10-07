@@ -133,6 +133,13 @@ func (m *traceCountingMeta) Write(ctx meta.Context, inode Ino, indx, off uint32,
 	return err
 }
 
+// WriteSlices delegates persistence and counts the slices it committed.
+func (m *traceCountingMeta) WriteSlices(ctx meta.Context, inode Ino, indx uint32, slices []meta.SliceWrite, mtime time.Time) (int, syscall.Errno, bool) {
+	n, err, uncertain := m.Meta.WriteSlices(ctx, inode, indx, slices, mtime)
+	m.writes.Add(int32(n))
+	return n, err, uncertain
+}
+
 // TestWriterReuseWindow reads real data after revisiting a partial slice behind newer gap slices.
 func TestWriterReuseWindow(t *testing.T) {
 	for _, window := range []int{4, 16} {
@@ -292,7 +299,9 @@ func TestWriterFlushCallerErrors(t *testing.T) {
 	log := logs.String()
 	require.Regexp(t, `origin=vfs.Read barrier=[1-9][0-9]* phase=begin`, log)
 	require.Regexp(t, `origin=vfs.Fsync barrier=[1-9][0-9]* phase=end errno=28`, log)
-	require.Regexp(t, `origin=vfs.Read barrier=[1-9][0-9]* phase=end errno=28`, log)
+	// With --writer-flush-scope=range the failure may surface in the barrier taken
+	// before the handle lock.
+	require.Regexp(t, `origin=vfs.Read(\.prelock)? barrier=[1-9][0-9]* phase=end errno=28`, log)
 }
 
 // TestWriterReuseRestrictions keeps gaps, intervening overlaps and complete blocks immutable.

@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -100,6 +101,9 @@ func mount(url, mp string) {
 		Format:   *format,
 		Chunk:    &chunkConf,
 		FuseOpts: &vfs.FuseOptions{},
+		// JFS_TEST_WRITER_FLUSH_SCOPE=range reruns the suite with range barriers.
+		WriterFlushScope: os.Getenv("JFS_TEST_WRITER_FLUSH_SCOPE"),
+		MetaWriteBatch:   metaWriteBatchFromEnv(),
 	}
 
 	err = m.NewSession(true)
@@ -302,4 +306,10 @@ func TestFUSE(t *testing.T) {
 			f(t, mp)
 		})
 	}
+}
+
+// metaWriteBatchFromEnv reads JFS_TEST_META_WRITE_BATCH for suite reruns with batched commits.
+func metaWriteBatchFromEnv() int {
+	n, _ := strconv.Atoi(os.Getenv("JFS_TEST_META_WRITE_BATCH"))
+	return n
 }

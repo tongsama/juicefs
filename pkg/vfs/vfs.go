@@ -140,6 +140,8 @@ type Config struct {
 	SliceFlushIdle       time.Duration
 	WriterReuseWindow    int           // Distance before freezing nonmatching old slices; zero uses four.
 	WriterFlushTimeout   time.Duration // 0 waits without a deadline; AutoWriterFlushTimeout uses the legacy deadline.
+	WriterFlushScope     string        // WriterFlushScopeFile (default) or WriterFlushScopeRange for Read/Fallocate barriers.
+	MetaWriteBatch       int           // Maximum slices of one chunk committed per metadata transaction; 0 disables batching.
 	FastResolve          bool          `json:",omitempty"`
 	AccessLog            string        `json:",omitempty"`
 	Subdir               string        `json:",omitempty"`
@@ -788,6 +790,12 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 		err = syscall.EBADF
 		return
 	}
+	// With range barriers, do most of the waiting before taking the handle lock so
+	// writes through the same handle are not blocked; the barrier below then only
+	// has to commit writes that completed in the meantime.
+	if err = v.prelockFlush(WithWriterFlushOrigin(ctx, "vfs.Read.prelock"), ino, off, uint64(len(buf))); err != 0 {
+		return
+	}
 	if !h.Rlock(ctx) {
 		err = syscall.EINTR
 		return
@@ -796,7 +804,7 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 	defer h.removeOp(ctx)
 
 	// Reads must not expose old metadata when pending writes could not be committed.
-	if err = v.writer.Flush(WithWriterFlushOrigin(ctx, "vfs.Read"), ino); err != 0 {
+	if err = v.flushForRange(WithWriterFlushOrigin(ctx, "vfs.Read"), ino, off, uint64(len(buf))); err != 0 {
 		return
 	}
 	n, err = h.reader.Read(ctx, off, buf)
@@ -897,6 +905,10 @@ func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh ui
 		err = syscall.EBADF
 		return
 	}
+	// As in Read: wait for in-range commits before locking the handle.
+	if err = v.prelockFlush(WithWriterFlushOrigin(ctx, "vfs.Fallocate.prelock"), ino, uint64(off), uint64(size)); err != 0 {
+		return
+	}
 	if !h.Wlock(ctx) {
 		err = syscall.EINTR
 		return
@@ -904,14 +916,25 @@ func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh ui
 	defer h.Wunlock()
 	defer h.removeOp(ctx)
 
-	err = v.writer.Flush(WithWriterFlushOrigin(ctx, "vfs.Fallocate"), ino)
+	err = v.flushForRange(WithWriterFlushOrigin(ctx, "vfs.Fallocate"), ino, uint64(off), uint64(size))
 	if err != 0 {
 		return
 	}
 	var length uint64
-	err = v.Meta.Fallocate(ctx, ino, mode, uint64(off), uint64(size), &length)
+	// Fallocate sets mtime to now; ordering it with slice commits keeps pending
+	// commits from moving it back.
+	err = v.writer.UpdateMeta(ino, func() syscall.Errno {
+		return v.Meta.Fallocate(ctx, ino, mode, uint64(off), uint64(size), &length)
+	})
 	if err == 0 {
-		v.writer.Truncate(ino, length)
+		if v.Conf.WriterFlushScope == WriterFlushScopeRange {
+			// Uncommitted appends outside the range are not in the metadata length yet,
+			// and fallocate never shrinks a file, so keep the larger writer length.
+			v.writer.GrowTo(ino, length)
+			length = max(length, v.writer.GetLength(ino))
+		} else {
+			v.writer.Truncate(ino, length)
+		}
 		s := size
 		if off+size > int64(length) {
 			s = int64(length) - off
@@ -922,6 +945,27 @@ func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh ui
 		v.invalidateAttr(ino)
 	}
 	return
+}
+
+// flushForRange commits the pending writes a Read or Fallocate of [off, off+size)
+// depends on: only those of the touched chunks with --writer-flush-scope=range,
+// otherwise every pending write of the file. fsync, close, truncate and
+// copy_file_range keep using whole-file flushes.
+func (v *VFS) flushForRange(ctx meta.Context, ino Ino, off, size uint64) syscall.Errno {
+	if v.Conf.WriterFlushScope == WriterFlushScopeRange {
+		return v.writer.FlushRange(ctx, ino, off, size)
+	}
+	return v.writer.Flush(ctx, ino)
+}
+
+// prelockFlush runs a range barrier before the handle lock is taken, so the
+// barrier taken under the lock only waits for writes that arrive meanwhile.
+// It does nothing for whole-file barriers, whose flush already stops writes.
+func (v *VFS) prelockFlush(ctx meta.Context, ino Ino, off, size uint64) syscall.Errno {
+	if v.Conf.WriterFlushScope == WriterFlushScopeRange {
+		return v.writer.FlushRange(ctx, ino, off, size)
+	}
+	return 0
 }
 
 // CopyFileRange flushes both files before copying committed slices.

@@ -3184,6 +3184,59 @@ func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, sli
 	}, m.inodeKey(inode)))
 }
 
+// doWriteSlices appends slices to one chunk and updates the inode in a single
+// transaction: one RPUSH with every slice, one SET of the attributes.
+func (m *redisMeta) doWriteSlices(ctx Context, inode Ino, indx uint32, slices []SliceWrite, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
+	return errno(m.txn(ctx, func(tx *redis.Tx) error {
+		*delta = dirStat{}
+		*attr = Attr{}
+		a, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
+		if err != nil {
+			return err
+		}
+		m.parseAttr(a, attr)
+		if attr.Typ != TypeFile {
+			return syscall.EPERM
+		}
+		oldLength := attr.Length
+		for _, w := range slices {
+			if newleng := uint64(indx)*ChunkSize + uint64(w.Off) + uint64(w.Slice.Len); newleng > attr.Length {
+				attr.Length = newleng
+			}
+		}
+		delta.length = int64(attr.Length - oldLength)
+		delta.space = align4K(attr.Length) - align4K(oldLength)
+		if err := m.checkQuota(ctx, delta.space, 0, attr.Uid, attr.Gid, m.getParents(ctx, tx, inode, attr.Parent)...); err != 0 {
+			return err
+		}
+		now := time.Now()
+		attr.Mtime = mtime.Unix()
+		attr.Mtimensec = uint32(mtime.Nanosecond())
+		attr.Ctime = now.Unix()
+		attr.Ctimensec = uint32(now.Nanosecond())
+		vals := make([]interface{}, len(slices))
+		for i, w := range slices {
+			vals[i] = marshalSlice(w.Off, w.Slice.Id, w.Slice.Size, w.Slice.Off, w.Slice.Len)
+		}
+		var rpush *redis.IntCmd
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			rpush = pipe.RPush(ctx, m.chunkKey(inode, indx), vals...)
+			pipe.Set(ctx, m.inodeKey(inode), m.marshal(attr), 0)
+			if delta.space > 0 {
+				pipe.IncrBy(ctx, m.usedSpaceKey(), delta.space)
+			}
+			for _, w := range slices {
+				m.genLog(ctx, pipe, now, "WRITE(%d,%d,%d,%d,%d,%d,%d):%d", inode, indx, w.Off, w.Slice.Id, w.Slice.Len, attr.Mtime, attr.Mtimensec, *numSlices)
+			}
+			return nil
+		})
+		if err == nil {
+			*numSlices = int(rpush.Val())
+		}
+		return err
+	}, m.inodeKey(inode)))
+}
+
 // CopyFileRange copies only a watched source chunk snapshot and commits its shared references atomically.
 func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut uint64, size uint64, flags uint32, copied, outLength *uint64) syscall.Errno {
 	defer m.timeit("CopyFileRange", time.Now())
