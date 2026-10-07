@@ -239,6 +239,8 @@ func (c *chunkWriter) commitThread() {
 			// same order keeps an older slice from moving the file mtime back.
 			f.commitMu.Lock()
 			f.Lock()
+			// Slices that finished while this chunk waited for the commit order join the batch.
+			batch = c.commitBatch()
 			mtime, gen = s.lastMod, f.mtimeGen
 			for _, b := range batch[1:] {
 				if b.lastMod.After(mtime) {

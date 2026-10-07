@@ -273,3 +273,60 @@ func TestMetaWriteBatchMtime(t *testing.T) {
 	defer rm.mu.Unlock()
 	require.False(t, rm.mtimes[len(rm.mtimes)-1].Before(newest))
 }
+
+// TestMetaWriteBatchRecollectsAfterCommitOrder adds slices that finish while a
+// chunk waits for another chunk's commit to the batch it then sends.
+func TestMetaWriteBatchRecollectsAfterCommitOrder(t *testing.T) {
+	f, rm := newBatchTestFile(t, 64)
+	// Chunk 1: its first slice is frozen by the reuse window and its commit is held,
+	// keeping the inode's commit order (commitMu) busy.
+	f.write(t, meta.ChunkSize, []byte("x0"))
+	f.write(t, meta.ChunkSize+3<<20, []byte("x1"))
+	f.write(t, meta.ChunkSize+1<<20, []byte("x2"))
+	<-rm.held
+	// Chunk 0: the head becomes committable and its thread waits for the commit order.
+	f.write(t, 3<<20, []byte("s0"))
+	f.write(t, 0, []byte("s1"))
+	f.write(t, 1<<20, []byte("s2")) // freezes s0
+	fw := f.fileWriter(t)
+	head := chunkSlices(fw, 0)[0]
+	deadline := time.Now().Add(rangeTestTimeout)
+	for {
+		fw.Lock()
+		done := head.done
+		fw.Unlock()
+		if done {
+			break
+		}
+		require.True(t, time.Now().Before(deadline), "head slice did not finish")
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // let chunk 0's thread reach the commit order
+	f.write(t, 2<<20, []byte("s3"))   // freezes s1
+	fsynced := make(chan syscall.Errno, 1)
+	go func() { fsynced <- f.v.Fsync(f.ctx, f.ino, 0, f.fh) }()
+	awaitAllDone(t, fw, 0)
+	ids := map[uint64]bool{}
+	fw.Lock()
+	headID := head.id
+	for _, s := range fw.chunks[0].slices {
+		ids[s.id] = true
+	}
+	fw.Unlock()
+	close(rm.hold)
+	select {
+	case eno := <-fsynced:
+		require.Zero(t, eno)
+	case <-time.After(rangeTestTimeout):
+		t.Fatal("fsync did not finish")
+	}
+	for _, c := range rm.snapshot() {
+		for _, id := range c {
+			if id == headID {
+				require.Len(t, c, len(ids), "chunk 0's slices that finished while waiting should join the head's batch: %v", rm.snapshot())
+				return
+			}
+		}
+	}
+	t.Fatal("chunk 0's head was never committed")
+}
