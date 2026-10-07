@@ -29,7 +29,10 @@ import (
 )
 
 const (
-	flushDuration = time.Second * 5
+	defaultSliceFlushWait = time.Second * 5
+	defaultSliceFlushIdle = time.Second
+	// AutoWriterFlushTimeout explicitly selects the legacy retry-derived flush deadline.
+	AutoWriterFlushTimeout time.Duration = -1
 )
 
 type FileWriter interface {
@@ -106,13 +109,29 @@ func (s *sliceWriter) markDone() {
 	f.Unlock()
 }
 
-// freezed, no more data
+// freeze records why a writable slice stops growing; the caller holds the file lock.
+func (s *sliceWriter) freeze(reason string) {
+	s.freezeWithTrace(reason, writerFlushTrace{})
+}
+
+// freezeWithTrace associates explicit barriers with the slices they actually freeze.
+func (s *sliceWriter) freezeWithTrace(reason string, trace writerFlushTrace) {
+	if s.freezed {
+		return
+	}
+	s.freezed = true
+	s.logFreeze(reason, trace)
+	go s.flushData()
+}
+
+// flushData finishes a frozen slice's blocks before allowing its metadata commit.
 func (s *sliceWriter) flushData() {
 	defer s.markDone()
 	if s.slen == 0 {
 		return
 	}
 	s.prepareID(meta.Background(), true)
+	s.logFinish()
 	if s.err != 0 {
 		logger.Infof("flush inode: %v chunk: %d err: %s", s.chunk.file.inode, s.id, s.err)
 		s.writer.Abort()
@@ -127,7 +146,7 @@ func (s *sliceWriter) flushData() {
 	}
 }
 
-// protected by s.chunk.file
+// write grows only writable data and uploads complete blocks under the file lock.
 func (s *sliceWriter) write(ctx meta.Context, off uint32, data []uint8) syscall.Errno {
 	f := s.chunk.file
 	_, err := s.writer.WriteAt(data, int64(off))
@@ -140,8 +159,7 @@ func (s *sliceWriter) write(ctx meta.Context, off uint32, data []uint8) syscall.
 	}
 	s.lastMod = time.Now()
 	if s.slen == meta.ChunkSize {
-		s.freezed = true
-		go s.flushData()
+		s.freeze("full_slice")
 	} else if int(s.slen) >= f.w.blockSize {
 		if s.id > 0 {
 			err := s.writer.FlushTo(int(s.slen))
@@ -160,7 +178,7 @@ type chunkWriter struct {
 	slices []*sliceWriter
 }
 
-// protected by file
+// findWritableSlice reuses the unflushed tail and freezes old candidates under the file lock.
 func (c *chunkWriter) findWritableSlice(pos uint32, size uint32) *sliceWriter {
 	blockSize := uint32(c.file.w.blockSize)
 	for i := range c.slices {
@@ -169,9 +187,8 @@ func (c *chunkWriter) findWritableSlice(pos uint32, size uint32) *sliceWriter {
 			flushoff := s.slen / blockSize * blockSize
 			if pos >= s.off+flushoff && pos <= s.off+s.slen {
 				return s
-			} else if i > 3 {
-				s.freezed = true
-				go s.flushData()
+			} else if i >= c.file.w.conf.WriterReuseWindow {
+				s.freeze("writable_window")
 			}
 		}
 		if pos < s.off+s.slen && s.off < pos+size {
@@ -183,6 +200,7 @@ func (c *chunkWriter) findWritableSlice(pos uint32, size uint32) *sliceWriter {
 	return nil
 }
 
+// commitThread commits slices in creation order and reports slow metadata calls.
 func (c *chunkWriter) commitThread() {
 	f := c.file
 	defer f.w.free(f)
@@ -192,9 +210,8 @@ func (c *chunkWriter) commitThread() {
 	for len(c.slices) > 0 {
 		s := c.slices[0]
 		for !s.done {
-			if s.notify.WaitWithTimeout(time.Millisecond*100) && !s.freezed && time.Since(s.started) > flushDuration*2 {
-				s.freezed = true
-				go s.flushData()
+			if s.notify.WaitWithTimeout(time.Millisecond*100) && !s.freezed && time.Since(s.started) > f.w.conf.SliceFlushWait*2 {
+				s.freeze("commit_age")
 			}
 		}
 		for s.dep != nil && !s.dep.committed {
@@ -205,7 +222,12 @@ func (c *chunkWriter) commitThread() {
 
 		if err == 0 {
 			var ss = meta.Slice{Id: s.id, Size: s.length, Off: s.soff, Len: s.slen}
+			start := time.Now()
+			logger.Debugf("slice commit inode=%d chunk=%d slice=%d phase=metadata", f.inode, c.indx, s.id)
 			err = f.w.m.Write(meta.Background(), f.inode, c.indx, s.off, ss, s.lastMod)
+			if elapsed := time.Since(start); elapsed >= time.Second {
+				logger.Warnf("slow slice commit inode=%d chunk=%d slice=%d metadata=%s errno=%s", f.inode, c.indx, s.id, elapsed, err)
+			}
 			f.w.reader.Invalidate(f.inode, uint64(c.indx)*meta.ChunkSize+uint64(s.off), uint64(ss.Len))
 		}
 
@@ -383,33 +405,52 @@ func (f *fileWriter) updateMtime(t time.Time) {
 	}
 }
 
-func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
+// flush waits for pending commits, reporting actual failures and only explicitly configured deadlines.
+func (f *fileWriter) flush(ctx meta.Context, writeback bool) (err syscall.Errno) {
+	trace := beginWriterFlush(ctx, f.inode)
+	defer func() { trace.end(err) }()
 	s := time.Now()
 	f.Lock()
 	defer f.Unlock()
 	f.flushwaiting++
 
-	var err syscall.Errno
-	var wait = time.Second * time.Duration((f.w.maxRetries+2)*(f.w.maxRetries+2)/2)
-	if wait < time.Minute*5 {
-		wait = time.Minute * 5
+	wait := f.w.flushTimeout()
+	var deadline time.Time
+	if wait > 0 {
+		deadline = s.Add(wait)
 	}
-	var deadline = time.Now().Add(wait)
+	nextWarning := s.Add(5 * time.Minute)
 	for len(f.chunks) > 0 && err == 0 {
+		if f.err != 0 {
+			err = f.err
+			break
+		}
 		for _, c := range f.chunks {
 			for _, s := range c.slices {
 				if !s.freezed {
-					s.freezed = true
-					go s.flushData()
+					s.freezeWithTrace("explicit_flush", trace)
 				}
 			}
 		}
-		if f.flushcond.WaitWithTimeout(time.Second*3) && ctx.Canceled() && time.Since(s) > f.w.conf.Chunk.PutTimeout*2 {
+		poll := 3 * time.Second
+		if !deadline.IsZero() {
+			poll = min(poll, max(time.Until(deadline), 0))
+		}
+		f.flushcond.WaitWithTimeout(poll)
+		// A completed commit wins even if the deadline elapsed while acquiring the lock.
+		if len(f.chunks) == 0 {
+			break
+		}
+		if f.err != 0 {
+			err = f.err
+			break
+		}
+		if ctx.Canceled() && time.Since(s) > f.w.conf.Chunk.PutTimeout*2 {
 			logger.Warnf("flush %d interrupted after %d", f.inode, time.Since(s))
 			err = syscall.EINTR
 			break
 		}
-		if time.Now().After(deadline) {
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
 			logger.Errorf("flush %d timeout after waited %s", f.inode, wait)
 			for _, c := range f.chunks {
 				for _, s := range c.slices {
@@ -421,6 +462,14 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 			logger.Warnf("All goroutines (%d):\n%s", runtime.NumGoroutine(), buf[:n])
 			err = syscall.EIO
 			break
+		}
+		if deadline.IsZero() && !time.Now().Before(nextWarning) {
+			pending := 0
+			for _, c := range f.chunks {
+				pending += len(c.slices)
+			}
+			logger.Warnf("flush %d still waiting after %s: pending_chunks=%d pending_slices=%d; no flush deadline configured", f.inode, time.Since(s), len(f.chunks), pending)
+			nextWarning = time.Now().Add(5 * time.Minute)
 		}
 	}
 	f.flushwaiting--
@@ -437,7 +486,11 @@ func (f *fileWriter) Flush(ctx meta.Context) syscall.Errno {
 	return f.flush(ctx, false)
 }
 
+// Close waits for data and metadata and then drops this writer reference.
 func (f *fileWriter) Close(ctx meta.Context) syscall.Errno {
+	if writerFlushOrigin(ctx) == "unknown" {
+		ctx = WithWriterFlushOrigin(ctx, "internal.close")
+	}
 	defer f.w.free(f)
 	return f.Flush(ctx)
 }
@@ -467,7 +520,40 @@ type dataWriter struct {
 	maxRetries uint32
 }
 
+// flushTimeout keeps legacy retry coupling opt-in and lets zero mean completion-based waiting.
+func (w *dataWriter) flushTimeout() time.Duration {
+	if w.conf.WriterFlushTimeout == AutoWriterFlushTimeout {
+		const maxTimeout time.Duration = 1<<63 - 1
+		retries := uint64(w.maxRetries) + 2
+		// Check before squaring or converting seconds to nanoseconds to avoid a shorter deadline.
+		maxSeconds := uint64(maxTimeout / time.Second)
+		if retries > (maxSeconds*2+1)/retries {
+			return maxTimeout
+		}
+		return max(time.Second*time.Duration(retries*retries/2), 5*time.Minute)
+	}
+	return w.conf.WriterFlushTimeout
+}
+
+// NewDataWriter validates scheduling settings before starting the background slice flusher.
 func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader DataReader) DataWriter {
+	if conf.WriterFlushTimeout < 0 && conf.WriterFlushTimeout != AutoWriterFlushTimeout {
+		logger.Warnf("invalid writer flush timeout %s: using no deadline; use AutoWriterFlushTimeout for the legacy deadline", conf.WriterFlushTimeout)
+		conf.WriterFlushTimeout = 0
+	}
+	if conf.WriterReuseWindow < 0 || conf.WriterReuseWindow > 64 {
+		logger.Warnf("invalid writer reuse window %d: using default 4 (valid range 1..64)", conf.WriterReuseWindow)
+		conf.WriterReuseWindow = 4
+	}
+	if conf.WriterReuseWindow == 0 {
+		conf.WriterReuseWindow = 4
+	}
+	if conf.SliceFlushWait <= 0 {
+		conf.SliceFlushWait = defaultSliceFlushWait
+	}
+	if conf.SliceFlushIdle <= 0 {
+		conf.SliceFlushIdle = defaultSliceFlushIdle
+	}
 	w := &dataWriter{
 		m:          m,
 		store:      store,
@@ -482,6 +568,7 @@ func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader Dat
 	return w
 }
 
+// flushAll closes aged, idle or excess slices without changing explicit flush barriers.
 func (w *dataWriter) flushAll() {
 	for {
 		w.Lock()
@@ -496,10 +583,16 @@ func (w *dataWriter) flushAll() {
 			for i, c := range f.chunks {
 				hs := len(c.slices) / 2
 				for j, s := range c.slices {
-					if !s.freezed && (now.Sub(s.started) > flushDuration || now.Sub(s.lastMod) > time.Second && now.Sub(s.started) > time.Second ||
+					if !s.freezed && (now.Sub(s.started) > w.conf.SliceFlushWait ||
+						now.Sub(s.lastMod) > w.conf.SliceFlushIdle && now.Sub(s.started) > w.conf.SliceFlushIdle ||
 						tooMany && i%2 == lastBit && j <= hs) {
-						s.freezed = true
-						go s.flushData()
+						reason := "slice_pressure"
+						if now.Sub(s.started) > w.conf.SliceFlushWait {
+							reason = "age"
+						} else if now.Sub(s.lastMod) > w.conf.SliceFlushIdle && now.Sub(s.started) > w.conf.SliceFlushIdle {
+							reason = "idle"
+						}
+						s.freeze(reason)
 					}
 				}
 			}
@@ -584,7 +677,7 @@ func (w *dataWriter) FlushAll() error {
 	for inode, ind := range w.files {
 		ind.refs++
 		w.Unlock()
-		eno := ind.Flush(meta.Background())
+		eno := ind.Flush(WithWriterFlushOrigin(meta.Background(), "internal.FlushAll"))
 		w.free(ind)
 		if eno != 0 {
 			logger.Errorf("flush %s: %s", inode, eno)

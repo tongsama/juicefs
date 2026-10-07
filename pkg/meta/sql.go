@@ -3861,6 +3861,7 @@ func (m *dbMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error) {
 	return count, nil
 }
 
+// doCompactChunk commits reference replacement before legacy or deferred obsolete cleanup.
 func (m *dbMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*slice, skipped int, pos uint32, id uint64, size uint32, delayed []byte) syscall.Errno {
 	st := errno(m.txn(func(s *xorm.Session) error {
 		var c2 = chunk{Inode: inode, Indx: indx}
@@ -3934,7 +3935,7 @@ func (m *dbMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*sli
 				return e
 			})
 			if err == nil && ok && ref.Refs <= 0 {
-				m.deleteSlice(s.id, s.size)
+				m.enqueueCompactionDelete(s.id, s.size)
 			}
 		}
 	}

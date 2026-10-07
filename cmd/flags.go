@@ -23,6 +23,7 @@ import (
 	"runtime"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
+	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/urfave/cli/v2"
 )
 
@@ -147,7 +148,21 @@ func storageFlags() []cli.Flag {
 		&cli.IntFlag{
 			Name:  "max-deletes",
 			Value: 10,
-			Usage: "number of threads to delete objects",
+			Usage: "number of background threads to delete objects; 0 disables deletion, negative values delete synchronously in the caller (not unlimited concurrency)",
+		},
+		&cli.StringFlag{
+			Name: "compaction-gc-mode", Value: "legacy",
+			Usage: "obsolete-slice cleanup notification: legacy waits for queue space; deferred uses durable references and bounded asynchronous hints",
+			Action: func(c *cli.Context, value string) error {
+				return (&meta.Config{CompactionGCMode: value, MaxDeletes: c.Int("max-deletes"), NoBGJob: c.Bool("no-bgjob"), ReadOnly: c.Bool("read-only")}).ValidateCompactionGC()
+			},
+		},
+		&cli.StringFlag{
+			Name: "compaction-scheduler", Value: "legacy",
+			Usage: "background compaction admission: legacy or bounded advisory priority scheduling",
+			Action: func(_ *cli.Context, value string) error {
+				return (&meta.Config{CompactionScheduler: value}).ValidateCompactionScheduler()
+			},
 		},
 		&cli.StringFlag{
 			Name:  "upload-limit",
@@ -216,6 +231,40 @@ func dataCacheFlags() []cli.Flag {
 			Name:  "writeback-threshold-size",
 			Value: "0",
 			Usage: "blocks smaller than this size will be staged, 0 means all staged.",
+		},
+		&cli.BoolFlag{
+			Name:  "writeback-fsync",
+			Value: true,
+			Usage: "fdatasync staged blocks and fsync their directories before acknowledging writes in writeback mode; disabling it is faster but staged data may be lost on an OS crash",
+		},
+		&cli.StringFlag{
+			Name:  "slice-flush-wait",
+			Value: "5s",
+			Usage: "maximum duration before flushing a pending slice",
+		},
+		&cli.StringFlag{
+			Name:  "slice-flush-idle",
+			Value: "1s",
+			Usage: "idle duration before flushing a pending slice",
+		},
+		&cli.IntFlag{
+			Name: "writer-reuse-window", Value: 4,
+			Usage: "pending slice search distance before freezing old candidates (1..64); does not bypass flush barriers or merge gaps",
+			Action: func(_ *cli.Context, value int) error {
+				if value < 1 || value > 64 {
+					return fmt.Errorf("writer-reuse-window must be between 1 and 64")
+				}
+				return nil
+			},
+		},
+		&cli.StringFlag{
+			Name:  "writer-flush-timeout",
+			Value: "0s",
+			Usage: "deadline for pending file writes; 0s waits until completion, auto uses the legacy retry-derived deadline, positive durations opt into timeout errors",
+			Action: func(_ *cli.Context, value string) error {
+				_, err := parseWriterFlushTimeout(value)
+				return err
+			},
 		},
 		&cli.StringFlag{
 			Name:  "upload-delay",

@@ -31,3 +31,8 @@ func getAtime(fi os.FileInfo) time.Time {
 }
 
 func dropOSCache(r ReadCloser) {}
+
+// fdatasyncFile flushes file data; darwin has no fdatasync, and os.File.Sync uses F_FULLFSYNC.
+func fdatasyncFile(f *os.File) error {
+	return f.Sync()
+}

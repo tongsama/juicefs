@@ -57,6 +57,8 @@ const (
 	OpSummary = 1007
 	// CompactPath is a message to trigger compact
 	CompactPath = 1008
+	// RetireSlice optionally cancels local staging after committed reference retirement, without remote I/O.
+	RetireSlice = 1009
 )
 
 const (

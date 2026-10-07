@@ -280,7 +280,27 @@ func expandPathForEmbedded(addr string) string {
 	return addr
 }
 
+// parseWriterFlushTimeout rejects invalid values rather than silently disabling a deadline.
+func parseWriterFlushTimeout(value string) (time.Duration, error) {
+	if value == "auto" {
+		return vfs.AutoWriterFlushTimeout, nil
+	}
+	if value == "" {
+		return 0, nil
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil || timeout < 0 {
+		return 0, fmt.Errorf("invalid writer-flush-timeout %q: use 0s, auto, or a positive duration", value)
+	}
+	return timeout, nil
+}
+
+// getVfsConf carries validated CLI settings into the VFS completion policy.
 func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chunkConf *chunk.Config) *vfs.Config {
+	flushTimeout, err := parseWriterFlushTimeout(c.String("writer-flush-timeout"))
+	if err != nil {
+		logger.Fatalf("%s", err)
+	}
 	cfg := &vfs.Config{
 		Meta:   metaConf,
 		Format: *format,
@@ -288,16 +308,20 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 			EnableCap:     c.Bool("enable-cap"),
 			EnableSELinux: c.Bool("enable-selinux"),
 		},
-		Version:         version.Version(),
-		Chunk:           chunkConf,
-		BackupMeta:      utils.Duration(c.String("backup-meta")),
-		BackupSkipTrash: c.Bool("backup-skip-trash"),
-		Port:            &vfs.Port{DebugAgent: debugAgent, PyroscopeAddr: c.String("pyroscope")},
-		PrefixInternal:  c.Bool("prefix-internal"),
-		Pid:             os.Getpid(),
-		PPid:            os.Getppid(),
-		UMask:           0xFFFF,
-		HideInternal:    c.Bool("hide-internal"),
+		Version:            version.Version(),
+		Chunk:              chunkConf,
+		BackupMeta:         utils.Duration(c.String("backup-meta")),
+		BackupSkipTrash:    c.Bool("backup-skip-trash"),
+		SliceFlushWait:     utils.Duration(c.String("slice-flush-wait")),
+		SliceFlushIdle:     utils.Duration(c.String("slice-flush-idle")),
+		WriterReuseWindow:  c.Int("writer-reuse-window"),
+		WriterFlushTimeout: flushTimeout,
+		Port:               &vfs.Port{DebugAgent: debugAgent, PyroscopeAddr: c.String("pyroscope")},
+		PrefixInternal:     c.Bool("prefix-internal"),
+		Pid:                os.Getpid(),
+		PPid:               os.Getppid(),
+		UMask:              0xFFFF,
+		HideInternal:       c.Bool("hide-internal"),
 	}
 
 	if c.IsSet("umask") {
@@ -315,7 +339,17 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 	return cfg
 }
 
+// registerMetaMsg connects durable metadata decisions to data storage and optional local retirement.
 func registerMetaMsg(m meta.Meta, store chunk.ChunkStore, chunkConf *chunk.Config) {
+	m.OnMsg(meta.RetireSlice, func(args ...interface{}) error {
+		if retire, ok := store.(interface {
+			Retire(id uint64, length int) error
+		}); ok {
+			return retire.Retire(args[0].(uint64), int(args[1].(uint32)))
+		}
+		// Custom stores without local retirement keep cleanup in physical Remove.
+		return nil
+	})
 	m.OnMsg(meta.DeleteSlice, func(args ...interface{}) error {
 		return store.Remove(args[0].(uint64), int(args[1].(uint32)))
 	})
@@ -332,6 +366,7 @@ func readConfig(mp string) ([]byte, error) {
 	return contents, err
 }
 
+// getMetaConf validates optional compaction modes before constructing a metadata client.
 func getMetaConf(c *cli.Context, mp string, readOnly bool) *meta.Config {
 	conf := meta.DefaultConf()
 	conf.Retries = c.Int("io-retries")
@@ -339,6 +374,14 @@ func getMetaConf(c *cli.Context, mp string, readOnly bool) *meta.Config {
 	conf.SkipDirNlink = c.Int("skip-dir-nlink")
 	conf.ReadOnly = readOnly
 	conf.NoBGJob = c.Bool("no-bgjob")
+	conf.CompactionGCMode = c.String("compaction-gc-mode")
+	conf.CompactionScheduler = c.String("compaction-scheduler")
+	if err := conf.ValidateCompactionGC(); err != nil {
+		logger.Fatalf("%s", err)
+	}
+	if err := conf.ValidateCompactionScheduler(); err != nil {
+		logger.Fatalf("%s", err)
+	}
 	conf.OpenCache = utils.Duration(c.String("open-cache"))
 	conf.OpenCacheLimit = c.Uint64("open-cache-limit")
 	conf.Heartbeat = utils.Duration(c.String("heartbeat"))
@@ -387,6 +430,7 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 		MaxRetries:             c.Int("io-retries"),
 		Writeback:              c.Bool("writeback"),
 		WritebackThresholdSize: int(utils.ParseBytes(c, "writeback-threshold-size", 'B')),
+		StagingNoSync:          !c.Bool("writeback-fsync"),
 		Prefetch:               c.Int("prefetch"),
 		BufferSize:             utils.ParseBytes(c, "buffer-size", 'M'),
 		UploadLimit:            utils.ParseMbps(c, "upload-limit") * 1e6 / 8,

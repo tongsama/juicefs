@@ -196,6 +196,50 @@ func TestVFSBasic(t *testing.T) {
 
 }
 
+// failingWriteMeta injects a metadata commit failure while keeping real reads and storage.
+type failingWriteMeta struct {
+	meta.Meta
+	err syscall.Errno
+}
+
+// Write rejects the new slice so reads can only see previously committed data.
+func (m *failingWriteMeta) Write(ctx meta.Context, inode meta.Ino, indx, off uint32, slice meta.Slice, mtime time.Time) syscall.Errno {
+	return m.err
+}
+
+// TestVFSReadFlushError prevents successful stale reads after a failed slice commit.
+func TestVFSReadFlushError(t *testing.T) {
+	for _, eno := range []syscall.Errno{syscall.EIO, syscall.ENOSPC, syscall.EDQUOT, syscall.ENOENT} {
+		t.Run(eno.Error(), func(t *testing.T) {
+			v, _ := createTestVFS(nil, "")
+			ctx := NewLogContext(meta.Background())
+			fe, fh, err := v.Create(ctx, 1, "flush-error", 0644, 0, syscall.O_RDWR)
+			require.Zero(t, err)
+			defer v.Release(ctx, fe.Inode, fh)
+			require.Zero(t, v.Write(ctx, fe.Inode, []byte("old"), 0, fh))
+			require.Zero(t, v.Fsync(ctx, fe.Inode, 0, fh))
+			buf := make([]byte, 3)
+			n, err := v.Read(ctx, fe.Inode, buf, 0, fh)
+			require.Zero(t, err)
+			require.Equal(t, "old", string(buf[:n]))
+
+			// Fail only the commit, after the slice data has reached the real store.
+			v.writer.(*dataWriter).m = &failingWriteMeta{Meta: v.Meta, err: eno}
+			require.Zero(t, v.Write(ctx, fe.Inode, []byte("new"), 0, fh))
+			buf = []byte("???")
+			n, err = v.Read(ctx, fe.Inode, buf, 0, fh)
+			if err != eno || n != 0 || string(buf) != "???" {
+				t.Errorf("read after failed commit: errno=%v n=%d data=%q; want errno=%v, no bytes and untouched buffer", err, n, buf, eno)
+			}
+			h := v.findHandle(fe.Inode, fh)
+			h.Lock()
+			defer h.Unlock()
+			require.Empty(t, h.ops, "read must unregister its operation even when preflush fails")
+			require.Zero(t, h.readers, "read must release its handle lock")
+		})
+	}
+}
+
 func TestVFSIO(t *testing.T) {
 	v, _ := createTestVFS(nil, "")
 	ctx := NewLogContext(meta.Background())
