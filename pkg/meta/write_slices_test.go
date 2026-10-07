@@ -225,9 +225,42 @@ func testWriteSlices(t *testing.T, m Meta) {
 	})
 }
 
-// TestWriteSlicesMemKV runs the shared WriteSlices checks on MemKV.
+// TestWriteSlicesMemKV runs the shared WriteSlices checks on MemKV and requires
+// the single-transaction implementation.
 func TestWriteSlicesMemKV(t *testing.T) {
-	testWriteSlices(t, newWriteSlicesMemKV(t))
+	m := newWriteSlicesMemKV(t)
+	if _, ok := m.getBase().en.(sliceBatchWriter); !ok {
+		t.Fatal("tkv engine does not implement doWriteSlices")
+	}
+	testWriteSlices(t, m)
+}
+
+// TestWriteSlicesTKVDuplicate skips a slice already in the chunk, as Write does,
+// and appends the rest of the batch.
+func TestWriteSlicesTKVDuplicate(t *testing.T) {
+	m := newWriteSlicesMemKV(t)
+	_, f := createIn(t, m, "dup")
+	ctx := Background()
+	ws := sliceShapes(t, m, 3, 4096)
+	if st := m.Write(ctx, f, 0, ws[1].Off, ws[1].Slice, time.Now()); st != 0 {
+		t.Fatal(st)
+	}
+	if n, st := m.WriteSlices(ctx, f, 0, ws, time.Now()); n != 3 || st != 0 {
+		t.Fatalf("WriteSlices = %d, %s", n, st)
+	}
+	var ss []Slice
+	if st := m.Read(ctx, f, 0, &ss); st != 0 {
+		t.Fatal(st)
+	}
+	ids := map[uint64]int{}
+	for _, s := range ss {
+		if s.Id != 0 {
+			ids[s.Id]++
+		}
+	}
+	if len(ids) != 3 {
+		t.Fatalf("visible slices %+v", ss)
+	}
 }
 
 // failingBatchEngine fails batches with a fixed errno and counts single writes,

@@ -2693,6 +2693,71 @@ func (m *kvMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice 
 	}, inode))
 }
 
+// doWriteSlices appends slices to one chunk in a single transaction, skipping
+// slices the chunk already holds (as doWrite does), and sets the chunk and the
+// inode once.
+func (m *kvMeta) doWriteSlices(ctx Context, inode Ino, indx uint32, slices []SliceWrite, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
+	return errno(m.txn(ctx, func(tx *kvTxn) error {
+		*delta = dirStat{}
+		*attr = Attr{}
+		rs := tx.gets(m.inodeKey(inode), m.chunkKey(inode, indx))
+		if rs[0] == nil {
+			return syscall.ENOENT
+		}
+		m.parseAttr(rs[0], attr)
+		if attr.Typ != TypeFile {
+			return syscall.EPERM
+		}
+		if len(rs[1])%sliceBytes != 0 {
+			logger.Errorf("Invalid chunk value for inode %d indx %d: %d", inode, indx, len(rs[1]))
+			return syscall.EIO
+		}
+		val := append([]byte(nil), rs[1]...) // do not write into the value read in this transaction
+		oldLength := attr.Length
+		var added []SliceWrite
+		for _, w := range slices {
+			buf := marshalSlice(w.Off, w.Slice.Id, w.Slice.Size, w.Slice.Off, w.Slice.Len)
+			dup := false
+			for i := 0; i < len(val); i += sliceBytes {
+				if bytes.Equal(val[i:i+sliceBytes], buf) {
+					dup = true
+					break
+				}
+			}
+			if dup {
+				logger.Warnf("Write same slice for inode %d indx %d sliceId %d", inode, indx, w.Slice.Id)
+				continue
+			}
+			if newleng := uint64(indx)*ChunkSize + uint64(w.Off) + uint64(w.Slice.Len); newleng > attr.Length {
+				attr.Length = newleng
+			}
+			val = append(val, buf...)
+			added = append(added, w)
+		}
+		if len(added) == 0 {
+			*numSlices = len(val) / sliceBytes
+			return nil
+		}
+		delta.length = int64(attr.Length - oldLength)
+		delta.space = align4K(attr.Length) - align4K(oldLength)
+		if err := m.checkQuota(ctx, delta.space, 0, attr.Uid, attr.Gid, m.getParents(tx, inode, attr.Parent)...); err != 0 {
+			return err
+		}
+		now := time.Now()
+		attr.Mtime = mtime.Unix()
+		attr.Mtimensec = uint32(mtime.Nanosecond())
+		attr.Ctime = now.Unix()
+		attr.Ctimensec = uint32(now.Nanosecond())
+		tx.set(m.inodeKey(inode), m.marshal(attr))
+		tx.set(m.chunkKey(inode, indx), val)
+		*numSlices = len(val) / sliceBytes
+		for _, w := range added {
+			m.genLog(tx, now, "WRITE(%d,%d,%d,%d,%d,%d,%d):%d", inode, indx, w.Off, w.Slice.Id, w.Slice.Len, attr.Mtime, attr.Mtimensec, *numSlices)
+		}
+		return nil
+	}, inode))
+}
+
 func (m *kvMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut uint64, size uint64, flags uint32, copied, outLength *uint64) syscall.Errno {
 	defer m.timeit("CopyFileRange", time.Now())
 	var newLength, newSpace int64
