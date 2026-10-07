@@ -2179,6 +2179,21 @@ func (m *baseMeta) Close(ctx Context, inode Ino) syscall.Errno {
 }
 
 // Write commits a slice and diagnoses stalls without changing inode lock ordering.
+// compactionWanted reports whether a chunk whose slice count grew from prev to
+// now passed a count at which a single Write would request compaction
+// (every count ending in 99, or more than 350 slices).
+func compactionWanted(prev, now int) bool {
+	if now > 350 {
+		return true
+	}
+	for n := max(prev+1, 0); n <= now; n++ {
+		if n%100 == 99 {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) (st syscall.Errno) {
 	start := time.Now()
 	defer m.timeit("Write", start)
@@ -2211,7 +2226,7 @@ func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice 
 		m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
 		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
 		statTime = time.Since(phaseStart)
-		if numSlices%100 == 99 || numSlices > 350 {
+		if compactionWanted(numSlices-1, numSlices) {
 			if numSlices < maxSlices {
 				m.requestBackgroundCompaction(inode, indx, numSlices, int(attr.Tier))
 			} else {
