@@ -160,6 +160,10 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		}
 	}
 
+	if s.store.conf.FinishCanceledGet && s.store.conf.CacheEnabled() && s.store.shouldCache(blockSize) {
+		return s.readBlockDetached(ctx, p, key, boff, blockSize)
+	}
+
 	block, err := s.store.group.Execute(key, func() (*Page, error) {
 		tmp := page
 		if boff > 0 || len(p) < blockSize {
@@ -576,6 +580,9 @@ type Config struct {
 	BufferSize             uint64
 	Readahead              int
 	Prefetch               int
+	// FinishCanceledGet keeps a full-block GET running after its reader is canceled,
+	// and stores the block in the disk cache instead of discarding the download.
+	FinishCanceledGet bool
 }
 
 func (c *Config) SelfCheck(uuid string) {
@@ -712,6 +719,11 @@ type cachedStore struct {
 	objectDataBytes     *prometheus.CounterVec
 	stageBlockDelay     prometheus.Counter
 	stageBlockErrors    prometheus.Counter
+
+	// detachedFetches bounds the GETs kept running for canceled readers (FinishCanceledGet).
+	detachedFetches     chan struct{}
+	canceledGetFinished prometheus.Counter
+	canceledGetDropped  prometheus.Counter
 }
 
 func logRequest(typeStr, key, param, reqID string, err error, used time.Duration) {
@@ -773,15 +785,106 @@ func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page,
 	return 0, errTryFullRead
 }
 
+// readBlockDetached reads p from a full block fetched by a GET that is not tied to ctx.
+// If ctx is canceled first, the caller returns at once while the GET goes on in the
+// background and caches the block (see loadDetached). The fetch always uses its own
+// page, so nothing writes into the caller's buffer after it has returned.
+func (s *rSlice) readBlockDetached(ctx context.Context, p []byte, key string, boff, blockSize int) (int, error) {
+	type result struct {
+		block *Page
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		block, err := s.store.group.Execute(key, func() (*Page, error) {
+			tmp := NewOffPage(blockSize)
+			return tmp, s.store.loadDetached(ctx, key, tmp)
+		})
+		done <- result{block, err}
+	}()
+	select {
+	case r := <-done:
+		defer r.block.Release()
+		if r.err != nil {
+			return 0, r.err
+		}
+		copy(p, r.block.Data[boff:])
+		return len(p), nil
+	case <-ctx.Done():
+		go func() { (<-done).block.Release() }()
+		return 0, ctx.Err()
+	}
+}
+
+// loadDetached downloads a full block into page and caches it, for readBlockDetached.
+// It gives up while waiting for a download slot if ctx ends, because no request has
+// been sent yet. Once the GET has started, a cancel of ctx no longer stops it, as long
+// as fewer than detachedFetches GETs are already running this way; above that limit
+// the GET is canceled as before. GetTimeout still applies.
+func (store *cachedStore) loadDetached(ctx context.Context, key string, page *Page) error {
+	select {
+	case store.currentDownload <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-store.currentDownload }()
+
+	gctx, gcancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer gcancel()
+	const (
+		running = iota
+		detached
+		finished
+	)
+	var mu sync.Mutex
+	state := running
+	stop := context.AfterFunc(ctx, func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if state != running {
+			return
+		}
+		select {
+		case store.detachedFetches <- struct{}{}:
+			state = detached
+		default:
+			store.canceledGetDropped.Inc()
+			gcancel()
+		}
+	})
+	defer stop()
+
+	err := store.fetchBlock(gctx, key, page, true, false)
+
+	mu.Lock()
+	wasDetached := state == detached
+	state = finished
+	mu.Unlock()
+	if wasDetached {
+		<-store.detachedFetches
+		if err == nil {
+			store.canceledGetFinished.Inc()
+			logger.Debugf("finished GET %s after its reader was canceled, block cached", key)
+		}
+	}
+	return err
+}
+
 func (store *cachedStore) load(ctx context.Context, key string, page *Page, cache bool, forceCache bool) (err error) {
+	store.currentDownload <- struct{}{}
+	defer func() { <-store.currentDownload }()
+	return store.fetchBlock(ctx, key, page, cache, forceCache)
+}
+
+// fetchBlock downloads the whole object key into page and optionally caches it.
+// The caller must hold a currentDownload slot.
+func (store *cachedStore) fetchBlock(ctx context.Context, key string, page *Page, cache bool, forceCache bool) (err error) {
 	defer func() {
 		e := recover()
 		if e != nil {
 			err = fmt.Errorf("recovered from %s", e)
 		}
 	}()
-	store.currentDownload <- struct{}{}
-	defer func() { <-store.currentDownload }()
 	needed := store.compressor.CompressBound(len(page.Data))
 	compressed := needed > len(page.Data)
 	// we don't know the actual size for compressed block
@@ -863,6 +966,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		conf:              config,
 		currentUpload:     make(chan struct{}, config.MaxUpload),
 		currentDownload:   make(chan struct{}, config.MaxDownload),
+		detachedFetches:   make(chan struct{}, max(1, config.MaxDownload/2)),
 		compressor:        compressor,
 		seekable:          compressor.CompressBound(0) == 0,
 		pendingCh:         make(chan *pendingItem, 100*config.MaxUpload),
@@ -994,6 +1098,14 @@ func (store *cachedStore) initMetrics() {
 		Name: "staging_block_errors",
 		Help: "Total errors when staging blocks",
 	})
+	store.canceledGetFinished = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "kaz_canceled_get_finished",
+		Help: "Full-block GETs finished and cached after their reader was canceled.",
+	})
+	store.canceledGetDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "kaz_canceled_get_dropped",
+		Help: "Full-block GETs aborted on cancel because too many were already kept running.",
+	})
 }
 
 func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
@@ -1008,6 +1120,8 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(store.objectReqsHistogram)
 	reg.MustRegister(store.objectReqErrors)
 	reg.MustRegister(store.objectDataBytes)
+	reg.MustRegister(store.canceledGetFinished)
+	reg.MustRegister(store.canceledGetDropped)
 	reg.MustRegister(store.stageBlockDelay)
 	reg.MustRegister(store.stageBlockErrors)
 	reg.MustRegister(prometheus.NewGaugeFunc(

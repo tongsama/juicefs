@@ -434,6 +434,7 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 		WritebackThresholdSize: int(utils.ParseBytes(c, "writeback-threshold-size", 'B')),
 		StagingNoSync:          !c.Bool("writeback-fsync"),
 		Prefetch:               c.Int("prefetch"),
+		FinishCanceledGet:      c.Bool("kaz-finish-canceled-get"),
 		BufferSize:             utils.ParseBytes(c, "buffer-size", 'M'),
 		UploadLimit:            utils.ParseMbps(c, "upload-limit") * 1e6 / 8,
 		DownloadLimit:          utils.ParseMbps(c, "download-limit") * 1e6 / 8,

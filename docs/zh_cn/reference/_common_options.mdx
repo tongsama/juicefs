@@ -52,6 +52,7 @@
 |-|-|
 |`--buffer-size=300`|读写缓冲区的总大小；单位为 MiB (默认：300)。阅读[「读写缓冲区」](../guide/cache.md#buffer-size)了解更多。|
 |`--prefetch=1`|并发预读 N 个块 (默认：1)。阅读[「客户端读缓存」](../guide/cache.md#client-read-cache)了解更多。|
+|`--kaz-finish-canceled-get`|[kaz] 当整块下载因读请求不再需要（例如被丢弃的预读）而被取消时，继续完成下载并写入磁盘缓存，而不是丢弃（默认：false）。尚未开始的下载仍会跳过，以这种方式继续的下载最多为 `--max-downloads` 的一半。需要启用磁盘缓存。|
 |`--writeback`|后台异步上传对象，默认为 false。阅读[「客户端写缓存」](../guide/cache.md#client-write-cache)了解更多。|
 |`--writeback-threshold-size=0` <VersionAdd>1.4</VersionAdd>|启用 `--writeback` 后，仅小于此大小的数据块会暂存到本地缓存，较大的数据块将直接上传。默认为 0，表示所有数据块都暂存。|
 |`--writeback-fsync=true`|启用 `--writeback` 后，在确认写入前对每个暂存数据块执行 `fdatasync`，并对其所在目录执行 `fsync`，确保操作系统崩溃或断电后暂存数据不丢失。设为 `false` 可提升写入性能，但操作系统崩溃时暂存数据块可能丢失（残留为空文件）。|
