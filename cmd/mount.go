@@ -425,6 +425,7 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 		HashPrefix: format.HashPrefix,
 
 		GetTimeout:             utils.Duration(c.String("get-timeout")),
+		GetHeaderTimeout:       utils.Duration(c.String("kaz-get-header-timeout")),
 		PutTimeout:             utils.Duration(c.String("put-timeout")),
 		MaxUpload:              c.Int("max-uploads"),
 		MaxDownload:            c.Int("max-downloads"),
@@ -434,6 +435,7 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 		WritebackThresholdSize: int(utils.ParseBytes(c, "writeback-threshold-size", 'B')),
 		StagingNoSync:          !c.Bool("writeback-fsync"),
 		Prefetch:               c.Int("prefetch"),
+		FinishCanceledGet:      c.Bool("kaz-finish-canceled-get"),
 		BufferSize:             utils.ParseBytes(c, "buffer-size", 'M'),
 		UploadLimit:            utils.ParseMbps(c, "upload-limit") * 1e6 / 8,
 		DownloadLimit:          utils.ParseMbps(c, "download-limit") * 1e6 / 8,

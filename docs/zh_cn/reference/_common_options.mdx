@@ -37,6 +37,7 @@
 |`--bucket=value`|为当前挂载点指定访问对象存储的 Endpoint。|
 |`--storage-class value` <VersionAdd>1.1</VersionAdd>|当前客户端写入数据的存储类型|
 |`--get-timeout=60`|下载一个对象的超时时间；单位为秒 (默认：60)|
+|`--kaz-get-header-timeout=0`|[kaz] 下载数据块时等待响应头的最长时间；超时后放弃该请求，并通过常规重试重新下载 (默认：0，表示禁用)。与 `--get-timeout` 的区别：`--get-timeout` 限制整个下载 (等待响应加接收数据) 的时间，而此选项只限制数据开始传输前的等待，因此不会中断缓慢但仍在传输的下载。适用于对象存储偶尔在响应前停滞的情况 (例如基于 Google Drive 的 rclone serve s3)。请设置为明显大于正常下载时间的值。|
 |`--put-timeout=60`|上传一个对象的超时时间；单位为秒 (默认：60)|
 |`--io-retries=10`|网络异常时的重试次数，元数据请求的重试次数也由这个选项控制。如果超过重试次数将会返回 `EIO Input/output error` 错误。（默认：10）|
 |`--max-uploads=20`|上传并发度，默认为 20。对于粒度为 4M 的写入模式，20 并发已经是很高的默认值，在这样的写入模式下，提高写并发往往需要伴随增大 `--buffer-size`, 详见「[读写缓冲区](../guide/cache.md#buffer-size)」。但面对百 K 级别的小随机写，并发量大的时候很容易产生阻塞等待，造成写入速度恶化。如果无法改善应用写模式，对其进行合并，那么需要考虑采用更高的写并发，避免排队等待。|
@@ -52,6 +53,7 @@
 |-|-|
 |`--buffer-size=300`|读写缓冲区的总大小；单位为 MiB (默认：300)。阅读[「读写缓冲区」](../guide/cache.md#buffer-size)了解更多。|
 |`--prefetch=1`|并发预读 N 个块 (默认：1)。阅读[「客户端读缓存」](../guide/cache.md#client-read-cache)了解更多。|
+|`--kaz-finish-canceled-get`|[kaz] 当整块下载因读请求不再需要（例如被丢弃的预读）而被取消时，继续完成下载并写入磁盘缓存，而不是丢弃（默认：false）。尚未开始的下载仍会跳过，以这种方式继续的下载最多为 `--max-downloads` 的一半。需要启用磁盘缓存。|
 |`--writeback`|后台异步上传对象，默认为 false。阅读[「客户端写缓存」](../guide/cache.md#client-write-cache)了解更多。|
 |`--writeback-threshold-size=0` <VersionAdd>1.4</VersionAdd>|启用 `--writeback` 后，仅小于此大小的数据块会暂存到本地缓存，较大的数据块将直接上传。默认为 0，表示所有数据块都暂存。|
 |`--writeback-fsync=true`|启用 `--writeback` 后，在确认写入前对每个暂存数据块执行 `fdatasync`，并对其所在目录执行 `fsync`，确保操作系统崩溃或断电后暂存数据不丢失。设为 `false` 可提升写入性能，但操作系统崩溃时暂存数据块可能丢失（残留为空文件）。|
