@@ -122,6 +122,11 @@ func storageFlags() []cli.Flag {
 			Usage: "the timeout to download an object",
 		},
 		&cli.StringFlag{
+			Name:  "kaz-get-header-timeout",
+			Value: "0",
+			Usage: "[kaz] give up and retry a block download when the object store sends no response headers within this time (0 disables it); unlike --get-timeout, which bounds the whole download, this bounds only the wait before the data starts",
+		},
+		&cli.StringFlag{
 			Name:  "put-timeout",
 			Value: "60s",
 			Usage: "the timeout to upload an object",
