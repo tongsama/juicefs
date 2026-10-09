@@ -583,6 +583,9 @@ type Config struct {
 	// FinishCanceledGet keeps a full-block GET running after its reader is canceled,
 	// and stores the block in the disk cache instead of discarding the download.
 	FinishCanceledGet bool
+	// GetHeaderTimeout bounds only the wait for the response headers of a full-block GET
+	// (0 disables it). GetTimeout still bounds the whole GET, headers and body together.
+	GetHeaderTimeout time.Duration
 }
 
 func (c *Config) SelfCheck(uuid string) {
@@ -724,6 +727,7 @@ type cachedStore struct {
 	detachedFetches     chan struct{}
 	canceledGetFinished prometheus.Counter
 	canceledGetDropped  prometheus.Counter
+	getHeaderTimeouts   prometheus.Counter
 }
 
 func logRequest(typeStr, key, param, reqID string, err error, used time.Duration) {
@@ -735,6 +739,9 @@ func logRequest(typeStr, key, param, reqID string, err error, used time.Duration
 }
 
 var errTryFullRead = errors.New("try full read")
+
+// errGetHeaderTimeout reports a full-block GET abandoned by GetHeaderTimeout.
+var errGetHeaderTimeout = errors.New("no response headers within --kaz-get-header-timeout")
 
 func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page, off int) (n int, err error) {
 	p := page.Data
@@ -870,6 +877,55 @@ func (store *cachedStore) loadDetached(ctx context.Context, key string, page *Pa
 	return err
 }
 
+// cancelOnClose ends the request context of a GET when its body is closed.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+// Close closes the body and then releases its request context.
+func (c *cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
+}
+
+// getWithHeaderTimeout gets the whole object key, giving up with errGetHeaderTimeout
+// when Get (which returns once the response headers arrive) takes longer than
+// GetHeaderTimeout. After the headers, the body is read under ctx only, so a slow body
+// is still bounded by GetTimeout alone. Abandoned GETs are retried by the caller's
+// usual retry path.
+func (store *cachedStore) getWithHeaderTimeout(ctx context.Context, key string, getters ...object.AttrGetter) (io.ReadCloser, error) {
+	timeout := store.conf.GetHeaderTimeout
+	if timeout <= 0 {
+		return store.storage.Get(ctx, key, 0, -1, getters...)
+	}
+	hctx, cancel := context.WithCancel(ctx)
+	var fired atomic.Bool
+	timer := time.AfterFunc(timeout, func() {
+		fired.Store(true)
+		cancel()
+	})
+	in, err := store.storage.Get(hctx, key, 0, -1, getters...)
+	if !timer.Stop() && fired.Load() {
+		if in != nil {
+			_ = in.Close()
+		}
+		cancel()
+		if ctx.Err() != nil { // the caller gave up first; report that instead
+			return nil, ctx.Err()
+		}
+		store.getHeaderTimeouts.Inc()
+		logger.Warnf("GET %s: %s (%s), will retry", key, errGetHeaderTimeout, timeout)
+		return nil, fmt.Errorf("%w (%s)", errGetHeaderTimeout, timeout)
+	}
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return &cancelOnClose{in, cancel}, nil
+}
+
 func (store *cachedStore) load(ctx context.Context, key string, page *Page, cache bool, forceCache bool) (err error) {
 	store.currentDownload <- struct{}{}
 	defer func() { <-store.currentDownload }()
@@ -910,7 +966,7 @@ func (store *cachedStore) fetchBlock(ctx context.Context, key string, page *Page
 	err = utils.WithTimeout(ctx, func(cCtx context.Context) error {
 		defer p.Release()
 		// it will be retried in the upper layer.
-		in, err = store.storage.Get(cCtx, key, 0, -1, object.WithRequestID(&reqID), object.WithStorageClass(&sc))
+		in, err = store.getWithHeaderTimeout(cCtx, key, object.WithRequestID(&reqID), object.WithStorageClass(&sc))
 		if err == nil {
 			n, err = io.ReadFull(in, p.Data)
 			_ = in.Close()
@@ -932,7 +988,7 @@ func (store *cachedStore) fetchBlock(ctx context.Context, key string, page *Page
 	store.objectReqsHistogram.WithLabelValues("GET", sc).Observe(used.Seconds())
 	if err != nil {
 		store.objectReqErrors.Add(1)
-		return fmt.Errorf("get %s: %s", key, err)
+		return fmt.Errorf("get %s: %w", key, err)
 	}
 	if compressed {
 		n, err = store.compressor.Decompress(page.Data, p.Data[:n])
@@ -1106,6 +1162,10 @@ func (store *cachedStore) initMetrics() {
 		Name: "kaz_canceled_get_dropped",
 		Help: "Full-block GETs aborted on cancel because too many were already kept running.",
 	})
+	store.getHeaderTimeouts = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "kaz_get_header_timeouts",
+		Help: "Full-block GETs abandoned because no response headers arrived within --kaz-get-header-timeout.",
+	})
 }
 
 func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
@@ -1122,6 +1182,7 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(store.objectDataBytes)
 	reg.MustRegister(store.canceledGetFinished)
 	reg.MustRegister(store.canceledGetDropped)
+	reg.MustRegister(store.getHeaderTimeouts)
 	reg.MustRegister(store.stageBlockDelay)
 	reg.MustRegister(store.stageBlockErrors)
 	reg.MustRegister(prometheus.NewGaugeFunc(

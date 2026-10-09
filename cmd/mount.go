@@ -425,6 +425,7 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 		HashPrefix: format.HashPrefix,
 
 		GetTimeout:             utils.Duration(c.String("get-timeout")),
+		GetHeaderTimeout:       utils.Duration(c.String("kaz-get-header-timeout")),
 		PutTimeout:             utils.Duration(c.String("put-timeout")),
 		MaxUpload:              c.Int("max-uploads"),
 		MaxDownload:            c.Int("max-downloads"),
