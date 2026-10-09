@@ -116,3 +116,36 @@ func TestGetHeaderTimeoutDisabled(t *testing.T) {
 	require.NoError(t, store.load(context.Background(), "chunks/0/0/1_0_1048576", page, false, false))
 	require.Equal(t, 0.0, testutil.ToFloat64(store.getHeaderTimeouts))
 }
+
+func TestGetHeaderTimeoutNotRepeatedForSameKey(t *testing.T) {
+	// The object always takes longer than the header timeout to answer, like a
+	// Google Drive file that stalls for about 30s: the retry must wait for it.
+	store, size := headerTimeoutStore(t, 100*time.Millisecond, 300*time.Millisecond, 0)
+	page := NewOffPage(size)
+	defer page.Release()
+	key := "chunks/0/0/1_0_1048576"
+	err := store.load(context.Background(), key, page, false, false)
+	require.True(t, errors.Is(err, errGetHeaderTimeout), "first GET is cut: %v", err)
+
+	require.NoError(t, store.load(context.Background(), key, page, false, false), "the retry must not be cut")
+	require.Equal(t, 1.0, testutil.ToFloat64(store.getHeaderTimeouts))
+
+	// Other keys are still cut.
+	err = store.load(context.Background(), "chunks/0/0/2_0_1048576", page, false, false)
+	require.True(t, errors.Is(err, errGetHeaderTimeout), "unexpected error: %v", err)
+}
+
+func TestGetHeaderTimeoutAppliesAgainLater(t *testing.T) {
+	old := headerTimeoutMemory
+	headerTimeoutMemory = 50 * time.Millisecond
+	defer func() { headerTimeoutMemory = old }()
+
+	store, size := headerTimeoutStore(t, 100*time.Millisecond, 300*time.Millisecond, 0)
+	page := NewOffPage(size)
+	defer page.Release()
+	key := "chunks/0/0/1_0_1048576"
+	require.Error(t, store.load(context.Background(), key, page, false, false))
+	time.Sleep(100 * time.Millisecond) // the key is forgotten
+	err := store.load(context.Background(), key, page, false, false)
+	require.True(t, errors.Is(err, errGetHeaderTimeout), "a key is cut again once forgotten: %v", err)
+}
