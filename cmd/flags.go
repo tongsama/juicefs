@@ -225,6 +225,10 @@ func dataCacheFlags() []cli.Flag {
 			Usage: "prefetch N blocks in parallel",
 		},
 		&cli.BoolFlag{
+			Name:  "kaz-finish-canceled-get",
+			Usage: "[kaz] keep a full-block download running after its read is canceled (e.g. dropped readahead) and store the block in the disk cache; requires the disk cache",
+		},
+		&cli.BoolFlag{
 			Name:  "writeback",
 			Usage: "upload blocks in background",
 		},
