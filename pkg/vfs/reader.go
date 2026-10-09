@@ -104,6 +104,9 @@ type sliceReader struct {
 	next       *sliceReader
 	prev       **sliceReader
 	refs       uint16
+	// err is the error returned to the reads waiting for this slice once it has
+	// given up; the slice is then INVALID and not reused by later reads.
+	err syscall.Errno
 }
 
 func (s *sliceReader) delay(delay time.Duration) {
@@ -124,7 +127,12 @@ func (s *sliceReader) done(err syscall.Errno, delay time.Duration) {
 		if !f.closing {
 			logger.Errorf("read file %d: %s", f.inode, err)
 		}
-		f.err = err
+		// Fail only the reads waiting for this slice. Later reads of the file
+		// create new slices and try again, so a temporary failure of the object
+		// store does not fail every read of the file until it is closed.
+		s.err = err
+		s.state = INVALID
+		f.tried = 0
 	}
 	if f.shouldStop() {
 		s.state = INVALID
@@ -285,7 +293,6 @@ type fileReader struct {
 	// protected by itself
 	inode    Ino
 	length   uint64
-	err      syscall.Errno
 	tried    uint32
 	sessions [readSessions]session
 	slices   *sliceReader
@@ -586,7 +593,7 @@ func (f *fileReader) prepareRequests(ranges []uint64) []*req {
 }
 
 func (f *fileReader) shouldStop() bool {
-	return f.err != 0 || f.closing
+	return f.closing
 }
 
 func (f *fileReader) waitForIO(ctx meta.Context, reqs []*req, buf []byte) (int, syscall.Errno) {
@@ -600,8 +607,11 @@ func (f *fileReader) waitForIO(ctx meta.Context, reqs []*req, buf []byte) (int, 
 					return 0, syscall.EINTR
 				}
 			}
+			if s.state == INVALID && s.err != 0 {
+				return 0, s.err
+			}
 			if f.shouldStop() {
-				return 0, f.err
+				return 0, 0
 			}
 		}
 	}
@@ -636,7 +646,7 @@ func (f *fileReader) Read(ctx meta.Context, offset uint64, buf []byte) (int, sys
 	defer f.release()
 
 	if f.shouldStop() {
-		return 0, f.err
+		return 0, 0
 	}
 
 	size := uint64(len(buf))
