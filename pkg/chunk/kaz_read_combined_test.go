@@ -41,7 +41,9 @@ func TestHeaderTimeoutAppliesToDetachedFetch(t *testing.T) {
 	waitStarted(t, gate, key) // consume the notification of that Get
 
 	// A reader canceled while its GET waits for headers leaves a detached GET,
-	// which must still give up at the header timeout.
+	// which must still give up at the header timeout. Forget the first cut so
+	// that this GET is not treated as its retry.
+	store.forgetHeaderTimeout(key)
 	cctx, cancel := context.WithCancel(context.Background())
 	res := startRead(cctx, store, 1, len(data))
 	waitStarted(t, gate, key)

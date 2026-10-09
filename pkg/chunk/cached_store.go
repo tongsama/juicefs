@@ -728,6 +728,10 @@ type cachedStore struct {
 	canceledGetFinished prometheus.Counter
 	canceledGetDropped  prometheus.Counter
 	getHeaderTimeouts   prometheus.Counter
+
+	// headerTimedOut remembers keys recently cut by GetHeaderTimeout (key -> time).
+	headerTimedOutMu sync.Mutex
+	headerTimedOut   map[string]time.Time
 }
 
 func logRequest(typeStr, key, param, reqID string, err error, used time.Duration) {
@@ -739,6 +743,54 @@ func logRequest(typeStr, key, param, reqID string, err error, used time.Duration
 }
 
 var errTryFullRead = errors.New("try full read")
+
+// headerTimeoutMemory is how long a key cut by GetHeaderTimeout is remembered.
+var headerTimeoutMemory = 5 * time.Minute
+
+// maxHeaderTimedOut bounds the number of remembered keys.
+const maxHeaderTimedOut = 4096
+
+// headerTimedOutRecently reports whether key was cut by GetHeaderTimeout within
+// headerTimeoutMemory, forgetting it once that has passed.
+func (store *cachedStore) headerTimedOutRecently(key string) bool {
+	store.headerTimedOutMu.Lock()
+	defer store.headerTimedOutMu.Unlock()
+	t, ok := store.headerTimedOut[key]
+	if ok && time.Since(t) > headerTimeoutMemory {
+		delete(store.headerTimedOut, key)
+		return false
+	}
+	return ok
+}
+
+// rememberHeaderTimeout records that key was cut by GetHeaderTimeout.
+// When too many keys are remembered, the expired ones are dropped first and,
+// if that is not enough, all of them.
+func (store *cachedStore) rememberHeaderTimeout(key string) {
+	store.headerTimedOutMu.Lock()
+	defer store.headerTimedOutMu.Unlock()
+	if store.headerTimedOut == nil {
+		store.headerTimedOut = make(map[string]time.Time)
+	}
+	if len(store.headerTimedOut) >= maxHeaderTimedOut {
+		for k, t := range store.headerTimedOut {
+			if time.Since(t) > headerTimeoutMemory {
+				delete(store.headerTimedOut, k)
+			}
+		}
+		if len(store.headerTimedOut) >= maxHeaderTimedOut {
+			clear(store.headerTimedOut)
+		}
+	}
+	store.headerTimedOut[key] = time.Now()
+}
+
+// forgetHeaderTimeout drops key once it has been downloaded.
+func (store *cachedStore) forgetHeaderTimeout(key string) {
+	store.headerTimedOutMu.Lock()
+	defer store.headerTimedOutMu.Unlock()
+	delete(store.headerTimedOut, key)
+}
 
 // errGetHeaderTimeout reports a full-block GET abandoned by GetHeaderTimeout.
 var errGetHeaderTimeout = errors.New("no response headers within --kaz-get-header-timeout")
@@ -895,10 +947,21 @@ func (c *cancelOnClose) Close() error {
 // GetHeaderTimeout. After the headers, the body is read under ctx only, so a slow body
 // is still bounded by GetTimeout alone. Abandoned GETs are retried by the caller's
 // usual retry path.
+//
+// A key cut within headerTimeoutMemory is fetched again without the header timeout:
+// some objects (e.g. on Google Drive) always take longer than it to answer, and
+// cutting every retry would use up the read retries and fail the read with EIO.
 func (store *cachedStore) getWithHeaderTimeout(ctx context.Context, key string, getters ...object.AttrGetter) (io.ReadCloser, error) {
 	timeout := store.conf.GetHeaderTimeout
 	if timeout <= 0 {
 		return store.storage.Get(ctx, key, 0, -1, getters...)
+	}
+	if store.headerTimedOutRecently(key) {
+		in, err := store.storage.Get(ctx, key, 0, -1, getters...)
+		if err == nil {
+			store.forgetHeaderTimeout(key)
+		}
+		return in, err
 	}
 	hctx, cancel := context.WithCancel(ctx)
 	var fired atomic.Bool
@@ -916,7 +979,8 @@ func (store *cachedStore) getWithHeaderTimeout(ctx context.Context, key string, 
 			return nil, ctx.Err()
 		}
 		store.getHeaderTimeouts.Inc()
-		logger.Warnf("GET %s: %s (%s), will retry", key, errGetHeaderTimeout, timeout)
+		store.rememberHeaderTimeout(key)
+		logger.Warnf("GET %s: %s (%s), will retry without it", key, errGetHeaderTimeout, timeout)
 		return nil, fmt.Errorf("%w (%s)", errGetHeaderTimeout, timeout)
 	}
 	if err != nil {
