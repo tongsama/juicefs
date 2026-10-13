@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
@@ -29,6 +30,9 @@ import (
 // duration, and reports malformed text instead of reading it as 0.
 func parseKazCompactionCooldown(s string) (time.Duration, error) {
 	if v, err := strconv.ParseFloat(s, 64); err == nil {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return 0, fmt.Errorf("invalid kaz-compaction-cooldown %q", s)
+		}
 		return time.Duration(v * float64(time.Second)), nil
 	}
 	d, err := time.ParseDuration(s)
@@ -38,17 +42,34 @@ func parseKazCompactionCooldown(s string) (time.Duration, error) {
 	return d, nil
 }
 
+// kazCompactionPolicyFromFlags checks the raw flag values. Unlike the Go config,
+// where 0 means "use the default", 0 on the command line is out of range.
+func kazCompactionPolicyFromFlags(readMin int, cooldownText string, force int) (int, time.Duration, int, error) {
+	if readMin == 0 {
+		return 0, 0, 0, fmt.Errorf("invalid kaz-compaction-read-min 0 (want 5..2499)")
+	}
+	if force == 0 {
+		return 0, 0, 0, fmt.Errorf("invalid kaz-compaction-force-slices 0 (want 100..2499)")
+	}
+	cooldown, err := parseKazCompactionCooldown(cooldownText)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	conf := meta.Config{KazCompactionReadMin: readMin, KazCompactionCooldown: cooldown, KazCompactionForceSlices: force}
+	if err := conf.ValidateKazCompactionPolicy(); err != nil {
+		return 0, 0, 0, err
+	}
+	return readMin, cooldown, force, nil
+}
+
 // applyKazCompactionPolicyFlags copies the kaz compaction policy flags into conf
 // and exits on invalid values, like the other compaction modes.
 func applyKazCompactionPolicyFlags(c *cli.Context, conf *meta.Config) {
-	cooldown, err := parseKazCompactionCooldown(c.String("kaz-compaction-cooldown"))
+	readMin, cooldown, force, err := kazCompactionPolicyFromFlags(c.Int("kaz-compaction-read-min"), c.String("kaz-compaction-cooldown"), c.Int("kaz-compaction-force-slices"))
 	if err != nil {
 		logger.Fatalf("%s", err)
 	}
-	conf.KazCompactionReadMin = c.Int("kaz-compaction-read-min")
+	conf.KazCompactionReadMin = readMin
 	conf.KazCompactionCooldown = cooldown
-	conf.KazCompactionForceSlices = c.Int("kaz-compaction-force-slices")
-	if err := conf.ValidateKazCompactionPolicy(); err != nil {
-		logger.Fatalf("%s", err)
-	}
+	conf.KazCompactionForceSlices = force
 }

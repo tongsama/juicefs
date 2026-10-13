@@ -173,7 +173,7 @@ func storageFlags() []cli.Flag {
 		&cli.IntFlag{
 			Name:  "kaz-compaction-read-min",
 			Value: 5,
-			Usage: "[kaz] request background compaction from a read only when the chunk has at least this many slices (5 keeps the upstream behavior)",
+			Usage: "[kaz] request background compaction from a read only when the chunk has at least this many slices (5-2499; 5 keeps the upstream behavior)",
 		},
 		&cli.StringFlag{
 			Name:  "kaz-compaction-cooldown",

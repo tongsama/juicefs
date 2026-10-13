@@ -59,8 +59,32 @@ func TestParseKazCompactionCooldown(t *testing.T) {
 		require.NoError(t, err, in)
 		require.Equal(t, want, got, in)
 	}
-	for _, in := range []string{"", "abc", "1x", "1d"} {
+	for _, in := range []string{"", "abc", "1x", "1d", "NaN", "Inf", "-Inf", "+Inf"} {
 		_, err := parseKazCompactionCooldown(in)
 		require.Error(t, err, in)
+	}
+}
+
+// TestKazCompactionPolicyFromFlags rejects 0 on the command line, where it would silently mean the default.
+func TestKazCompactionPolicyFromFlags(t *testing.T) {
+	readMin, cooldown, force, err := kazCompactionPolicyFromFlags(100, "1m", 700)
+	require.NoError(t, err)
+	require.Equal(t, 100, readMin)
+	require.Equal(t, time.Minute, cooldown)
+	require.Equal(t, 700, force)
+	for _, tc := range []struct {
+		readMin  int
+		cooldown string
+		force    int
+	}{
+		{0, "0", 1000},
+		{5, "0", 0},
+		{4, "0", 1000},
+		{5, "0", 2500},
+		{5, "500ms", 1000},
+		{5, "NaN", 1000},
+	} {
+		_, _, _, err := kazCompactionPolicyFromFlags(tc.readMin, tc.cooldown, tc.force)
+		require.Error(t, err, "%+v", tc)
 	}
 }
