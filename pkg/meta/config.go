@@ -58,7 +58,11 @@ type Config struct {
 	NetworkInterfaces   []string // list of network interfaces to use for IP discovery (empty means all)
 
 	// [kaz] compaction policy; zero keeps the upstream trigger.
-	KazCompactionReadMin int // reads request compaction from this many slices; 0 means 5
+	// KazCompactionReadMin: when Read reloads a chunk's slice list from the engine
+	// (open-file chunk cache miss), background compaction of that chunk is queued
+	// only if it has at least this many slice records. Commit-triggered compaction
+	// is unchanged. 0 means 5, the upstream threshold.
+	KazCompactionReadMin int
 }
 
 func DefaultConf() *Config {

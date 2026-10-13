@@ -96,8 +96,12 @@ func (k *kazCompactionMetrics) observeStart(wait time.Duration, count int) {
 	k.slices.Observe(float64(count))
 }
 
-// compactionPolicy filters read-triggered compaction requests. Commit-triggered
-// requests never pass through it. It never touches metadata: dropping a request
+// compactionPolicy filters read-triggered compaction requests: when Read reloads
+// a chunk's slice list from the engine (an open-file chunk cache miss), the
+// request for that 64 MiB chunk is queued only if the chunk has at least readMin
+// slice records (raw records, not the merged visible pieces). Queuing does not
+// run compaction at once; the scheduler runs one chunk per inode at a time.
+// Commit-triggered requests (compactionWanted) never pass through it. It never touches metadata: dropping a request
 // only leaves more slices in a chunk until a commit or a later read asks again.
 type compactionPolicy struct {
 	readMin int
