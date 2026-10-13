@@ -170,6 +170,21 @@ func storageFlags() []cli.Flag {
 				return (&meta.Config{CompactionScheduler: value}).ValidateCompactionScheduler()
 			},
 		},
+		&cli.IntFlag{
+			Name:  "kaz-compaction-read-min",
+			Value: 5,
+			Usage: "[kaz] request background compaction from a read only when the chunk has at least this many slices (5 keeps the upstream behavior)",
+		},
+		&cli.StringFlag{
+			Name:  "kaz-compaction-cooldown",
+			Value: "0",
+			Usage: "[kaz] hold background compaction of a chunk until it has not been written for this long (0 disables it; 1s-1h)",
+		},
+		&cli.IntFlag{
+			Name:  "kaz-compaction-force-slices",
+			Value: 1000,
+			Usage: "[kaz] with --kaz-compaction-cooldown, compact a held chunk once it has this many slices (100-2499)",
+		},
 		&cli.StringFlag{
 			Name:  "upload-limit",
 			Usage: "bandwidth limit for upload in Mbps",
