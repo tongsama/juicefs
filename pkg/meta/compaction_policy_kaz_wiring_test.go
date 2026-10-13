@@ -98,31 +98,6 @@ func expectNoDispatch(t *testing.T, ch chan struct{}) {
 	}
 }
 
-// drain empties the dispatch channel.
-func drain(ch chan struct{}) {
-	for {
-		select {
-		case <-ch:
-		default:
-			return
-		}
-	}
-}
-
-// usePolicyClock swaps the running policy's clock for a fake one.
-func usePolicyClock(t *testing.T, b gcTestBackend) *fakeClock {
-	t.Helper()
-	p := b.kazCompact.Load()
-	if p == nil {
-		t.Fatal("policy not attached")
-	}
-	clk := &fakeClock{t: time.Now()}
-	p.mu.Lock()
-	p.now = clk.now
-	p.mu.Unlock()
-	return clk
-}
-
 // TestKazCompactionPolicyDefaultsUnchanged keeps the upstream read trigger when no knob is set.
 func TestKazCompactionPolicyDefaultsUnchanged(t *testing.T) {
 	for _, backend := range []string{"memkv", "sqlite"} {
@@ -163,121 +138,13 @@ func TestKazCompactionPolicyReadMinWiring(t *testing.T) {
 	}
 }
 
-// TestKazCompactionPolicyCooldownWiring holds a commit-triggered request until idle, and forces it at the threshold.
-func TestKazCompactionPolicyCooldownWiring(t *testing.T) {
-	b, dispatched := newPolicyTestBackend(t, "memkv", func(c *Config) {
-		c.KazCompactionCooldown = time.Minute
-		c.KazCompactionForceSlices = 150
-	})
-	clk := usePolicyClock(t, b)
-	inode, _ := createGCTestFile(t, b, "cooldown")
-	writeSlices(t, b, inode, 2, 97) // 99 slices: crosses compactionWanted
-	expectNoDispatch(t, dispatched)
-	clk.add(61 * time.Second)
-	b.kazCompact.Load().patrol()
-	expectDispatch(t, dispatched)
-	drain(dispatched)
-
-	inode2, _ := createGCTestFile(t, b, "force")
-	writeSlices(t, b, inode2, 2, 97) // held at 99
-	expectNoDispatch(t, dispatched)
-	writeSlices(t, b, inode2, 99, 51) // 150 slices: force
-	expectDispatch(t, dispatched)
-}
-
-// TestKazCompactionPolicyBatchCommit sees batch commits (doWriteSlices) through afterWrite.
-func TestKazCompactionPolicyBatchCommit(t *testing.T) {
-	for _, backend := range []string{"memkv", "sqlite", "redis"} {
-		t.Run(backend, func(t *testing.T) {
-			b, dispatched := newPolicyTestBackend(t, backend, func(c *Config) {
-				c.KazCompactionCooldown = time.Minute
-				c.KazCompactionForceSlices = 150
-			})
-			usePolicyClock(t, b)
-			inode, _ := createGCTestFile(t, b, "batch")
-			writeSlices(t, b, inode, 2, 97) // held at 99
-			expectNoDispatch(t, dispatched)
-			batch := make([]SliceWrite, 0, 60)
-			for i := 99; i < 159; i++ {
-				var id uint64
-				if st := b.NewSlice(Background(), &id); st != 0 {
-					t.Fatal(st)
-				}
-				batch = append(batch, SliceWrite{Off: uint32(i * 4096), Slice: Slice{Id: id, Size: 4096, Len: 4096}})
-			}
-			if n, st, _ := b.WriteSlices(Background(), inode, 0, batch, time.Now()); st != 0 || n != len(batch) {
-				t.Fatalf("WriteSlices n=%d st=%v", n, st)
-			}
-			expectDispatch(t, dispatched)
-		})
-	}
-}
-
-// TestKazCompactionPolicyKeepsSyncCompaction still compacts synchronously at maxSlices.
-func TestKazCompactionPolicyKeepsSyncCompaction(t *testing.T) {
-	b, dispatched := newPolicyTestBackend(t, "memkv", func(c *Config) {
-		c.KazCompactionReadMin = kazCompactionMaxReadMin
-		c.KazCompactionCooldown = time.Hour
-		c.KazCompactionForceSlices = kazCompactionMaxForce
-	})
-	rec := &policyRecorder{}
-	p := b.kazCompact.Load()
-	p.mu.Lock()
-	p.forward = rec.forward // background requests never reach CompactChunk
-	p.mu.Unlock()
-	inode, _ := createGCTestFile(t, b, "sync")
-	writeSlices(t, b, inode, 2, maxSlices-3) // 2499 slices
-	expectNoDispatch(t, dispatched)
-	writeSlices(t, b, inode, maxSlices-1, 1) // 2500: synchronous compaction inside Write
-	select {
-	case <-dispatched:
-	default:
-		t.Fatal("synchronous compaction did not run inside Write")
-	}
-}
-
-// TestKazCompactionPolicyDeletedFile releases a held request whose file no longer exists:
-// the real compaction finds nothing to do, without panics or a CompactChunk call.
-// A missing inode stands in for a deleted file; the GC test backend's prefilled
-// deletion queue would block a real Unlink.
-func TestKazCompactionPolicyDeletedFile(t *testing.T) {
-	b, dispatched := newPolicyTestBackend(t, "memkv", func(c *Config) { c.KazCompactionCooldown = time.Minute })
-	clk := usePolicyClock(t, b)
-	p := b.kazCompact.Load()
-	p.onCommit(999999, 0, 99)
-	p.request(999999, 0, 99, 0, false)
-	before := scheduledStarts(t, b)
-	clk.add(time.Hour)
-	p.patrol()
-	if got := policyEvents(b.kazCompactMetrics, "released_idle"); got != 1 {
-		t.Fatalf("released_idle=%v, want 1", got)
-	}
-	expectNoDispatch(t, dispatched)
-	deadline := time.Now().Add(3 * time.Second)
-	for scheduledStarts(t, b) != before+1 {
-		if time.Now().After(deadline) {
-			t.Fatalf("scheduler starts=%d, want %d: the released request did not reach compactChunk", scheduledStarts(t, b), before+1)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-// scheduledStarts returns how many compactions the priority scheduler has started.
-func scheduledStarts(t *testing.T, b gcTestBackend) uint64 {
-	t.Helper()
-	var m dto.Metric
-	if err := b.kazCompactMetrics.slices.Write(&m); err != nil {
-		t.Fatal(err)
-	}
-	return m.GetHistogram().GetSampleCount()
-}
-
 // TestKazCompactionPolicyRestart replaces the policy when the session restarts in the same process.
 func TestKazCompactionPolicyRestart(t *testing.T) {
-	b, _ := newPolicyTestBackend(t, "memkv", func(c *Config) { c.KazCompactionCooldown = time.Minute })
+	b, _ := newPolicyTestBackend(t, "memkv", func(c *Config) { c.KazCompactionReadMin = 100 })
 	old := b.kazCompact.Load()
-	old.onCommit(1, 0, 99)
-	old.request(1, 0, 99, 0, false)
+	if old == nil {
+		t.Fatal("policy not attached")
+	}
 	b.stopPriorityCompactor()
 	if b.kazCompact.Load() != nil {
 		t.Fatal("policy still attached after stop")
@@ -285,9 +152,6 @@ func TestKazCompactionPolicyRestart(t *testing.T) {
 	b.startPriorityCompactor()
 	if p := b.kazCompact.Load(); p == nil || p == old {
 		t.Fatal("restart did not attach a new policy")
-	}
-	if got := policyEvents(b.kazCompactMetrics, "discarded_on_stop"); got != 1 {
-		t.Fatalf("discarded_on_stop=%v, want 1", got)
 	}
 }
 
@@ -307,5 +171,16 @@ func TestKazCompactionSchedulerMetrics(t *testing.T) {
 	}
 	if m.GetHistogram().GetSampleCount() == 0 {
 		t.Fatal("scheduled slices histogram is empty")
+	}
+}
+
+// TestKazCompactionPolicyCommitBypassesPolicy leaves commit-triggered requests on the upstream path.
+func TestKazCompactionPolicyCommitBypassesPolicy(t *testing.T) {
+	b, dispatched := newPolicyTestBackend(t, "memkv", func(c *Config) { c.KazCompactionReadMin = 100 })
+	inode, _ := createGCTestFile(t, b, "commit")
+	writeSlices(t, b, inode, 2, 97) // 99 slices: crosses compactionWanted
+	expectDispatch(t, dispatched)
+	if got := policyEvents(b.kazCompactMetrics, "pass"); got != 0 {
+		t.Fatalf("commit request went through the policy: pass=%v", got)
 	}
 }

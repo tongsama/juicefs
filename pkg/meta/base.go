@@ -2260,10 +2260,9 @@ func (m *baseMeta) afterWrite(ctx Context, inode Ino, indx uint32, attr *Attr, d
 	m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
 	m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
 	ph.stat = time.Since(phaseStart)
-	m.notifyCompactionCommit(inode, indx, ph.numSlices)
 	if compactionWanted(prevSlices, ph.numSlices) {
 		if ph.numSlices < maxSlices {
-			m.requestCompactionFromCommit(inode, indx, ph.numSlices, int(attr.Tier))
+			m.requestBackgroundCompaction(inode, indx, ph.numSlices, int(attr.Tier))
 		} else {
 			logger.Debugf("metadata write inode=%d chunk=%d phase=compact slices=%d", inode, indx, ph.numSlices)
 			phaseStart = time.Now()

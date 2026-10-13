@@ -18,7 +18,6 @@ package cmd
 
 import (
 	"testing"
-	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/stretchr/testify/require"
@@ -36,55 +35,28 @@ func metaConfFromArgs(t *testing.T, args ...string) *meta.Config {
 	return conf
 }
 
-// TestKazCompactionPolicyFlags keeps the upstream behavior by default and parses the opt-in values.
+// TestKazCompactionPolicyFlags keeps the upstream behavior by default and parses the opt-in value.
 func TestKazCompactionPolicyFlags(t *testing.T) {
-	c := metaConfFromArgs(t)
-	require.Equal(t, 5, c.KazCompactionReadMin)
-	require.Zero(t, c.KazCompactionCooldown)
-	require.Equal(t, 1000, c.KazCompactionForceSlices)
-
-	c = metaConfFromArgs(t, "--kaz-compaction-read-min", "100", "--kaz-compaction-cooldown", "1m", "--kaz-compaction-force-slices", "700")
-	require.Equal(t, 100, c.KazCompactionReadMin)
-	require.Equal(t, time.Minute, c.KazCompactionCooldown)
-	require.Equal(t, 700, c.KazCompactionForceSlices)
-
-	c = metaConfFromArgs(t, "--kaz-compaction-cooldown", "90")
-	require.Equal(t, 90*time.Second, c.KazCompactionCooldown)
+	require.Equal(t, 5, metaConfFromArgs(t).KazCompactionReadMin)
+	require.Equal(t, 100, metaConfFromArgs(t, "--kaz-compaction-read-min", "100").KazCompactionReadMin)
 }
 
-// TestParseKazCompactionCooldown rejects malformed durations instead of reading them as 0.
-func TestParseKazCompactionCooldown(t *testing.T) {
-	for in, want := range map[string]time.Duration{"0": 0, "1m": time.Minute, "90": 90 * time.Second, "1.5": 1500 * time.Millisecond} {
-		got, err := parseKazCompactionCooldown(in)
-		require.NoError(t, err, in)
-		require.Equal(t, want, got, in)
-	}
-	for _, in := range []string{"", "abc", "1x", "1d", "NaN", "Inf", "-Inf", "+Inf"} {
-		_, err := parseKazCompactionCooldown(in)
-		require.Error(t, err, in)
-	}
-}
-
-// TestKazCompactionPolicyFromFlags rejects 0 on the command line, where it would silently mean the default.
-func TestKazCompactionPolicyFromFlags(t *testing.T) {
-	readMin, cooldown, force, err := kazCompactionPolicyFromFlags(100, "1m", 700)
+// TestKazCompactionReadMinFromFlag rejects 0 on the command line, where it would silently mean the default.
+func TestKazCompactionReadMinFromFlag(t *testing.T) {
+	got, err := kazCompactionReadMinFromFlag(100)
 	require.NoError(t, err)
-	require.Equal(t, 100, readMin)
-	require.Equal(t, time.Minute, cooldown)
-	require.Equal(t, 700, force)
-	for _, tc := range []struct {
-		readMin  int
-		cooldown string
-		force    int
-	}{
-		{0, "0", 1000},
-		{5, "0", 0},
-		{4, "0", 1000},
-		{5, "0", 2500},
-		{5, "500ms", 1000},
-		{5, "NaN", 1000},
-	} {
-		_, _, _, err := kazCompactionPolicyFromFlags(tc.readMin, tc.cooldown, tc.force)
-		require.Error(t, err, "%+v", tc)
+	require.Equal(t, 100, got)
+	for _, v := range []int{0, 4, 2500, -1} {
+		_, err := kazCompactionReadMinFromFlag(v)
+		require.Error(t, err, "%d", v)
+	}
+}
+
+// TestKazCompactionCooldownFlagsRemoved keeps the measured-harmful cooldown out of the mount flags.
+func TestKazCompactionCooldownFlagsRemoved(t *testing.T) {
+	for _, f := range cmdMount().Flags {
+		for _, name := range f.Names() {
+			require.NotContains(t, []string{"kaz-compaction-cooldown", "kaz-compaction-force-slices"}, name)
+		}
 	}
 }

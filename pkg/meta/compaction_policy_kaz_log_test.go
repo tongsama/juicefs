@@ -19,7 +19,6 @@ package meta
 import (
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
@@ -64,48 +63,25 @@ func hasLog(hook *logtest.Hook, level logrus.Level, fragments ...string) bool {
 	return false
 }
 
-// TestKazCompactionPolicyStartLogs reports the policy state once at start and warns about the legacy scheduler.
+// TestKazCompactionPolicyStartLogs reports once at start whether the policy is on.
 func TestKazCompactionPolicyStartLogs(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		scheduler string
-		mutate    func(*Config)
-		info      []string
-		warn      bool
+		name    string
+		readMin int
+		info    string
 	}{
-		{"off", "priority", func(*Config) {}, []string{"kaz compaction policy: off"}, false},
-		{"priority", "priority", func(c *Config) { c.KazCompactionReadMin = 100; c.KazCompactionCooldown = time.Minute }, []string{"read-min=100", "cooldown=1m0s"}, false},
-		{"legacy", "legacy", func(c *Config) { c.KazCompactionCooldown = time.Minute }, []string{"cooldown=1m0s"}, true},
-		{"legacy_read_min_only", "legacy", func(c *Config) { c.KazCompactionReadMin = 100 }, []string{"read-min=100"}, false},
+		{"off", 0, "kaz compaction policy: off"},
+		{"on", 100, "kaz compaction policy: read-min=100"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newGCTestBackend(t, "memkv")
-			b.conf.CompactionScheduler = tc.scheduler
-			tc.mutate(b.conf)
+			b.conf.KazCompactionReadMin = tc.readMin
 			hook := capturePolicyLogs(t, logrus.InfoLevel)
 			b.startCompactionPolicy()
 			defer b.stopCompactionPolicy()
-			if !hasLog(hook, logrus.InfoLevel, tc.info...) {
-				t.Fatalf("missing INFO %v in %v", tc.info, hook.AllEntries())
-			}
-			if got := hasLog(hook, logrus.WarnLevel, "priority"); got != tc.warn {
-				t.Fatalf("legacy warning=%v, want %v", got, tc.warn)
+			if !hasLog(hook, logrus.InfoLevel, tc.info) {
+				t.Fatalf("missing INFO %q in %v", tc.info, hook.AllEntries())
 			}
 		})
-	}
-}
-
-// TestCompactionPolicyOverflowLogs leaves a DEBUG trace when the held map is full.
-func TestCompactionPolicyOverflowLogs(t *testing.T) {
-	p, _, _, _ := newTestPolicy(5, time.Minute, 700)
-	for i := 0; i < kazCompactionMaxDeferred; i++ {
-		p.onCommit(Ino(i+1), 0, 99)
-		p.request(Ino(i+1), 0, 99, 0, false)
-	}
-	hook := capturePolicyLogs(t, logrus.DebugLevel)
-	p.onCommit(100000, 0, 99)
-	p.request(100000, 0, 99, 0, false)
-	if !hasLog(hook, logrus.DebugLevel, "kaz compaction overflow", "inode=100000") {
-		t.Fatalf("missing overflow DEBUG in %v", hook.AllEntries())
 	}
 }

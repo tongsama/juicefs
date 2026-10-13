@@ -57,10 +57,8 @@ type Config struct {
 	FastStatfs          bool
 	NetworkInterfaces   []string // list of network interfaces to use for IP discovery (empty means all)
 
-	// [kaz] compaction policy; zero values keep the upstream triggers.
-	KazCompactionReadMin     int           // reads request compaction from this many slices; 0 means 5
-	KazCompactionCooldown    time.Duration // hold compaction of a chunk written within this period; 0 disables it
-	KazCompactionForceSlices int           // compact a held chunk once it has this many slices; 0 means 1000
+	// [kaz] compaction policy; zero keeps the upstream trigger.
+	KazCompactionReadMin int // reads request compaction from this many slices; 0 means 5
 }
 
 func DefaultConf() *Config {
@@ -79,7 +77,7 @@ func (c *Config) SelfCheck() {
 	}
 	if err := c.ValidateKazCompactionPolicy(); err != nil {
 		logger.Warnf("%s; falling back to the upstream compaction triggers", err)
-		c.KazCompactionReadMin, c.KazCompactionCooldown, c.KazCompactionForceSlices = 0, 0, 0
+		c.KazCompactionReadMin = 0
 	}
 	if c.MaxDeletes < 0 {
 		logger.Warnf("max-deletes=%d means synchronous object deletion in the caller, not unlimited deletion concurrency; this can delay compaction and writes. Use a positive max-deletes value for background deletion workers", c.MaxDeletes)

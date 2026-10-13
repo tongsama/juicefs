@@ -18,58 +18,30 @@ package cmd
 
 import (
 	"fmt"
-	"math"
-	"strconv"
-	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/urfave/cli/v2"
 )
 
-// parseKazCompactionCooldown reads --kaz-compaction-cooldown as seconds or a Go
-// duration, and reports malformed text instead of reading it as 0.
-func parseKazCompactionCooldown(s string) (time.Duration, error) {
-	if v, err := strconv.ParseFloat(s, 64); err == nil {
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			return 0, fmt.Errorf("invalid kaz-compaction-cooldown %q", s)
-		}
-		return time.Duration(v * float64(time.Second)), nil
-	}
-	d, err := time.ParseDuration(s)
-	if err != nil {
-		return 0, fmt.Errorf("invalid kaz-compaction-cooldown %q: %w", s, err)
-	}
-	return d, nil
-}
-
-// kazCompactionPolicyFromFlags checks the raw flag values. Unlike the Go config,
-// where 0 means "use the default", 0 on the command line is out of range.
-func kazCompactionPolicyFromFlags(readMin int, cooldownText string, force int) (int, time.Duration, int, error) {
+// kazCompactionReadMinFromFlag checks --kaz-compaction-read-min. Unlike the Go
+// config, where 0 means "use the default", 0 on the command line is out of range.
+func kazCompactionReadMinFromFlag(readMin int) (int, error) {
 	if readMin == 0 {
-		return 0, 0, 0, fmt.Errorf("invalid kaz-compaction-read-min 0 (want 5..2499)")
+		return 0, fmt.Errorf("invalid kaz-compaction-read-min 0 (want 5..2499)")
 	}
-	if force == 0 {
-		return 0, 0, 0, fmt.Errorf("invalid kaz-compaction-force-slices 0 (want 100..2499)")
-	}
-	cooldown, err := parseKazCompactionCooldown(cooldownText)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	conf := meta.Config{KazCompactionReadMin: readMin, KazCompactionCooldown: cooldown, KazCompactionForceSlices: force}
+	conf := meta.Config{KazCompactionReadMin: readMin}
 	if err := conf.ValidateKazCompactionPolicy(); err != nil {
-		return 0, 0, 0, err
+		return 0, err
 	}
-	return readMin, cooldown, force, nil
+	return readMin, nil
 }
 
-// applyKazCompactionPolicyFlags copies the kaz compaction policy flags into conf
-// and exits on invalid values, like the other compaction modes.
+// applyKazCompactionPolicyFlags copies the kaz compaction policy flag into conf
+// and exits on an invalid value, like the other compaction modes.
 func applyKazCompactionPolicyFlags(c *cli.Context, conf *meta.Config) {
-	readMin, cooldown, force, err := kazCompactionPolicyFromFlags(c.Int("kaz-compaction-read-min"), c.String("kaz-compaction-cooldown"), c.Int("kaz-compaction-force-slices"))
+	readMin, err := kazCompactionReadMinFromFlag(c.Int("kaz-compaction-read-min"))
 	if err != nil {
 		logger.Fatalf("%s", err)
 	}
 	conf.KazCompactionReadMin = readMin
-	conf.KazCompactionCooldown = cooldown
-	conf.KazCompactionForceSlices = force
 }

@@ -18,65 +18,49 @@ package meta
 
 import (
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// Defaults and bounds of the kaz compaction policy. The defaults keep the
-// upstream behavior: a read requests compaction from 5 slices and nothing is held.
-// The upper bounds stay below maxSlices (2500, a variable in base.go), where
-// writes compact synchronously; TestKazCompactionPolicyConfig pins the relation.
+// Bounds of the kaz compaction policy. The default keeps the upstream behavior:
+// a read requests compaction from 5 slices. The upper bound stays below
+// maxSlices (2500, a variable in base.go), where writes compact synchronously;
+// TestKazCompactionPolicyConfig pins the relation.
+//
+// A cooldown that held compaction of busy chunks was tried and removed: it let
+// small staged slices upload before compaction could retire them, which raised
+// the total PUT count (docs/inspection/vm_write_hotspot/2026-10-14).
 const (
 	kazCompactionDefaultReadMin = 5
 	kazCompactionMaxReadMin     = 2499
-	kazCompactionDefaultForce   = 1000
-	kazCompactionMinForce       = 100
-	kazCompactionMaxForce       = 2499
-	kazCompactionMinCooldown    = time.Second
-	kazCompactionMaxCooldown    = time.Hour
-	kazCompactionMaxDeferred    = 1024
-	kazCompactionMaxTracked     = 4096
 )
 
-// ValidateKazCompactionPolicy rejects policy knobs outside their documented ranges.
-// Zero values mean "use the default", so Go callers that never set them keep upstream behavior.
+// ValidateKazCompactionPolicy rejects a read minimum outside its documented range.
+// Zero means "use the default", so Go callers that never set it keep upstream behavior.
 func (c *Config) ValidateKazCompactionPolicy() error {
 	if v := c.KazCompactionReadMin; v != 0 && (v < kazCompactionDefaultReadMin || v > kazCompactionMaxReadMin) {
 		return fmt.Errorf("invalid kaz-compaction-read-min %d (want %d..%d)", v, kazCompactionDefaultReadMin, kazCompactionMaxReadMin)
 	}
-	if v := c.KazCompactionCooldown; v != 0 && (v < kazCompactionMinCooldown || v > kazCompactionMaxCooldown) {
-		return fmt.Errorf("invalid kaz-compaction-cooldown %s (want 0 or %s..%s)", v, kazCompactionMinCooldown, kazCompactionMaxCooldown)
-	}
-	if v := c.KazCompactionForceSlices; v != 0 && (v < kazCompactionMinForce || v > kazCompactionMaxForce) {
-		return fmt.Errorf("invalid kaz-compaction-force-slices %d (want %d..%d)", v, kazCompactionMinForce, kazCompactionMaxForce)
-	}
 	return nil
 }
 
-// kazCompactionSettings returns the effective read minimum, cooldown and force threshold.
-func (c *Config) kazCompactionSettings() (readMin int, cooldown time.Duration, force int) {
-	readMin, cooldown, force = c.KazCompactionReadMin, c.KazCompactionCooldown, c.KazCompactionForceSlices
-	if readMin == 0 {
-		readMin = kazCompactionDefaultReadMin
+// kazCompactionReadMin returns the effective read minimum.
+func (c *Config) kazCompactionReadMin() int {
+	if c.KazCompactionReadMin == 0 {
+		return kazCompactionDefaultReadMin
 	}
-	if force == 0 {
-		force = kazCompactionDefaultForce
-	}
-	return
+	return c.KazCompactionReadMin
 }
 
-// kazCompactionPolicyEnabled reports whether any knob changes the upstream behavior.
+// kazCompactionPolicyEnabled reports whether the read minimum changes the upstream behavior.
 func (c *Config) kazCompactionPolicyEnabled() bool {
-	readMin, cooldown, _ := c.kazCompactionSettings()
-	return readMin != kazCompactionDefaultReadMin || cooldown > 0
+	return c.kazCompactionReadMin() != kazCompactionDefaultReadMin
 }
 
 // kazCompactionMetrics groups the observations exported for the kaz compaction policy.
 type kazCompactionMetrics struct {
 	events    *prometheus.CounterVec
-	deferred  prometheus.Gauge
 	queueWait prometheus.Histogram
 	slices    prometheus.Histogram
 }
@@ -86,12 +70,8 @@ func newKazCompactionMetrics() *kazCompactionMetrics {
 	return &kazCompactionMetrics{
 		events: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "kaz_compaction_policy_events_total",
-			Help: "Decisions of the kaz compaction policy: read_below_min, pass, deferred, released_idle, released_forced, overflow, discarded_on_stop.",
+			Help: "Decisions of the kaz compaction policy on read-triggered requests: read_below_min, pass.",
 		}, []string{"event"}),
-		deferred: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "kaz_compaction_policy_deferred",
-			Help: "Chunks whose background compaction is currently held by the kaz compaction policy.",
-		}),
 		queueWait: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "kaz_compaction_queue_wait_seconds",
 			Help:    "Time from queuing a chunk in the priority compaction scheduler to the start of its compaction.",
@@ -107,7 +87,7 @@ func newKazCompactionMetrics() *kazCompactionMetrics {
 
 // register attaches the collectors to reg.
 func (k *kazCompactionMetrics) register(reg prometheus.Registerer) {
-	reg.MustRegister(k.events, k.deferred, k.queueWait, k.slices)
+	reg.MustRegister(k.events, k.queueWait, k.slices)
 }
 
 // observeStart records one compaction start taken from the priority scheduler.
@@ -116,288 +96,67 @@ func (k *kazCompactionMetrics) observeStart(wait time.Duration, count int) {
 	k.slices.Observe(float64(count))
 }
 
-// heldCompaction is one background compaction request held by the policy.
-type heldCompaction struct {
-	count, tier int
-	since       time.Time
-}
-
-// compactionPolicy decides when advisory background compaction requests reach
-// the scheduler. It never touches metadata: dropping or holding a request only
-// leaves more slices in a chunk until a later request, commit or patrol.
+// compactionPolicy filters read-triggered compaction requests. Commit-triggered
+// requests never pass through it. It never touches metadata: dropping a request
+// only leaves more slices in a chunk until a commit or a later read asks again.
 type compactionPolicy struct {
-	readMin  int
-	cooldown time.Duration
-	force    int
-	forward  func(inode Ino, chunk uint32, count, tier int)
-	now      func() time.Time
-	metrics  *kazCompactionMetrics
-
-	mu         sync.Mutex
-	closed     bool
-	started    bool
-	held       map[compactionKey]*heldCompaction
-	lastCommit map[compactionKey]time.Time
-	stopCh     chan struct{}
-	done       chan struct{}
+	readMin int
+	forward func(inode Ino, chunk uint32, count, tier int)
+	metrics *kazCompactionMetrics
 }
 
-// newCompactionPolicy builds a policy; start launches its patrol when a cooldown is set.
-func newCompactionPolicy(readMin int, cooldown time.Duration, force int, forward func(inode Ino, chunk uint32, count, tier int), metrics *kazCompactionMetrics) *compactionPolicy {
-	return &compactionPolicy{
-		readMin: readMin, cooldown: cooldown, force: force, forward: forward, now: time.Now, metrics: metrics,
-		held:       make(map[compactionKey]*heldCompaction),
-		lastCommit: make(map[compactionKey]time.Time),
-		stopCh:     make(chan struct{}),
-		done:       make(chan struct{}),
-	}
+// newCompactionPolicy builds a read-request filter that forwards accepted requests.
+func newCompactionPolicy(readMin int, forward func(inode Ino, chunk uint32, count, tier int), metrics *kazCompactionMetrics) *compactionPolicy {
+	return &compactionPolicy{readMin: readMin, forward: forward, metrics: metrics}
 }
 
-// event counts n decisions when metrics are attached.
-func (p *compactionPolicy) event(name string, n int) {
-	if p.metrics != nil && n > 0 {
-		p.metrics.events.WithLabelValues(name).Add(float64(n))
-	}
-}
-
-// heldChanged publishes the number of held chunks; the caller holds mu.
-func (p *compactionPolicy) heldChanged() {
+// event counts one decision when metrics are attached.
+func (p *compactionPolicy) event(name string) {
 	if p.metrics != nil {
-		p.metrics.deferred.Set(float64(len(p.held)))
+		p.metrics.events.WithLabelValues(name).Inc()
 	}
 }
 
-// pass forwards one request; callers must not hold mu. forward is read under mu
-// so tests may swap it while the patrol goroutine runs.
-func (p *compactionPolicy) pass(event string, inode Ino, chunk uint32, count, tier int) {
-	p.mu.Lock()
-	forward := p.forward
-	p.mu.Unlock()
-	p.event(event, 1)
-	forward(inode, chunk, count, tier)
+// requestFromRead drops a read-triggered request below the read minimum and forwards the rest.
+func (p *compactionPolicy) requestFromRead(inode Ino, chunk uint32, count, tier int) {
+	if count < p.readMin {
+		p.event("read_below_min")
+		return
+	}
+	p.event("pass")
+	p.forward(inode, chunk, count, tier)
 }
 
-// request handles one compaction request; fromRead applies the read minimum first.
-func (p *compactionPolicy) request(inode Ino, chunk uint32, count, tier int, fromRead bool) {
-	if fromRead && count < p.readMin {
-		p.event("read_below_min", 1)
-		return
-	}
-	key := compactionKey{inode, chunk}
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return
-	}
-	if p.cooldown <= 0 {
-		p.mu.Unlock()
-		p.pass("pass", inode, chunk, count, tier)
-		return
-	}
-	held := p.held[key]
-	if held != nil && held.count > count {
-		count = held.count
-	}
-	last, tracked := p.lastCommit[key]
-	if count >= p.force || !tracked || p.now().Sub(last) >= p.cooldown {
-		if held != nil {
-			delete(p.held, key)
-			p.heldChanged()
-		}
-		p.mu.Unlock()
-		p.pass("pass", inode, chunk, count, tier)
-		return
-	}
-	if held != nil {
-		held.count, held.tier = count, tier
-		p.mu.Unlock()
-		return
-	}
-	if len(p.held) >= kazCompactionMaxDeferred {
-		p.mu.Unlock()
-		logger.Debugf("kaz compaction overflow inode=%d chunk=%d slices=%d held=%d", inode, chunk, count, kazCompactionMaxDeferred)
-		p.pass("overflow", inode, chunk, count, tier)
-		return
-	}
-	p.held[key] = &heldCompaction{count: count, tier: tier, since: p.now()}
-	p.heldChanged()
-	p.mu.Unlock()
-	p.event("deferred", 1)
-	logger.Debugf("kaz compaction hold inode=%d chunk=%d slices=%d", inode, chunk, count)
-}
-
-// onCommit records a commit to the chunk and releases its held request at the force threshold.
-func (p *compactionPolicy) onCommit(inode Ino, chunk uint32, count int) {
-	if p.cooldown <= 0 {
-		return
-	}
-	key := compactionKey{inode, chunk}
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return
-	}
-	if _, ok := p.lastCommit[key]; ok || len(p.lastCommit) < kazCompactionMaxTracked {
-		p.lastCommit[key] = p.now()
-	}
-	held := p.held[key]
-	if held == nil {
-		p.mu.Unlock()
-		return
-	}
-	if count > held.count {
-		held.count = count
-	}
-	if held.count < p.force {
-		p.mu.Unlock()
-		return
-	}
-	h := *held
-	delete(p.held, key)
-	p.heldChanged()
-	waited := p.now().Sub(h.since)
-	p.mu.Unlock()
-	logger.Debugf("kaz compaction force inode=%d chunk=%d slices=%d held=%s", inode, chunk, h.count, waited)
-	p.pass("released_forced", inode, chunk, h.count, h.tier)
-}
-
-// patrol forgets chunks idle for the cooldown and releases their held requests.
-func (p *compactionPolicy) patrol() {
-	type release struct {
-		key  compactionKey
-		held heldCompaction
-	}
-	var out []release
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return
-	}
-	now := p.now()
-	for key, last := range p.lastCommit {
-		if now.Sub(last) >= p.cooldown {
-			delete(p.lastCommit, key)
-		}
-	}
-	for key, held := range p.held {
-		if _, busy := p.lastCommit[key]; !busy {
-			out = append(out, release{key, *held})
-			delete(p.held, key)
-		}
-	}
-	if len(out) > 0 {
-		p.heldChanged()
-	}
-	p.mu.Unlock()
-	for _, r := range out {
-		logger.Debugf("kaz compaction release inode=%d chunk=%d slices=%d held=%s", r.key.inode, r.key.chunk, r.held.count, now.Sub(r.held.since))
-		p.pass("released_idle", r.key.inode, r.key.chunk, r.held.count, r.held.tier)
-	}
-}
-
-// patrolInterval returns a quarter of the cooldown, kept between 1s and 5s.
-func (p *compactionPolicy) patrolInterval() time.Duration {
-	return min(max(p.cooldown/4, time.Second), 5*time.Second)
-}
-
-// start launches the patrol goroutine when a cooldown is configured.
-func (p *compactionPolicy) start() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.cooldown <= 0 || p.started || p.closed {
-		return
-	}
-	p.started = true
-	go func() {
-		defer close(p.done)
-		ticker := time.NewTicker(p.patrolInterval())
-		defer ticker.Stop()
-		for {
-			select {
-			case <-p.stopCh:
-				return
-			case <-ticker.C:
-				p.patrol()
-			}
-		}
-	}()
-}
-
-// close discards held requests, stops the patrol and makes later calls no-ops.
-func (p *compactionPolicy) close() {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return
-	}
-	p.closed = true
-	discarded := len(p.held)
-	p.held = make(map[compactionKey]*heldCompaction)
-	p.lastCommit = make(map[compactionKey]time.Time)
-	p.heldChanged()
-	started := p.started
-	p.mu.Unlock()
-	p.event("discarded_on_stop", discarded)
-	close(p.stopCh)
-	if started {
-		<-p.done
-	}
-}
-
-// startCompactionPolicy attaches the kaz policy when its knobs differ from upstream,
-// and logs once whether it is on.
+// startCompactionPolicy attaches the kaz policy when the read minimum differs from
+// upstream, and logs once whether it is on.
 func (m *baseMeta) startCompactionPolicy() {
 	if m.conf.ReadOnly || m.kazCompact.Load() != nil {
-		return
-	}
-	if !m.conf.kazCompactionPolicyEnabled() {
-		logger.Infof("kaz compaction policy: off (upstream compaction triggers)")
 		return
 	}
 	if err := m.conf.ValidateKazCompactionPolicy(); err != nil {
 		logger.Warnf("%s; keeping the upstream compaction triggers", err)
 		return
 	}
-	readMin, cooldown, force := m.conf.kazCompactionSettings()
-	p := newCompactionPolicy(readMin, cooldown, force, m.requestBackgroundCompaction, m.kazCompactMetrics)
-	if !m.kazCompact.CompareAndSwap(nil, p) {
+	if !m.conf.kazCompactionPolicyEnabled() {
+		logger.Infof("kaz compaction policy: off (upstream compaction triggers)")
 		return
 	}
-	p.start()
-	logger.Infof("kaz compaction policy: read-min=%d cooldown=%s force-slices=%d", readMin, cooldown, force)
-	if cooldown > 0 && m.conf.CompactionScheduler != "priority" {
-		logger.Warnf("kaz compaction policy: the cooldown releases idle chunks in batches, and the legacy scheduler skips compactions beyond 10 at once; use --compaction-scheduler priority")
+	readMin := m.conf.kazCompactionReadMin()
+	if m.kazCompact.CompareAndSwap(nil, newCompactionPolicy(readMin, m.requestBackgroundCompaction, m.kazCompactMetrics)) {
+		logger.Infof("kaz compaction policy: read-min=%d", readMin)
 	}
 }
 
-// stopCompactionPolicy detaches the policy and discards its held requests.
+// stopCompactionPolicy detaches the policy; later read requests take the upstream path.
 func (m *baseMeta) stopCompactionPolicy() {
-	if p := m.kazCompact.Swap(nil); p != nil {
-		p.close()
-	}
+	m.kazCompact.Store(nil)
 }
 
 // requestCompactionFromRead routes a read-triggered request through the policy, if any.
 func (m *baseMeta) requestCompactionFromRead(inode Ino, chunk uint32, count, tier int) {
 	if p := m.kazCompact.Load(); p != nil {
-		p.request(inode, chunk, count, tier, true)
+		p.requestFromRead(inode, chunk, count, tier)
 		return
 	}
 	m.requestBackgroundCompaction(inode, chunk, count, tier)
-}
-
-// requestCompactionFromCommit routes a commit-triggered request through the policy, if any.
-func (m *baseMeta) requestCompactionFromCommit(inode Ino, chunk uint32, count, tier int) {
-	if p := m.kazCompact.Load(); p != nil {
-		p.request(inode, chunk, count, tier, false)
-		return
-	}
-	m.requestBackgroundCompaction(inode, chunk, count, tier)
-}
-
-// notifyCompactionCommit tells the policy that a commit reached the chunk.
-func (m *baseMeta) notifyCompactionCommit(inode Ino, chunk uint32, count int) {
-	if p := m.kazCompact.Load(); p != nil {
-		p.onCommit(inode, chunk, count)
-	}
 }
