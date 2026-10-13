@@ -56,6 +56,13 @@ type Config struct {
 	SortDir             bool
 	FastStatfs          bool
 	NetworkInterfaces   []string // list of network interfaces to use for IP discovery (empty means all)
+
+	// [kaz] compaction policy; zero keeps the upstream trigger.
+	// KazCompactionReadMin: when Read reloads a chunk's slice list from the engine
+	// (open-file chunk cache miss), background compaction of that chunk is queued
+	// only if it has at least this many slice records. Commit-triggered compaction
+	// is unchanged. 0 means 5, the upstream threshold.
+	KazCompactionReadMin int
 }
 
 func DefaultConf() *Config {
@@ -71,6 +78,10 @@ func (c *Config) SelfCheck() {
 	if err := c.ValidateCompactionGC(); err != nil {
 		logger.Warnf("%s; falling back to legacy compaction GC", err)
 		c.CompactionGCMode = "legacy"
+	}
+	if err := c.ValidateKazCompactionPolicy(); err != nil {
+		logger.Warnf("%s; falling back to the upstream compaction triggers", err)
+		c.KazCompactionReadMin = 0
 	}
 	if c.MaxDeletes < 0 {
 		logger.Warnf("max-deletes=%d means synchronous object deletion in the caller, not unlimited deletion concurrency; this can delay compaction and writes. Use a positive max-deletes value for background deletion workers", c.MaxDeletes)

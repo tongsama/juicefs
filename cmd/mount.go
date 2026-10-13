@@ -384,6 +384,7 @@ func getMetaConf(c *cli.Context, mp string, readOnly bool) *meta.Config {
 	if err := conf.ValidateCompactionScheduler(); err != nil {
 		logger.Fatalf("%s", err)
 	}
+	applyKazCompactionPolicyFlags(c, conf)
 	conf.OpenCache = utils.Duration(c.String("open-cache"))
 	conf.OpenCacheLimit = c.Uint64("open-cache-limit")
 	conf.Heartbeat = utils.Duration(c.String("heartbeat"))

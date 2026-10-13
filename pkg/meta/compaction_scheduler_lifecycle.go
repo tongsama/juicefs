@@ -16,18 +16,26 @@
 
 package meta
 
-// startPriorityCompactor attaches request-derived workers independently of periodic background jobs.
+// startPriorityCompactor attaches the kaz compaction policy and, for the priority
+// scheduler, request-derived workers, independently of periodic background jobs.
 func (m *baseMeta) startPriorityCompactor() {
+	m.startCompactionPolicy()
 	if m.conf.CompactionScheduler != "priority" || m.conf.ReadOnly || m.priorityCompactor.Load() != nil {
 		return
 	}
-	m.priorityCompactor.Store(newCompactionScheduler(func(inode Ino, chunk uint32, tier int) {
+	s := newCompactionScheduler(func(inode Ino, chunk uint32, tier int) {
 		m.compactChunk(inode, chunk, false, false, tier)
-	}, 11, 1024))
+	}, 11, 1024)
+	if m.kazCompactMetrics != nil {
+		s.setObserver(m.kazCompactMetrics.observeStart)
+	}
+	m.priorityCompactor.Store(s)
 }
 
-// stopPriorityCompactor joins callbacks before the metadata connection can be shut down.
+// stopPriorityCompactor detaches the kaz policy first, then joins scheduler
+// callbacks before the metadata connection can be shut down.
 func (m *baseMeta) stopPriorityCompactor() {
+	m.stopCompactionPolicy()
 	if s := m.priorityCompactor.Swap(nil); s != nil {
 		s.close()
 		s.wait()

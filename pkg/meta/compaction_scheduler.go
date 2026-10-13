@@ -19,6 +19,7 @@ package meta
 import (
 	"container/list"
 	"sync"
+	"time"
 )
 
 // compactionKey identifies one chunk independently of its current hint generation.
@@ -35,6 +36,7 @@ type compactionHint struct {
 	active      bool
 	element     *list.Element
 	bucket      int
+	queued      time.Time // when the hint last entered a pending list
 }
 
 // compactionInode holds one inode's pending chunks and enforces its execution quota.
@@ -58,6 +60,7 @@ type compactionScheduler struct {
 	inodes   map[Ino]*compactionInode
 	ready    [3]list.List
 	turn     int
+	observe  func(wait time.Duration, count int) // optional start observer, read under mu
 }
 
 // newCompactionScheduler starts a fixed worker pool; invalid limits reject hints.
@@ -119,6 +122,7 @@ func (s *compactionScheduler) schedule(inode Ino, chunk uint32, count, tier int)
 	}
 	bucket := compactionPriority(hint.count)
 	if hint.element == nil {
+		hint.queued = time.Now()
 		hint.bucket = bucket
 		hint.element = state.pending[bucket].PushBack(hint)
 	} else if hint.bucket != bucket {
@@ -204,8 +208,12 @@ func (s *compactionScheduler) worker() {
 			return
 		}
 		generation, tier := hint.generation, hint.tier
+		count, wait, observe := hint.count, time.Since(hint.queued), s.observe
 		hint.count = 0
 		s.mu.Unlock()
+		if observe != nil {
+			observe(wait, count)
+		}
 		s.run(hint.key.inode, hint.key.chunk, tier)
 		s.mu.Lock()
 		if s.closed {
@@ -216,6 +224,7 @@ func (s *compactionScheduler) worker() {
 		state.active = false
 		if generation != hint.generation {
 			hint.bucket = compactionPriority(hint.count)
+			hint.queued = time.Now()
 			hint.element = state.pending[hint.bucket].PushBack(hint)
 		} else {
 			delete(s.jobs, hint.key)
@@ -248,3 +257,10 @@ func (s *compactionScheduler) close() {
 
 // wait joins callbacks after close before metadata storage is shut down.
 func (s *compactionScheduler) wait() { s.workers.Wait() }
+
+// setObserver installs a callback that sees each start's queue wait and hinted slice count.
+func (s *compactionScheduler) setObserver(f func(wait time.Duration, count int)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.observe = f
+}

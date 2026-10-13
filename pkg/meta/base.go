@@ -299,6 +299,7 @@ type baseMeta struct {
 	dSliceWG          sync.WaitGroup
 	compactionGC      atomic.Pointer[compactionGC]
 	priorityCompactor atomic.Pointer[compactionScheduler]
+	kazCompact        atomic.Pointer[compactionPolicy]
 
 	dirStatsLock sync.RWMutex
 	dirStats     map[Ino]dirStat
@@ -355,6 +356,7 @@ type baseMeta struct {
 	groupQuotaUsedInodesG *prometheus.GaugeVec
 
 	compactionGCEvents *prometheus.CounterVec
+	kazCompactMetrics  *kazCompactionMetrics
 	bgjobDels          *prometheus.CounterVec
 	bgjobDuration      *prometheus.HistogramVec
 
@@ -537,6 +539,7 @@ func newBaseMeta(addr string, conf *Config) *baseMeta {
 			Name: "compaction_gc_events_total",
 			Help: "Compaction GC phase outcomes; local success counts callbacks, not removed files; deferred remote intent remains durable.",
 		}, []string{"event"}),
+		kazCompactMetrics: newKazCompactionMetrics(),
 
 		dirQuotaMetricKeys:   make(map[uint64]bool),
 		userQuotaMetricKeys:  make(map[uint64]bool),
@@ -569,6 +572,7 @@ func (m *baseMeta) InitSharedMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(m.bgjobDuration)
 	reg.MustRegister(m.bgjobDels)
 	reg.MustRegister(m.compactionGCEvents)
+	m.kazCompactMetrics.register(reg)
 	reg.MustRegister(m.subdirInfoG)
 
 	// Initialize subdir info metric
@@ -2142,7 +2146,7 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 		if f != nil {
 			tierID = int(f.attr.Tier)
 		}
-		m.requestBackgroundCompaction(inode, indx, len(ss), tierID)
+		m.requestCompactionFromRead(inode, indx, len(ss), tierID)
 	}
 	return 0
 }

@@ -170,6 +170,11 @@ func storageFlags() []cli.Flag {
 				return (&meta.Config{CompactionScheduler: value}).ValidateCompactionScheduler()
 			},
 		},
+		&cli.IntFlag{
+			Name:  "kaz-compaction-read-min",
+			Value: 5,
+			Usage: "[kaz] when a read reloads a chunk's slice list from metadata (open-file chunk cache miss), queue background compaction of that 64 MiB chunk only if it has at least this many slice records (5-2499; 5 keeps the upstream behavior; compaction triggered by writes is unchanged)",
+		},
 		&cli.StringFlag{
 			Name:  "upload-limit",
 			Usage: "bandwidth limit for upload in Mbps",
