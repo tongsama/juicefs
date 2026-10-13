@@ -237,3 +237,63 @@ func TestKazBlockCompactionUnusableBlockSize(t *testing.T) {
 		})
 	}
 }
+
+// TestKazBackgroundCompactionDefaultIsUpstream merges a chunk into one slice
+// when the block mode is not selected.
+func TestKazBackgroundCompactionDefaultIsUpstream(t *testing.T) {
+	e := newKazBlockEnv(t, "memkv", 4)
+	e.conf.KazCompactionMode = ""
+	inode := e.file(t)
+	e.write(t, inode, 0, 16*kazEB)
+	e.write(t, inode, 2*kazEB+1, 10)
+	e.write(t, inode, 9*kazEB+1, 10)
+	e.backgroundCompactChunk(inode, 0, 0)
+	require.Len(t, e.records(t, inode), 1)
+	require.Equal(t, 1, e.store.callCount())
+	require.Zero(t, kazBlockEventCount(e, "partial"))
+}
+
+// TestKazBackgroundCompactionBlockMode takes the block path when selected.
+func TestKazBackgroundCompactionBlockMode(t *testing.T) {
+	e := newKazBlockEnv(t, "memkv", 4)
+	inode := e.file(t)
+	e.write(t, inode, 0, 16*kazEB)
+	e.write(t, inode, 2*kazEB+1, 10)
+	e.write(t, inode, 9*kazEB+1, 10)
+	e.backgroundCompactChunk(inode, 0, 0)
+	require.Len(t, e.records(t, inode), 3)
+	require.Equal(t, 2, e.store.callCount())
+}
+
+// TestKazBackgroundCompactionFallsBack uses upstream compaction when the block
+// size cannot split a chunk.
+func TestKazBackgroundCompactionFallsBack(t *testing.T) {
+	e := newKazBlockEnv(t, "memkv", 0)
+	inode := e.file(t)
+	e.write(t, inode, 0, 16*kazEB)
+	e.write(t, inode, 2*kazEB+1, 10)
+	e.backgroundCompactChunk(inode, 0, 0)
+	require.Len(t, e.records(t, inode), 1)
+	require.Equal(t, float64(1), kazBlockEventCount(e, "fallback_upstream"))
+}
+
+// TestKazBlockCompactionThroughScheduler reaches the block path from a request
+// to the priority scheduler.
+func TestKazBlockCompactionThroughScheduler(t *testing.T) {
+	e := newKazBlockEnv(t, "memkv", 4)
+	e.conf.CompactionScheduler = "priority"
+	e.startPriorityCompactor()
+	t.Cleanup(e.stopPriorityCompactor)
+	inode := e.file(t)
+	e.write(t, inode, 0, 16*kazEB)
+	e.write(t, inode, 2*kazEB+1, 10)
+	e.write(t, inode, 9*kazEB+1, 10)
+	e.requestBackgroundCompaction(inode, 0, 3, 0)
+	// The chunk already holds 3 records before compaction, so wait on the
+	// compaction's own writes (callCount is mutex-guarded; no require inside).
+	require.Eventually(t, func() bool { return e.store.callCount() == 2 }, 5*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		ss, st := e.en.doRead(Background(), inode, 0)
+		return st == 0 && len(ss) == 3 && kazBlockEventCount(e, "partial") > 0
+	}, 5*time.Second, 10*time.Millisecond)
+}

@@ -47,7 +47,7 @@ const (
 )
 
 // kazBlockSize returns the volume block size in bytes, or 0 when it cannot split
-// a chunk into whole blocks (block compaction then falls back to upstream).
+// a chunk into whole blocks (the dispatcher then falls back to upstream compaction).
 func (m *baseMeta) kazBlockSize() uint32 {
 	f := m.getFormat()
 	if f == nil || f.BlockSize <= 0 {
@@ -249,4 +249,38 @@ func (m *baseMeta) writeKazBlocks(inode Ino, indx uint32, outs []kazBlockOut, ti
 		written = append(written, Slice{Id: ids[i], Size: o.length, Len: o.length})
 	}
 	return written, err
+}
+
+// backgroundCompactChunk runs one background compaction of a chunk: the kaz
+// block mode when selected and usable, otherwise upstream compactChunk. Forced
+// and synchronous compaction call compactChunk directly and never come here.
+func (m *baseMeta) backgroundCompactChunk(inode Ino, indx uint32, tier int) {
+	if m.conf.kazBlockCompactionEnabled() {
+		r, ok := m.en.(kazChunkReplacer)
+		if bs := m.kazBlockSize(); ok && bs > 0 {
+			if _, fits := kazBlockCompactLimit(bs); fits {
+				m.compactChunkBlocks(r, inode, indx, tier)
+				return
+			}
+		}
+		m.kazBlockEvent("fallback_upstream", 1)
+	}
+	m.compactChunk(inode, indx, false, false, tier)
+}
+
+// logKazCompactionMode states once at startup which background compaction runs.
+func (m *baseMeta) logKazCompactionMode() {
+	if !m.conf.kazBlockCompactionEnabled() {
+		logger.Infof("kaz compaction mode: upstream")
+		return
+	}
+	bs := m.kazBlockSize()
+	_, ok := m.en.(kazChunkReplacer)
+	_, fits := kazBlockCompactLimit(max(bs, 1))
+	if !ok || bs == 0 || !fits {
+		logger.Warnf("kaz compaction mode: block is not usable here (engine support %t, block size %d, room for new references %t); using upstream compaction", ok, bs, fits)
+		return
+	}
+	blocks := int(ChunkSize / uint64(bs))
+	logger.Infof("kaz compaction mode: block (block size %d, hidden-ratio %.2f, max-slices %d)", bs, m.conf.kazBlockHiddenRatio(), m.conf.kazBlockMaxSlices(blocks))
 }
