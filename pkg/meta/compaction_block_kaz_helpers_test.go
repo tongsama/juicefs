@@ -187,13 +187,13 @@ func (e *kazBlockEnv) write(t *testing.T, inode Ino, pos, length uint32) uint64 
 	return id
 }
 
-// zero appends a zero record (as fallocate zero-range does) at chunk 0 offset pos.
+// zero appends a zero record at chunk 0 offset pos the way production does, through
+// Fallocate zero-range (doWrite with id 0 would add a bogus slice ref on SQL).
+// Engines only add zero records below the file length, so the range must lie inside
+// data written earlier (write extends the length).
 func (e *kazBlockEnv) zero(t *testing.T, inode Ino, pos, length uint32) {
 	t.Helper()
-	var n int
-	var d dirStat
-	var attr Attr
-	require.Zero(t, e.en.doWrite(Background(), inode, 0, pos, Slice{Len: length}, time.Now(), &n, &d, &attr))
+	require.Zero(t, e.Fallocate(Background(), inode, fallocZeroRange|fallocKeepSize, uint64(pos), uint64(length), nil))
 }
 
 // records returns the records of chunk 0.

@@ -107,3 +107,20 @@ func TestKazReplaceChunkDelayed(t *testing.T) {
 		})
 	}
 }
+
+// TestKazBlockEnvZero checks the zero helper appends the same id-0 records on every engine, repeatedly.
+func TestKazBlockEnvZero(t *testing.T) {
+	for _, backend := range kazBlockBackends {
+		t.Run(backend, func(t *testing.T) {
+			e := newKazBlockEnv(t, backend, 4)
+			inode := e.file(t)
+			a := e.write(t, inode, 0, 8192)
+			e.zero(t, inode, 100, 50)
+			e.zero(t, inode, 300, 70)
+			got := e.records(t, inode)
+			require.Equal(t, []uint64{a, 0, 0}, kazIDs(got))
+			require.Equal(t, [2]uint32{100, 50}, [2]uint32{got[1].pos, got[1].len})
+			require.Equal(t, [2]uint32{300, 70}, [2]uint32{got[2].pos, got[2].len})
+		})
+	}
+}
