@@ -342,3 +342,53 @@ func (p *compactionPolicy) close() {
 		<-p.done
 	}
 }
+
+// startCompactionPolicy attaches the kaz policy when its knobs differ from upstream.
+func (m *baseMeta) startCompactionPolicy() {
+	if m.conf.ReadOnly || !m.conf.kazCompactionPolicyEnabled() || m.kazCompact.Load() != nil {
+		return
+	}
+	if err := m.conf.ValidateKazCompactionPolicy(); err != nil {
+		logger.Warnf("%s; keeping the upstream compaction triggers", err)
+		return
+	}
+	readMin, cooldown, force := m.conf.kazCompactionSettings()
+	p := newCompactionPolicy(readMin, cooldown, force, m.requestBackgroundCompaction, m.kazCompactMetrics)
+	if !m.kazCompact.CompareAndSwap(nil, p) {
+		return
+	}
+	p.start()
+	logger.Infof("kaz compaction policy: read-min=%d cooldown=%s force-slices=%d", readMin, cooldown, force)
+}
+
+// stopCompactionPolicy detaches the policy and discards its held requests.
+func (m *baseMeta) stopCompactionPolicy() {
+	if p := m.kazCompact.Swap(nil); p != nil {
+		p.close()
+	}
+}
+
+// requestCompactionFromRead routes a read-triggered request through the policy, if any.
+func (m *baseMeta) requestCompactionFromRead(inode Ino, chunk uint32, count, tier int) {
+	if p := m.kazCompact.Load(); p != nil {
+		p.request(inode, chunk, count, tier, true)
+		return
+	}
+	m.requestBackgroundCompaction(inode, chunk, count, tier)
+}
+
+// requestCompactionFromCommit routes a commit-triggered request through the policy, if any.
+func (m *baseMeta) requestCompactionFromCommit(inode Ino, chunk uint32, count, tier int) {
+	if p := m.kazCompact.Load(); p != nil {
+		p.request(inode, chunk, count, tier, false)
+		return
+	}
+	m.requestBackgroundCompaction(inode, chunk, count, tier)
+}
+
+// notifyCompactionCommit tells the policy that a commit reached the chunk.
+func (m *baseMeta) notifyCompactionCommit(inode Ino, chunk uint32, count int) {
+	if p := m.kazCompact.Load(); p != nil {
+		p.onCommit(inode, chunk, count)
+	}
+}
