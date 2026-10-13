@@ -60,3 +60,29 @@ func TestKazCompactionCooldownFlagsRemoved(t *testing.T) {
 		}
 	}
 }
+
+// TestKazBlockCompactionFlags keeps upstream compaction by default and parses the block mode.
+func TestKazBlockCompactionFlags(t *testing.T) {
+	def := metaConfFromArgs(t)
+	require.Equal(t, meta.KazCompactionModeUpstream, def.KazCompactionMode)
+	require.Equal(t, 0.5, def.KazCompactionBlockHiddenRatio)
+	require.Equal(t, 0, def.KazCompactionBlockMaxSlices)
+	c := metaConfFromArgs(t, "--kaz-compaction-mode", "block", "--kaz-compaction-block-hidden-ratio", "0.3", "--kaz-compaction-block-max-slices", "9")
+	require.Equal(t, meta.KazCompactionModeBlock, c.KazCompactionMode)
+	require.Equal(t, 0.3, c.KazCompactionBlockHiddenRatio)
+	require.Equal(t, 9, c.KazCompactionBlockMaxSlices)
+}
+
+// TestKazBlockCompactionFromFlags rejects values that would silently mean the default or nothing.
+func TestKazBlockCompactionFromFlags(t *testing.T) {
+	_, err := kazBlockCompactionFromFlags("block", 0.5, 0)
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		mode  string
+		ratio float64
+		max   int
+	}{{"blocks", 0.5, 0}, {"block", 0, 0}, {"block", 1.1, 0}, {"block", 0.5, -1}} {
+		_, err := kazBlockCompactionFromFlags(tc.mode, tc.ratio, tc.max)
+		require.Error(t, err, "%+v", tc)
+	}
+}
