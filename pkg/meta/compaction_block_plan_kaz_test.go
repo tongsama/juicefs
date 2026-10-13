@@ -155,3 +155,21 @@ func TestPlanKazBlockCompactionFullyHidden(t *testing.T) {
 	require.Equal(t, []uint64{2}, kazIDs(p.kept))
 	require.Empty(t, p.outs)
 }
+
+// TestPlanKazBlockCompactionOverLimitNothingRemovable rewrites fully when only the
+// record limit is exceeded, and does nothing within the limit.
+func TestPlanKazBlockCompactionOverLimitNothingRemovable(t *testing.T) {
+	var ss []*slice
+	for i := uint32(0); i < 20; i++ { // overlapping, shifted, each larger than a block
+		ss = append(ss, kazRec(i*1000, uint64(i+1), 5*kazTB))
+	}
+	p := planKazBlockCompaction(ss, kazTB, 0.5, 17)
+	require.NotNil(t, p)
+	require.True(t, p.full)
+	f := newKazFakeStore()
+	next := uint64(100)
+	end := 19*1000 + 5*kazTB
+	before := f.view(ss, end)
+	require.Equal(t, before, f.view(applyKazPlan(t, f, p, &next), end))
+	require.Nil(t, planKazBlockCompaction(ss, kazTB, 0.5, 100))
+}

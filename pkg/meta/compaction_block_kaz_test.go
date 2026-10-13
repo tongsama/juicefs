@@ -2,11 +2,14 @@ package meta
 
 import (
 	"errors"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,7 +53,7 @@ func TestKazBlockCompactionPartial(t *testing.T) {
 				require.Equal(t, kazEB, after[i+1].len)
 			}
 			require.Equal(t, float64(1), kazBlockEventCount(e, "partial"))
-			require.Equal(t, float64(3), kazBlockEventCount(e, "blocks_written"))
+			require.Equal(t, float64(3), testutil.ToFloat64(e.kazCompactMetrics.amount.WithLabelValues("blocks_written")))
 			require.NoError(t, e.en.doCleanupSlices(Background(), nil))
 			want := map[uint64]int{}
 			for _, id := range small {
@@ -296,4 +299,54 @@ func TestKazBlockCompactionThroughScheduler(t *testing.T) {
 		ss, st := e.en.doRead(Background(), inode, 0)
 		return st == 0 && len(ss) == 3 && kazBlockEventCount(e, "partial") > 0
 	}, 5*time.Second, 10*time.Millisecond)
+}
+
+// TestKazBlockCompactionLogs checks one phase=read, phase=object and phase=done
+// line per compaction (as upstream, so analysis scripts count runs) and one
+// block-object line per block written.
+func TestKazBlockCompactionLogs(t *testing.T) {
+	hook := capturePolicyLogs(t, logrus.DebugLevel)
+	e := newKazBlockEnv(t, "memkv", 4)
+	inode := e.file(t)
+	e.write(t, inode, 0, 16*kazEB)
+	e.write(t, inode, 2*kazEB+100, 300)
+	e.write(t, inode, 9*kazEB, 50)
+	kazRun(t, e, inode)
+	count := map[string]int{}
+	for _, en := range hook.AllEntries() {
+		for _, f := range []string{"phase=read", "phase=object", "phase=done", "compaction block-object", "compaction block inode"} {
+			if strings.Contains(en.Message, f) {
+				count[f]++
+			}
+		}
+	}
+	require.Equal(t, map[string]int{"phase=read": 1, "phase=object": 1, "phase=done": 1, "compaction block-object": e.store.callCount(), "compaction block inode": 1}, count)
+	require.Equal(t, 2, e.store.callCount())
+}
+
+// TestKazBlockCompactionRetiresRemoved reaches the deferred retire path.
+func TestKazBlockCompactionRetiresRemoved(t *testing.T) {
+	for _, backend := range kazBlockBackends {
+		t.Run(backend, func(t *testing.T) {
+			e := newKazBlockEnv(t, backend, 4)
+			var mu sync.Mutex
+			retired := map[uint64]bool{}
+			e.OnMsg(RetireSlice, func(args ...interface{}) error {
+				mu.Lock()
+				retired[args[0].(uint64)] = true
+				mu.Unlock()
+				return nil
+			})
+			inode := e.file(t)
+			e.write(t, inode, 0, 16*kazEB)
+			s1 := e.write(t, inode, 2*kazEB+1, 10)
+			s2 := e.write(t, inode, 9*kazEB+1, 10)
+			kazRun(t, e, inode)
+			require.Eventually(t, func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return retired[s1] && retired[s2]
+			}, 5*time.Second, 10*time.Millisecond)
+		})
+	}
 }

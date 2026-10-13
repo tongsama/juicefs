@@ -187,7 +187,11 @@ func kazOverlapsAny(ss []*slice, lo, hi uint32) bool {
 
 // planKazBlockCompaction decides which records of a chunk (ss, in chunk order) to
 // keep, which to drop and which blocks to rewrite so that the chunk reads the
-// same afterwards. It returns nil when nothing can be dropped. The rules are in
+// same afterwards. It returns nil when nothing can be dropped and the chunk is
+// within maxSlices (over it, the whole chunk is rewritten block by block).
+// Records of at least one block that are not block-shaped are kept, so a large
+// unaligned staged slice may still upload, unlike upstream which rewrites them.
+// The rules are in
 // docs/superpowers/specs/2026-10-14-kaz-block-compaction-design.md §5.
 func planKazBlockCompaction(ss []*slice, blockSize uint32, hiddenRatio float64, maxSlices int) *kazBlockPlan {
 	if len(ss) == 0 || blockSize == 0 {
@@ -219,11 +223,13 @@ func planKazBlockCompaction(ss []*slice, blockSize uint32, hiddenRatio float64, 
 			p.kept = append(p.kept, s)
 		}
 	}
-	if len(p.removed) == 0 {
+	// Nothing removable: only a chunk over the record limit is still rewritten (fully).
+	overLimit := len(p.removed) == 0 && len(ss) > maxSlices
+	if len(p.removed) == 0 && !overLimit {
 		return nil
 	}
 	p.hidden = g.hiddenShare(p.kept, touched)
-	if p.hidden > hiddenRatio || len(p.kept)+len(touched) > maxSlices {
+	if overLimit || p.hidden > hiddenRatio || len(p.kept)+len(touched) > maxSlices {
 		p.full, p.kept, p.removed = true, nil, append([]*slice(nil), ss...)
 		touched = make(map[uint32]bool)
 		for b := g.start / g.size; b*g.size < g.end; b++ {

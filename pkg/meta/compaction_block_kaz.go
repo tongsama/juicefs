@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // kazChunkReplacer replaces the leading records of a chunk with an arbitrary new
@@ -81,6 +82,13 @@ func (m *baseMeta) kazBlockEvent(event string, n int) {
 	}
 }
 
+// kazBlockAmount adds n to one block-compaction amount counter.
+func (m *baseMeta) kazBlockAmount(kind string, n int) {
+	if m.kazCompactMetrics != nil && n > 0 {
+		m.kazCompactMetrics.amount.WithLabelValues(kind).Add(float64(n))
+	}
+}
+
 // compactChunkBlocks rewrites only the blocks of a chunk that small records
 // touch, one new slice per block, and replaces the leading records through r.
 // It shares m.compacting with upstream compactChunk, so a chunk is never
@@ -95,6 +103,7 @@ func (m *baseMeta) compactChunkBlocks(r kazChunkReplacer, inode Ino, indx uint32
 		m.kazBlockEvent("error", 1)
 		return
 	}
+	start := time.Now()
 	k := uint64(inode) + (uint64(indx) << 40)
 	m.Lock()
 	if (m.sessCtx != nil && m.sessCtx.Canceled()) || len(m.compacting) > 10 || m.compacting[k] {
@@ -103,12 +112,24 @@ func (m *baseMeta) compactChunkBlocks(r kazChunkReplacer, inode Ino, indx uint32
 	}
 	m.compacting[k] = true
 	m.Unlock()
+	queueWait := time.Since(start)
+	var objectTime, metadataTime time.Duration
+	var sliceCount int
+	var compactSize uint32
+	// Same slow-compaction warning as upstream, marked with mode=block.
+	defer func() {
+		if total := time.Since(start); total >= time.Second {
+			logger.Warnf("slow compaction inode=%d chunk=%d once=false force=false slices=%d bytes=%d total=%s queue_wait=%s object=%s metadata=%s mode=block",
+				inode, indx, sliceCount, compactSize, total, queueWait, objectTime, metadataTime)
+		}
+	}()
 	defer func() {
 		m.Lock()
 		delete(m.compacting, k)
 		m.Unlock()
 	}()
 
+	logger.Debugf("compaction inode=%d chunk=%d phase=read queue_wait=%s", inode, indx, queueWait)
 	ss, st := m.en.doRead(Background(), inode, indx)
 	if st != 0 {
 		return
@@ -120,9 +141,12 @@ func (m *baseMeta) compactChunkBlocks(r kazChunkReplacer, inode Ino, indx uint32
 	if len(ss) > limit {
 		ss = ss[:limit]
 	}
+	sliceCount = len(ss)
 	plan := planKazBlockCompaction(ss, bs, m.conf.kazBlockHiddenRatio(), m.conf.kazBlockMaxSlices(int(ChunkSize/uint64(bs))))
 	if plan == nil {
 		m.kazBlockEvent("noop", 1)
+		logger.Debugf("compaction block inode=%d chunk=%d mode=noop removed=0 kept=%d blocks=0 mask=0 hidden=0.00 slices=%d total=%s errno=0",
+			inode, indx, len(ss), len(ss), time.Since(start))
 		return
 	}
 	if tier == -1 {
@@ -132,7 +156,9 @@ func (m *baseMeta) compactChunkBlocks(r kazChunkReplacer, inode Ino, indx uint32
 		}
 		tier = int(attr.Tier)
 	}
-	created, err := m.writeKazBlocks(inode, indx, plan.outs, tier)
+	phaseStart := time.Now()
+	created, err := m.writeKazBlocks(inode, indx, plan.outs, tier, sliceCount, &compactSize)
+	objectTime = time.Since(phaseStart)
 	if err != nil {
 		for _, c := range created {
 			m.deleteSlice(c.Id, c.Size)
@@ -182,20 +208,27 @@ func (m *baseMeta) compactChunkBlocks(r kazChunkReplacer, inode Ino, indx uint32
 		}
 	}
 
+	var firstID uint64
+	if len(created) > 0 {
+		firstID = created[0].Id
+	}
+	phaseStart = time.Now()
 	st = r.doKazReplaceChunk(inode, indx, origin, replaced, plan.removed, created, delayed, delayedKey)
+	metadataTime = time.Since(phaseStart)
+	logger.Debugf("compaction inode=%d chunk=%d slice=%d phase=done errno=%s", inode, indx, firstID, st)
 	mode := "partial"
 	if plan.full {
 		mode = "full"
 	}
-	logger.Debugf("compaction block inode=%d chunk=%d mode=%s removed=%d kept=%d blocks=%d mask=%d hidden=%.2f errno=%s",
-		inode, indx, mode, len(plan.removed), len(plan.kept), len(created), masks, plan.hidden, st)
+	logger.Debugf("compaction block inode=%d chunk=%d mode=%s removed=%d kept=%d blocks=%d mask=%d hidden=%.2f slices=%d total=%s errno=%s",
+		inode, indx, mode, len(plan.removed), len(plan.kept), len(created), masks, plan.hidden, sliceCount, time.Since(start), st)
 	switch st {
 	case 0:
 		m.of.InvalidateChunk(inode, indx)
 		m.kazBlockEvent(mode, 1)
-		m.kazBlockEvent("blocks_written", len(created))
-		m.kazBlockEvent("masks", masks)
-		m.kazBlockEvent("removed", len(plan.removed))
+		m.kazBlockAmount("blocks_written", len(created))
+		m.kazBlockAmount("masks", masks)
+		m.kazBlockAmount("removed", len(plan.removed))
 	case syscall.EINVAL:
 		logger.Infof("block compaction for %d:%d is wasted, delete %d new slices", inode, indx, len(created))
 		for _, c := range created {
@@ -212,7 +245,7 @@ func (m *baseMeta) compactChunkBlocks(r kazChunkReplacer, inode Ino, indx uint32
 // CompactChunk message, at most kazBlockWriteConcurrency at a time, so a chunk's
 // blocks upload in parallel as upstream's single slice does. It returns the
 // slices written successfully (in output order) and the joined errors.
-func (m *baseMeta) writeKazBlocks(inode Ino, indx uint32, outs []kazBlockOut, tier int) ([]Slice, error) {
+func (m *baseMeta) writeKazBlocks(inode Ino, indx uint32, outs []kazBlockOut, tier int, readSlices int, totalBytes *uint32) ([]Slice, error) {
 	var data []kazBlockOut
 	for _, o := range outs {
 		if !o.mask {
@@ -225,11 +258,21 @@ func (m *baseMeta) writeKazBlocks(inode Ino, indx uint32, outs []kazBlockOut, ti
 			return nil, st
 		}
 	}
+	// One upstream-shaped line per compaction (first new slice id, bytes of all blocks);
+	// per-block lines let PUTs be attributed to slice ids.
+	for _, o := range data {
+		*totalBytes += o.length
+	}
+	var firstID uint64
+	if len(ids) > 0 {
+		firstID = ids[0]
+	}
+	logger.Debugf("compaction inode=%d chunk=%d slice=%d phase=object slices=%d bytes=%d", inode, indx, firstID, readSlices, *totalBytes)
 	errs := make([]error, len(data))
 	sem := make(chan struct{}, kazBlockWriteConcurrency)
 	var wg sync.WaitGroup
 	for i, o := range data {
-		logger.Debugf("compaction inode=%d chunk=%d slice=%d phase=object slices=%d bytes=%d", inode, indx, ids[i], len(o.pieces), o.length)
+		logger.Debugf("compaction block-object inode=%d chunk=%d slice=%d pos=%d bytes=%d", inode, indx, ids[i], o.pos, o.length)
 		sem <- struct{}{}
 		wg.Add(1)
 		go func(i int, o kazBlockOut) {
