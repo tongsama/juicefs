@@ -63,11 +63,16 @@ type kazCompactionMetrics struct {
 	events    *prometheus.CounterVec
 	queueWait prometheus.Histogram
 	slices    prometheus.Histogram
+	block     *prometheus.CounterVec // block compaction outcomes and amounts
 }
 
 // newKazCompactionMetrics creates unregistered collectors; register attaches them.
 func newKazCompactionMetrics() *kazCompactionMetrics {
 	return &kazCompactionMetrics{
+		block: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "kaz_compaction_block_events_total",
+			Help: "Kaz block compaction outcomes (noop, partial, full, wasted, error, fallback_upstream) and amounts (blocks_written, masks, removed).",
+		}, []string{"event"}),
 		events: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "kaz_compaction_policy_events_total",
 			Help: "Decisions of the kaz compaction policy on read-triggered requests: read_below_min, pass.",
@@ -87,7 +92,7 @@ func newKazCompactionMetrics() *kazCompactionMetrics {
 
 // register attaches the collectors to reg.
 func (k *kazCompactionMetrics) register(reg prometheus.Registerer) {
-	reg.MustRegister(k.events, k.queueWait, k.slices)
+	reg.MustRegister(k.events, k.queueWait, k.slices, k.block)
 }
 
 // observeStart records one compaction start taken from the priority scheduler.

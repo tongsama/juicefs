@@ -24,18 +24,6 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// kazChunkReplacer replaces the leading records of a chunk with an arbitrary new
-// list in one transaction (kaz block compaction). It mirrors doCompactChunk,
-// which can only put a single new record, and lives outside the engine interface
-// so upstream changes to that interface do not touch it.
-type kazChunkReplacer interface {
-	// doKazReplaceChunk replaces origin (the chunk's leading records) by replaced
-	// when they still match, creates a reference for each created slice and either
-	// records delayed (trash, keyed by delayedKey) or drops one reference of each
-	// removed record. It returns EINVAL when the chunk no longer starts with origin.
-	doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []Slice, delayed []byte, delayedKey uint64) syscall.Errno
-}
-
 // doKazReplaceChunk follows redisMeta.doCompactChunk with a list of new records.
 func (m *redisMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []Slice, delayed []byte, delayedKey uint64) syscall.Errno {
 	var rs []*redis.IntCmd // trash disabled: check reference of slices
