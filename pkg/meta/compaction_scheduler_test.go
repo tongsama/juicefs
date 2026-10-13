@@ -291,3 +291,32 @@ func TestCompactionSchedulerWaitJoinsActiveCallbacks(t *testing.T) {
 		t.Fatal("wait did not join completed callback")
 	}
 }
+
+// TestCompactionSchedulerObserver reports the queue wait and the hinted slice count of each start.
+func TestCompactionSchedulerObserver(t *testing.T) {
+	started := make(chan struct{}, 4)
+	s := newCompactionScheduler(func(Ino, uint32, int) { started <- struct{}{} }, 1, 16)
+	defer func() { s.close(); s.wait() }()
+	type observation struct {
+		wait  time.Duration
+		count int
+	}
+	got := make(chan observation, 4)
+	s.setObserver(func(wait time.Duration, count int) { got <- observation{wait, count} })
+	if !s.schedule(1, 2, 150, 0) {
+		t.Fatal("schedule rejected")
+	}
+	select {
+	case o := <-got:
+		if o.count != 150 || o.wait < 0 {
+			t.Fatalf("observation %+v, want count 150", o)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("observer not called")
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("run not called")
+	}
+}
