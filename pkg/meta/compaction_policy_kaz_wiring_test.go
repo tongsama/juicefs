@@ -246,12 +246,30 @@ func TestKazCompactionPolicyDeletedFile(t *testing.T) {
 	p := b.kazCompact.Load()
 	p.onCommit(999999, 0, 99)
 	p.request(999999, 0, 99, 0, false)
+	before := scheduledStarts(t, b)
 	clk.add(time.Hour)
 	p.patrol()
 	if got := policyEvents(b.kazCompactMetrics, "released_idle"); got != 1 {
 		t.Fatalf("released_idle=%v, want 1", got)
 	}
 	expectNoDispatch(t, dispatched)
+	deadline := time.Now().Add(3 * time.Second)
+	for scheduledStarts(t, b) != before+1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("scheduler starts=%d, want %d: the released request did not reach compactChunk", scheduledStarts(t, b), before+1)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// scheduledStarts returns how many compactions the priority scheduler has started.
+func scheduledStarts(t *testing.T, b gcTestBackend) uint64 {
+	t.Helper()
+	var m dto.Metric
+	if err := b.kazCompactMetrics.slices.Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	return m.GetHistogram().GetSampleCount()
 }
 
 // TestKazCompactionPolicyRestart replaces the policy when the session restarts in the same process.

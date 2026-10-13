@@ -215,6 +215,7 @@ func (p *compactionPolicy) request(inode Ino, chunk uint32, count, tier int, fro
 	}
 	if len(p.held) >= kazCompactionMaxDeferred {
 		p.mu.Unlock()
+		logger.Debugf("kaz compaction overflow inode=%d chunk=%d slices=%d held=%d", inode, chunk, count, kazCompactionMaxDeferred)
 		p.pass("overflow", inode, chunk, count, tier)
 		return
 	}
@@ -343,9 +344,14 @@ func (p *compactionPolicy) close() {
 	}
 }
 
-// startCompactionPolicy attaches the kaz policy when its knobs differ from upstream.
+// startCompactionPolicy attaches the kaz policy when its knobs differ from upstream,
+// and logs once whether it is on.
 func (m *baseMeta) startCompactionPolicy() {
-	if m.conf.ReadOnly || !m.conf.kazCompactionPolicyEnabled() || m.kazCompact.Load() != nil {
+	if m.conf.ReadOnly || m.kazCompact.Load() != nil {
+		return
+	}
+	if !m.conf.kazCompactionPolicyEnabled() {
+		logger.Infof("kaz compaction policy: off (upstream compaction triggers)")
 		return
 	}
 	if err := m.conf.ValidateKazCompactionPolicy(); err != nil {
@@ -359,6 +365,9 @@ func (m *baseMeta) startCompactionPolicy() {
 	}
 	p.start()
 	logger.Infof("kaz compaction policy: read-min=%d cooldown=%s force-slices=%d", readMin, cooldown, force)
+	if cooldown > 0 && m.conf.CompactionScheduler != "priority" {
+		logger.Warnf("kaz compaction policy: the cooldown releases idle chunks in batches, and the legacy scheduler skips compactions beyond 10 at once; use --compaction-scheduler priority")
+	}
 }
 
 // stopCompactionPolicy detaches the policy and discards its held requests.
