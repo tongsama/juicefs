@@ -64,6 +64,9 @@ func (m *baseMeta) kazBlockSize() uint32 {
 // take. Engines that lowered maxCompactSlices (etcd) also need room for one new
 // reference per block; ok is false when too little room is left.
 func kazBlockCompactLimit(blockSize uint32) (int, bool) {
+	if blockSize == 0 {
+		return 0, false
+	}
 	if maxCompactSlices >= kazUpstreamMaxCompactSlices {
 		return maxCompactSlices, true
 	}
@@ -83,6 +86,15 @@ func (m *baseMeta) kazBlockEvent(event string, n int) {
 // It shares m.compacting with upstream compactChunk, so a chunk is never
 // compacted twice at once by this client.
 func (m *baseMeta) compactChunkBlocks(r kazChunkReplacer, inode Ino, indx uint32, tier int) {
+	// The dispatcher chooses upstream or block and checks these first; this is
+	// only a defensive guard (it must not call upstream: it would hold m.compacting).
+	bs := m.kazBlockSize()
+	limit, ok := kazBlockCompactLimit(bs)
+	if bs == 0 || !ok {
+		logger.Warnf("block compaction %d:%d skipped: block size %d unusable", inode, indx, bs)
+		m.kazBlockEvent("error", 1)
+		return
+	}
 	k := uint64(inode) + (uint64(indx) << 40)
 	m.Lock()
 	if (m.sessCtx != nil && m.sessCtx.Canceled()) || len(m.compacting) > 10 || m.compacting[k] {
@@ -103,13 +115,6 @@ func (m *baseMeta) compactChunkBlocks(r kazChunkReplacer, inode Ino, indx uint32
 	}
 	if ss == nil {
 		logger.Errorf("Corrupt value for inode %d chunk indx %d", inode, indx)
-		return
-	}
-	bs := m.kazBlockSize()
-	limit, ok := kazBlockCompactLimit(bs)
-	if bs == 0 || !ok { // the caller normally checks; stay safe and use upstream
-		m.kazBlockEvent("fallback_upstream", 1)
-		m.compactChunk(inode, indx, false, false, tier)
 		return
 	}
 	if len(ss) > limit {

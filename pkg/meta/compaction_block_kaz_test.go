@@ -200,3 +200,40 @@ func TestKazBlockCompactionTrash(t *testing.T) {
 		})
 	}
 }
+
+// TestKazBlockCompactLimit checks the record limit for the engines' transaction sizes.
+func TestKazBlockCompactLimit(t *testing.T) {
+	old := maxCompactSlices
+	t.Cleanup(func() { maxCompactSlices = old })
+	_, ok := kazBlockCompactLimit(0)
+	require.False(t, ok)
+	maxCompactSlices = 100
+	limit, ok := kazBlockCompactLimit(1 << 20)
+	require.True(t, ok)
+	require.Equal(t, 36, limit)
+	_, ok = kazBlockCompactLimit(4096)
+	require.False(t, ok)
+	maxCompactSlices = 1000
+	limit, ok = kazBlockCompactLimit(4096)
+	require.True(t, ok)
+	require.Equal(t, 1000, limit)
+}
+
+// TestKazBlockCompactionUnusableBlockSize leaves the chunk and the store untouched.
+func TestKazBlockCompactionUnusableBlockSize(t *testing.T) {
+	for _, backend := range kazBlockBackends {
+		t.Run(backend, func(t *testing.T) {
+			e := newKazBlockEnv(t, backend, 4)
+			inode := e.file(t)
+			e.write(t, inode, 0, 16*kazEB)
+			e.write(t, inode, kazEB+1, 10)
+			before := kazIDs(e.records(t, inode))
+			e.Lock()
+			e.fmt.BlockSize = 0
+			e.Unlock()
+			require.Equal(t, before, kazIDs(kazRun(t, e, inode)))
+			require.Zero(t, e.store.callCount())
+			require.Equal(t, float64(1), kazBlockEventCount(e, "error"))
+		})
+	}
+}
