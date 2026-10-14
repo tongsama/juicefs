@@ -184,3 +184,39 @@ func TestPlanKazBlockCompactionOverLimitBlockShaped(t *testing.T) {
 	}
 	require.Nil(t, planKazBlockCompaction(ss, kazTB, 0.5, 10))
 }
+
+// TestPlanKazBlockCompactionForced rewrites under juicefs compact until no data
+// is hidden and the chunk is block-shaped, and does nothing once it is.
+func TestPlanKazBlockCompactionForced(t *testing.T) {
+	var blocks []*slice
+	for i := uint32(0); i < 16; i++ {
+		blocks = append(blocks, kazRec(i*kazTB, uint64(i+1), kazTB))
+	}
+	require.Nil(t, planKazBlockCompactionForced(blocks, kazTB, 17))
+
+	// A large base partly covered by block records: nothing is small, but data is hidden.
+	ss := []*slice{kazRec(0, 100, 16*kazTB), kazRec(2*kazTB, 101, kazTB), kazRec(3*kazTB, 102, kazTB), kazRec(9*kazTB, 103, kazTB)}
+	require.Nil(t, planKazBlockCompaction(ss, kazTB, 0.5, 17))
+	p := planKazBlockCompactionForced(ss, kazTB, 17)
+	require.NotNil(t, p)
+	require.True(t, p.full)
+	require.Len(t, p.outs, 16)
+	f := newKazFakeStore()
+	next := uint64(1000)
+	before := f.view(ss, 16*kazTB)
+	after := applyKazPlan(t, f, p, &next)
+	require.Equal(t, before, f.view(after, 16*kazTB))
+	require.Nil(t, planKazBlockCompactionForced(after, kazTB, 17))
+
+	// Block-shaped chunk with a small write: only the touched block, nothing left hidden.
+	small := append(append([]*slice(nil), blocks...), kazRec(2*kazTB+5, 200, 10))
+	p = planKazBlockCompactionForced(small, kazTB, 17)
+	require.NotNil(t, p)
+	require.False(t, p.full)
+	require.Len(t, p.outs, 1)
+
+	// A small write over a large base: hidden base data forces a whole rewrite.
+	p = planKazBlockCompactionForced([]*slice{kazRec(0, 100, 16*kazTB), kazRec(2*kazTB+5, 200, 10)}, kazTB, 17)
+	require.NotNil(t, p)
+	require.True(t, p.full)
+}

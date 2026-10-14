@@ -94,6 +94,14 @@ func (m *baseMeta) kazBlockAmount(kind string, n int) {
 // It shares m.compacting with upstream compactChunk, so a chunk is never
 // compacted twice at once by this client.
 func (m *baseMeta) compactChunkBlocks(r kazChunkReplacer, inode Ino, indx uint32, tier int) {
+	m.runKazBlockCompaction(r, inode, indx, tier, false)
+}
+
+// runKazBlockCompaction runs one block compaction of a chunk and reports whether
+// it changed the chunk. force (juicefs compact, gc --compact) waits for a running
+// compaction of the same chunk instead of skipping it, as upstream's forced path
+// does, and plans with planKazBlockCompactionForced so no hidden data remains.
+func (m *baseMeta) runKazBlockCompaction(r kazChunkReplacer, inode Ino, indx uint32, tier int, force bool) bool {
 	// The dispatcher chooses upstream or block and checks these first; this is
 	// only a defensive guard (it must not call upstream: it would hold m.compacting).
 	bs := m.kazBlockSize()
@@ -101,14 +109,24 @@ func (m *baseMeta) compactChunkBlocks(r kazChunkReplacer, inode Ino, indx uint32
 	if bs == 0 || !ok {
 		logger.Warnf("block compaction %d:%d skipped: block size %d unusable", inode, indx, bs)
 		m.kazBlockEvent("error", 1)
-		return
+		return false
 	}
 	start := time.Now()
 	k := uint64(inode) + (uint64(indx) << 40)
 	m.Lock()
-	if (m.sessCtx != nil && m.sessCtx.Canceled()) || len(m.compacting) > 10 || m.compacting[k] {
+	if m.sessCtx != nil && m.sessCtx.Canceled() {
 		m.Unlock()
-		return
+		return false
+	}
+	if force {
+		for m.compacting[k] {
+			m.Unlock()
+			time.Sleep(time.Millisecond * 10)
+			m.Lock()
+		}
+	} else if len(m.compacting) > 10 || m.compacting[k] {
+		m.Unlock()
+		return false
 	}
 	m.compacting[k] = true
 	m.Unlock()
@@ -119,8 +137,8 @@ func (m *baseMeta) compactChunkBlocks(r kazChunkReplacer, inode Ino, indx uint32
 	// Same slow-compaction warning as upstream, marked with mode=block.
 	defer func() {
 		if total := time.Since(start); total >= time.Second {
-			logger.Warnf("slow compaction inode=%d chunk=%d once=false force=false slices=%d bytes=%d total=%s queue_wait=%s object=%s metadata=%s mode=block",
-				inode, indx, sliceCount, compactSize, total, queueWait, objectTime, metadataTime)
+			logger.Warnf("slow compaction inode=%d chunk=%d once=false force=%t slices=%d bytes=%d total=%s queue_wait=%s object=%s metadata=%s mode=block",
+				inode, indx, force, sliceCount, compactSize, total, queueWait, objectTime, metadataTime)
 		}
 	}()
 	defer func() {
@@ -132,27 +150,33 @@ func (m *baseMeta) compactChunkBlocks(r kazChunkReplacer, inode Ino, indx uint32
 	logger.Debugf("compaction inode=%d chunk=%d phase=read queue_wait=%s", inode, indx, queueWait)
 	ss, st := m.en.doRead(Background(), inode, indx)
 	if st != 0 {
-		return
+		return false
 	}
 	if ss == nil {
 		logger.Errorf("Corrupt value for inode %d chunk indx %d", inode, indx)
-		return
+		return false
 	}
 	if len(ss) > limit {
 		ss = ss[:limit]
 	}
 	sliceCount = len(ss)
-	plan := planKazBlockCompaction(ss, bs, m.conf.kazBlockHiddenRatio(), m.conf.kazBlockMaxSlices(int(ChunkSize/uint64(bs))))
+	maxSlices := m.conf.kazBlockMaxSlices(int(ChunkSize / uint64(bs)))
+	var plan *kazBlockPlan
+	if force {
+		plan = planKazBlockCompactionForced(ss, bs, maxSlices)
+	} else {
+		plan = planKazBlockCompaction(ss, bs, m.conf.kazBlockHiddenRatio(), maxSlices)
+	}
 	if plan == nil {
 		m.kazBlockEvent("noop", 1)
-		logger.Debugf("compaction block inode=%d chunk=%d mode=noop removed=0 kept=%d blocks=0 mask=0 hidden=0.00 slices=%d total=%s errno=0",
-			inode, indx, len(ss), len(ss), time.Since(start))
-		return
+		logger.Debugf("compaction block inode=%d chunk=%d mode=noop force=%t removed=0 kept=%d blocks=0 mask=0 hidden=0.00 slices=%d total=%s errno=0",
+			inode, indx, force, len(ss), len(ss), time.Since(start))
+		return false
 	}
 	if tier == -1 {
 		var attr Attr
 		if eno := m.GetAttr(Background(), inode, &attr); eno != 0 {
-			return
+			return false
 		}
 		tier = int(attr.Tier)
 	}
@@ -167,7 +191,7 @@ func (m *baseMeta) compactChunkBlocks(r kazChunkReplacer, inode Ino, indx uint32
 			logger.Warnf("block compaction %d %d with %d slices: %s", inode, indx, len(plan.removed), err)
 		}
 		m.kazBlockEvent("error", 1)
-		return
+		return false
 	}
 
 	replaced := make([]byte, 0, (len(plan.kept)+len(plan.outs))*sliceBytes)
@@ -203,7 +227,7 @@ func (m *baseMeta) compactChunkBlocks(r kazChunkReplacer, inode Ino, indx uint32
 		} else if len(delayed) > 0 {
 			if st = m.NewSlice(Background(), &delayedKey); st != 0 {
 				m.kazBlockEvent("error", 1)
-				return
+				return false
 			}
 		}
 	}
@@ -220,8 +244,8 @@ func (m *baseMeta) compactChunkBlocks(r kazChunkReplacer, inode Ino, indx uint32
 	if plan.full {
 		mode = "full"
 	}
-	logger.Debugf("compaction block inode=%d chunk=%d mode=%s removed=%d kept=%d blocks=%d mask=%d hidden=%.2f slices=%d total=%s errno=%s",
-		inode, indx, mode, len(plan.removed), len(plan.kept), len(created), masks, plan.hidden, sliceCount, time.Since(start), st)
+	logger.Debugf("compaction block inode=%d chunk=%d mode=%s force=%t removed=%d kept=%d blocks=%d mask=%d hidden=%.2f slices=%d total=%s errno=%s",
+		inode, indx, mode, force, len(plan.removed), len(plan.kept), len(created), masks, plan.hidden, sliceCount, time.Since(start), st)
 	switch st {
 	case 0:
 		m.of.InvalidateChunk(inode, indx)
@@ -239,6 +263,7 @@ func (m *baseMeta) compactChunkBlocks(r kazChunkReplacer, inode Ino, indx uint32
 		logger.Warnf("block compaction %d %d: %s; %d new slices may be orphaned, will be cleaned by gc", inode, indx, st, len(created))
 		m.kazBlockEvent("error", 1)
 	}
+	return st == 0
 }
 
 // writeKazBlocks allocates one slice per data output and writes them through the
@@ -294,21 +319,51 @@ func (m *baseMeta) writeKazBlocks(inode Ino, indx uint32, outs []kazBlockOut, ti
 	return written, err
 }
 
-// backgroundCompactChunk runs one background compaction of a chunk: the kaz
-// block mode when selected and usable, otherwise upstream compactChunk. Forced
-// and synchronous compaction call compactChunk directly and never come here.
-func (m *baseMeta) backgroundCompactChunk(inode Ino, indx uint32, tier int) {
-	if m.conf.kazBlockCompactionEnabled() {
-		r, ok := m.en.(kazChunkReplacer)
-		if bs := m.kazBlockSize(); ok && bs > 0 {
-			if _, fits := kazBlockCompactLimit(bs); fits {
-				m.compactChunkBlocks(r, inode, indx, tier)
-				return
-			}
+// kazBlockReplacer returns the engine's replace operation when block mode is
+// selected and usable (engine support, block size, room in the transaction);
+// otherwise nil, counting a fallback to upstream when block mode was selected.
+func (m *baseMeta) kazBlockReplacer() kazChunkReplacer {
+	if !m.conf.kazBlockCompactionEnabled() {
+		return nil
+	}
+	r, ok := m.en.(kazChunkReplacer)
+	if bs := m.kazBlockSize(); ok && bs > 0 {
+		if _, fits := kazBlockCompactLimit(bs); fits {
+			return r
 		}
-		m.kazBlockEvent("fallback_upstream", 1)
+	}
+	m.kazBlockEvent("fallback_upstream", 1)
+	return nil
+}
+
+// backgroundCompactChunk runs one background compaction of a chunk: the kaz
+// block mode when selected and usable, otherwise upstream compactChunk. The
+// synchronous compaction at maxSlices calls compactChunk directly.
+func (m *baseMeta) backgroundCompactChunk(inode Ino, indx uint32, tier int) {
+	if r := m.kazBlockReplacer(); r != nil {
+		m.compactChunkBlocks(r, inode, indx, tier)
+		return
 	}
 	m.compactChunk(inode, indx, false, false, tier)
+}
+
+// kazForcedRounds bounds the rounds of one forced block compaction of a chunk;
+// each round only repeats while new records keep arriving.
+const kazForcedRounds = 100
+
+// forcedCompactChunk runs a forced compaction of a chunk (juicefs compact, gc
+// --compact): in block mode it repeats block compaction until the chunk is
+// block-shaped with no hidden data, otherwise upstream compactChunk with force.
+func (m *baseMeta) forcedCompactChunk(inode Ino, indx uint32, tier int) {
+	if r := m.kazBlockReplacer(); r != nil {
+		for i := 0; i < kazForcedRounds; i++ {
+			if !m.runKazBlockCompaction(r, inode, indx, tier, true) {
+				break
+			}
+		}
+		return
+	}
+	m.compactChunk(inode, indx, false, true, tier)
 }
 
 // logKazCompactionMode states once at startup which background compaction runs.

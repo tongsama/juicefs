@@ -200,13 +200,41 @@ func kazOverlapsAny(ss []*slice, lo, hi uint32) bool {
 // The rules are in
 // docs/superpowers/specs/2026-10-14-kaz-block-compaction-design.md §5.
 func planKazBlockCompaction(ss []*slice, blockSize uint32, hiddenRatio float64, maxSlices int) *kazBlockPlan {
-	if len(ss) == 0 || blockSize == 0 {
-		return nil
+	return planKazBlocks(ss, blockSize, hiddenRatio, maxSlices, false)
+}
+
+// planKazBlockCompactionForced plans a forced compaction (juicefs compact, gc
+// --compact) in block mode: afterwards the chunk holds block-shaped records with
+// no hidden data. A chunk already in that shape gets nil; one with only small
+// writes above block-shaped records is rewritten partially; any hidden data,
+// or more records than the extent has blocks, makes it a whole rewrite.
+func planKazBlockCompactionForced(ss []*slice, blockSize uint32, maxSlices int) *kazBlockPlan {
+	if p := planKazBlocks(ss, blockSize, 0, maxSlices, false); p != nil || len(ss) == 0 || blockSize == 0 {
+		return p
 	}
+	g := kazNewBlockGeom(ss, blockSize)
+	if g.hiddenShare(ss, nil) > 0 || len(ss) > g.spanned() {
+		return planKazBlocks(ss, blockSize, 0, maxSlices, true)
+	}
+	return nil
+}
+
+// kazNewBlockGeom returns the block geometry of a chunk's records (len(ss) > 0).
+func kazNewBlockGeom(ss []*slice, blockSize uint32) kazBlockGeom {
 	g := kazBlockGeom{size: blockSize, start: ss[0].pos, end: ss[0].pos + ss[0].len}
 	for _, s := range ss[1:] {
 		g.start, g.end = min(g.start, s.pos), max(g.end, s.pos+s.len)
 	}
+	return g
+}
+
+// planKazBlocks implements both plans; whole makes it rewrite every block of
+// the extent regardless of the other rules.
+func planKazBlocks(ss []*slice, blockSize uint32, hiddenRatio float64, maxSlices int, whole bool) *kazBlockPlan {
+	if len(ss) == 0 || blockSize == 0 {
+		return nil
+	}
+	g := kazNewBlockGeom(ss, blockSize)
 	hidden := kazFullyHidden(ss)
 	touched := make(map[uint32]bool)
 	drop := make([]bool, len(ss))
@@ -234,11 +262,11 @@ func planKazBlockCompaction(ss []*slice, blockSize uint32, hiddenRatio float64, 
 	// record per block of the extent, so a chunk of block-shaped records under a
 	// limit below the block count would otherwise be rewritten on every request.
 	overLimit := len(p.removed) == 0 && len(ss) > maxSlices && len(ss) > g.spanned()
-	if len(p.removed) == 0 && !overLimit {
+	if len(p.removed) == 0 && !overLimit && !whole {
 		return nil
 	}
 	p.hidden = g.hiddenShare(p.kept, touched)
-	if overLimit || p.hidden > hiddenRatio || len(p.kept)+len(touched) > maxSlices {
+	if whole || overLimit || p.hidden > hiddenRatio || len(p.kept)+len(touched) > maxSlices {
 		p.full, p.kept, p.removed = true, nil, append([]*slice(nil), ss...)
 		touched = make(map[uint32]bool)
 		for b := g.start / g.size; b*g.size < g.end; b++ {

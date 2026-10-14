@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
@@ -388,4 +389,53 @@ func TestKazBlockCompactionModeLogWarnsSmallMaxSlices(t *testing.T) {
 	hook.Reset()
 	e.logKazCompactionMode()
 	require.False(t, hasLog(hook, logrus.WarnLevel, "max-slices"))
+}
+
+// TestKazForcedCompaction makes juicefs compact (Meta.Compact) leave block-shaped
+// chunks with no hidden data in block mode, and write nothing the second time.
+func TestKazForcedCompaction(t *testing.T) {
+	for _, backend := range kazBlockBackends {
+		t.Run(backend, func(t *testing.T) {
+			e := newKazBlockEnv(t, backend, 4)
+			inode := e.file(t)
+			e.write(t, inode, 0, 16*kazEB)
+			for _, b := range []uint32{2, 3, 9} {
+				e.write(t, inode, b*kazEB+5, 10)
+			}
+			before := e.store.view(e.records(t, inode), 16*kazEB)
+			require.Zero(t, e.meta.Compact(Background(), inode, 1, func() {}, func() {}))
+			after := e.records(t, inode)
+			require.Equal(t, before, e.store.view(after, 16*kazEB))
+			require.Len(t, after, 16)
+			for i, s := range after {
+				require.Equal(t, uint32(i)*kazEB, s.pos)
+				require.Equal(t, kazEB, s.len)
+			}
+			require.Equal(t, 16, e.store.callCount())
+			require.Zero(t, e.meta.Compact(Background(), inode, 1, func() {}, func() {}))
+			require.Equal(t, kazIDs(after), kazIDs(e.records(t, inode)))
+			require.Equal(t, 16, e.store.callCount())
+		})
+	}
+}
+
+// TestKazForcedCompactionAll does the same through CompactAll (juicefs gc --compact).
+func TestKazForcedCompactionAll(t *testing.T) {
+	e := newKazBlockEnv(t, "memkv", 4)
+	inode := e.file(t)
+	e.write(t, inode, 0, 16*kazEB)
+	e.write(t, inode, 2*kazEB+5, 10)
+	require.Zero(t, e.meta.CompactAll(Background(), 1, utils.NewProgress(true).AddCountBar("", 0)))
+	require.Len(t, e.records(t, inode), 16)
+}
+
+// TestKazForcedCompactionUpstreamMode keeps upstream juicefs compact (one slice) by default.
+func TestKazForcedCompactionUpstreamMode(t *testing.T) {
+	e := newKazBlockEnv(t, "memkv", 4)
+	e.conf.KazCompactionMode = ""
+	inode := e.file(t)
+	e.write(t, inode, 0, 16*kazEB)
+	e.write(t, inode, 2*kazEB+5, 10)
+	require.Zero(t, e.meta.Compact(Background(), inode, 1, func() {}, func() {}))
+	require.Len(t, e.records(t, inode), 1)
 }
