@@ -178,7 +178,7 @@ func storageFlags() []cli.Flag {
 		&cli.StringFlag{
 			Name:  "kaz-compaction-mode",
 			Value: "upstream",
-			Usage: "[kaz] how background compaction rewrites a chunk: upstream (the whole merged range as one new slice) or block (only the blocks changed since the last compaction, one new slice per block); forced and synchronous compaction stay upstream",
+			Usage: "[kaz] how compaction rewrites a chunk: upstream (the whole merged range as one new slice) or block (only the blocks changed since the last compaction, one new slice per block; juicefs compact and gc --compact leave every chunk as one slice per block with no hidden data); the synchronous compaction at 2500 slices stays upstream",
 		},
 		&cli.Float64Flag{
 			Name:  "kaz-compaction-block-hidden-ratio",
