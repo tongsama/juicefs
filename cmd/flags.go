@@ -176,6 +176,21 @@ func storageFlags() []cli.Flag {
 			Usage: "[kaz] when a read reloads a chunk's slice list from metadata (open-file chunk cache miss), queue background compaction of that 64 MiB chunk only if it has at least this many slice records (5-2499; 5 keeps the upstream behavior; compaction triggered by writes is unchanged)",
 		},
 		&cli.StringFlag{
+			Name:  "kaz-compaction-mode",
+			Value: "upstream",
+			Usage: "[kaz] how compaction rewrites a chunk: upstream (the whole merged range as one new slice) or block (only the blocks changed since the last compaction, one new slice per block; juicefs compact and gc --compact leave every chunk as one slice per block with no hidden data); the synchronous compaction at 2500 slices stays upstream",
+		},
+		&cli.Float64Flag{
+			Name:  "kaz-compaction-block-hidden-ratio",
+			Value: 0.5,
+			Usage: "[kaz] with --kaz-compaction-mode block, rewrite the whole chunk (one slice per block) when more than this share of the kept slices' data would be hidden by newer data (0 < ratio <= 1)",
+		},
+		&cli.IntFlag{
+			Name:  "kaz-compaction-block-max-slices",
+			Value: 0,
+			Usage: "[kaz] with --kaz-compaction-mode block, rewrite the whole chunk when more than this many slice records would remain (0 = blocks per chunk + 1, 17 for 4 MiB blocks)",
+		},
+		&cli.StringFlag{
 			Name:  "upload-limit",
 			Usage: "bandwidth limit for upload in Mbps",
 		},

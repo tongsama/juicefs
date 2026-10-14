@@ -2937,7 +2937,7 @@ func (m *baseMeta) CompactAll(ctx Context, threads int, bar *utils.Bar) syscall.
 		go func() {
 			for c := range ch {
 				logger.Debugf("Compacting chunk %d:%d (%d slices)", c.inode, c.indx, c.slices)
-				m.compactChunk(c.inode, c.indx, false, true, -1)
+				m.forcedCompactChunk(c.inode, c.indx, -1) // kaz: block mode when selected
 				bar.Increment()
 			}
 			wg.Done()
@@ -3103,7 +3103,7 @@ func (m *baseMeta) Compact(ctx Context, inode Ino, concurrency int, preFunc, pos
 		go func() {
 			defer wg.Done()
 			for c := range chunkChan {
-				m.compactChunk(c.inode, c.indx, false, true, int(attr.Tier))
+				m.forcedCompactChunk(c.inode, c.indx, int(attr.Tier)) // kaz: block mode when selected
 				postFunc()
 				if ctx.Canceled() {
 					return

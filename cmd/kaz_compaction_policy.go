@@ -36,12 +36,32 @@ func kazCompactionReadMinFromFlag(readMin int) (int, error) {
 	return readMin, nil
 }
 
-// applyKazCompactionPolicyFlags copies the kaz compaction policy flag into conf
-// and exits on an invalid value, like the other compaction modes.
+// kazBlockCompactionFromFlags checks the block compaction flags. Unlike the Go
+// config, a hidden ratio of 0 on the command line is out of range.
+func kazBlockCompactionFromFlags(mode string, ratio float64, maxSlices int) (meta.Config, error) {
+	if ratio == 0 {
+		return meta.Config{}, fmt.Errorf("invalid kaz-compaction-block-hidden-ratio 0 (want 0 < ratio <= 1)")
+	}
+	conf := meta.Config{KazCompactionMode: mode, KazCompactionBlockHiddenRatio: ratio, KazCompactionBlockMaxSlices: maxSlices}
+	if err := conf.ValidateKazBlockCompaction(); err != nil {
+		return meta.Config{}, err
+	}
+	return conf, nil
+}
+
+// applyKazCompactionPolicyFlags copies the kaz compaction policy and block
+// compaction flags into conf and exits on an invalid value, like the other compaction modes.
 func applyKazCompactionPolicyFlags(c *cli.Context, conf *meta.Config) {
 	readMin, err := kazCompactionReadMinFromFlag(c.Int("kaz-compaction-read-min"))
 	if err != nil {
 		logger.Fatalf("%s", err)
 	}
 	conf.KazCompactionReadMin = readMin
+	block, err := kazBlockCompactionFromFlags(c.String("kaz-compaction-mode"), c.Float64("kaz-compaction-block-hidden-ratio"), c.Int("kaz-compaction-block-max-slices"))
+	if err != nil {
+		logger.Fatalf("%s", err)
+	}
+	conf.KazCompactionMode = block.KazCompactionMode
+	conf.KazCompactionBlockHiddenRatio = block.KazCompactionBlockHiddenRatio
+	conf.KazCompactionBlockMaxSlices = block.KazCompactionBlockMaxSlices
 }

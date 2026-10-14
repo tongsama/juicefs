@@ -63,6 +63,13 @@ type Config struct {
 	// only if it has at least this many slice records. Commit-triggered compaction
 	// is unchanged. 0 means 5, the upstream threshold.
 	KazCompactionReadMin int
+	// [kaz] block compaction; "" or "upstream" keeps upstream compaction.
+	// KazCompactionMode "block" rewrites only the blocks changed since the last
+	// background compaction, one new slice per block. The two thresholds switch a
+	// chunk back to a whole rewrite (still one slice per block); 0 means the default.
+	KazCompactionMode             string
+	KazCompactionBlockHiddenRatio float64
+	KazCompactionBlockMaxSlices   int
 }
 
 func DefaultConf() *Config {
@@ -82,6 +89,10 @@ func (c *Config) SelfCheck() {
 	if err := c.ValidateKazCompactionPolicy(); err != nil {
 		logger.Warnf("%s; falling back to the upstream compaction triggers", err)
 		c.KazCompactionReadMin = 0
+	}
+	if err := c.ValidateKazBlockCompaction(); err != nil {
+		logger.Warnf("%s; falling back to upstream compaction", err)
+		c.KazCompactionMode, c.KazCompactionBlockHiddenRatio, c.KazCompactionBlockMaxSlices = "", 0, 0
 	}
 	if c.MaxDeletes < 0 {
 		logger.Warnf("max-deletes=%d means synchronous object deletion in the caller, not unlimited deletion concurrency; this can delay compaction and writes. Use a positive max-deletes value for background deletion workers", c.MaxDeletes)

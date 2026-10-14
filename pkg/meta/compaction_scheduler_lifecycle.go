@@ -16,15 +16,16 @@
 
 package meta
 
-// startPriorityCompactor attaches the kaz compaction policy and, for the priority
+// startPriorityCompactor attaches the kaz compaction policy, logs the compaction mode and, for the priority
 // scheduler, request-derived workers, independently of periodic background jobs.
 func (m *baseMeta) startPriorityCompactor() {
 	m.startCompactionPolicy()
+	m.logKazCompactionMode()
 	if m.conf.CompactionScheduler != "priority" || m.conf.ReadOnly || m.priorityCompactor.Load() != nil {
 		return
 	}
 	s := newCompactionScheduler(func(inode Ino, chunk uint32, tier int) {
-		m.compactChunk(inode, chunk, false, false, tier)
+		m.backgroundCompactChunk(inode, chunk, tier)
 	}, 11, 1024)
 	if m.kazCompactMetrics != nil {
 		s.setObserver(m.kazCompactMetrics.observeStart)
@@ -50,5 +51,5 @@ func (m *baseMeta) requestBackgroundCompaction(inode Ino, chunk uint32, count, t
 			return
 		}
 	}
-	go m.compactChunk(inode, chunk, false, false, tier)
+	go m.backgroundCompactChunk(inode, chunk, tier)
 }
