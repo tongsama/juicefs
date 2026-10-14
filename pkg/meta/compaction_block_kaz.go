@@ -326,4 +326,7 @@ func (m *baseMeta) logKazCompactionMode() {
 	}
 	blocks := int(ChunkSize / uint64(bs))
 	logger.Infof("kaz compaction mode: block (block size %d, hidden-ratio %.2f, max-slices %d)", bs, m.conf.kazBlockHiddenRatio(), m.conf.kazBlockMaxSlices(blocks))
+	if v := m.conf.KazCompactionBlockMaxSlices; v != 0 && v < blocks+1 {
+		logger.Warnf("kaz compaction mode: max-slices %d is below blocks per chunk + 1 (%d); a chunk is rewritten whole whenever its kept and rewritten records exceed it, which for a chunk already split into blocks means every compaction that has new writes", v, blocks+1)
+	}
 }

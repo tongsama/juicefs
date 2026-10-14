@@ -73,6 +73,12 @@ func (g kazBlockGeom) within(s *slice, t map[uint32]bool) bool {
 	return true
 }
 
+// spanned returns how many blocks the data extent touches, the most records a
+// whole rewrite can leave.
+func (g kazBlockGeom) spanned() int {
+	return int((g.end+g.size-1)/g.size - g.start/g.size)
+}
+
 // outside counts the bytes of [a, b) in blocks not in t.
 func (g kazBlockGeom) outside(a, b uint32, t map[uint32]bool) uint64 {
 	var n uint64
@@ -187,8 +193,8 @@ func kazOverlapsAny(ss []*slice, lo, hi uint32) bool {
 
 // planKazBlockCompaction decides which records of a chunk (ss, in chunk order) to
 // keep, which to drop and which blocks to rewrite so that the chunk reads the
-// same afterwards. It returns nil when nothing can be dropped and the chunk is
-// within maxSlices (over it, the whole chunk is rewritten block by block).
+// same afterwards. It returns nil when nothing can be dropped, unless the chunk
+// is over maxSlices and a whole rewrite (block by block) would lower its count.
 // Records of at least one block that are not block-shaped are kept, so a large
 // unaligned staged slice may still upload, unlike upstream which rewrites them.
 // The rules are in
@@ -223,8 +229,11 @@ func planKazBlockCompaction(ss []*slice, blockSize uint32, hiddenRatio float64, 
 			p.kept = append(p.kept, s)
 		}
 	}
-	// Nothing removable: only a chunk over the record limit is still rewritten (fully).
-	overLimit := len(p.removed) == 0 && len(ss) > maxSlices
+	// Nothing removable: a chunk over the record limit is still rewritten (fully),
+	// but only when that lowers its record count. A whole rewrite leaves at most one
+	// record per block of the extent, so a chunk of block-shaped records under a
+	// limit below the block count would otherwise be rewritten on every request.
+	overLimit := len(p.removed) == 0 && len(ss) > maxSlices && len(ss) > g.spanned()
 	if len(p.removed) == 0 && !overLimit {
 		return nil
 	}

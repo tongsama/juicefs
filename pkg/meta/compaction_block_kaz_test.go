@@ -350,3 +350,42 @@ func TestKazBlockCompactionRetiresRemoved(t *testing.T) {
 		})
 	}
 }
+
+// TestKazBlockCompactionSmallMaxSlicesNoRepeat rewrites a chunk whole once
+// under a record limit below the block count, and then writes nothing more
+// until new data arrives.
+func TestKazBlockCompactionSmallMaxSlicesNoRepeat(t *testing.T) {
+	for _, backend := range kazBlockBackends {
+		t.Run(backend, func(t *testing.T) {
+			e := newKazBlockEnv(t, backend, 4)
+			e.conf.KazCompactionBlockMaxSlices = 10
+			inode := e.file(t)
+			e.write(t, inode, 0, 16*kazEB)
+			for b := uint32(0); b < 10; b++ { // base + 10 touched blocks > 10 records: whole rewrite
+				e.write(t, inode, b*kazEB+1, 10)
+			}
+			after := kazRun(t, e, inode)
+			require.Len(t, after, 16)
+			require.Equal(t, 16, e.store.callCount())
+			for i := 0; i < 3; i++ {
+				require.Equal(t, kazIDs(after), kazIDs(kazRun(t, e, inode)))
+			}
+			require.Equal(t, 16, e.store.callCount())
+			require.Equal(t, float64(3), kazBlockEventCount(e, "noop"))
+		})
+	}
+}
+
+// TestKazBlockCompactionModeLogWarnsSmallMaxSlices warns at startup when the
+// record limit is below blocks per chunk + 1.
+func TestKazBlockCompactionModeLogWarnsSmallMaxSlices(t *testing.T) {
+	hook := capturePolicyLogs(t, logrus.InfoLevel)
+	e := newKazBlockEnv(t, "memkv", 4096) // 4 MiB blocks: 16 per chunk
+	e.conf.KazCompactionBlockMaxSlices = 10
+	e.logKazCompactionMode()
+	require.True(t, hasLog(hook, logrus.WarnLevel, "max-slices 10", "17"))
+	e.conf.KazCompactionBlockMaxSlices = 0
+	hook.Reset()
+	e.logKazCompactionMode()
+	require.False(t, hasLog(hook, logrus.WarnLevel, "max-slices"))
+}

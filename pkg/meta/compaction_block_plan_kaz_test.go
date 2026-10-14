@@ -173,3 +173,14 @@ func TestPlanKazBlockCompactionOverLimitNothingRemovable(t *testing.T) {
 	require.Equal(t, before, f.view(applyKazPlan(t, f, p, &next), end))
 	require.Nil(t, planKazBlockCompaction(ss, kazTB, 0.5, 100))
 }
+
+// TestPlanKazBlockCompactionOverLimitBlockShaped does nothing for a chunk of
+// block-shaped records over a small record limit: rewriting it whole would
+// produce the same number of records, so it would repeat on every request.
+func TestPlanKazBlockCompactionOverLimitBlockShaped(t *testing.T) {
+	var ss []*slice
+	for i := uint32(0); i < 16; i++ {
+		ss = append(ss, kazRec(i*kazTB, uint64(i+1), kazTB))
+	}
+	require.Nil(t, planKazBlockCompaction(ss, kazTB, 0.5, 10))
+}
