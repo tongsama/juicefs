@@ -674,3 +674,42 @@ func TestKaz2QCompactionProtectedKeepsOrder(t *testing.T) {
 	require.Equal(t, kazTestStart+5, it.inserted)
 	require.Equal(t, kazTestStart+5, it.order)
 }
+
+// TestKaz2QGhostPriorCompaction checks that a compaction output evicted from
+// probation without a demotion is remembered with prior 4 (compaction), that
+// a demoted compaction output keeps prior 2, and that a ghost hit on the
+// former counts ghost_hit and ghost_hit_compaction only.
+func TestKaz2QGhostPriorCompaction(t *testing.T) {
+	p, clock := newKazTestIndex(t, 10, 4) // protected limit: 6 blocks
+	m := newKaz2QMetrics()
+	p.kazSetMetrics(m)
+	ev := func(name string) float64 { return testutil.ToFloat64(m.events.WithLabelValues(name)) }
+
+	p.kazExpect(kazKey(20), kazProbation, *clock)
+	p.add(kazKey(20), cacheItem{size: kazTestBlock, atime: *clock})
+	k, ok := kazNextEvicted(p)
+	require.True(t, ok)
+	require.Equal(t, kazKey(20), k)
+	require.Equal(t, kazPriorCompaction, kazGhostPriorOf(t, p, kazKey(20)))
+
+	// a compaction output demoted from protected is counted as demoted
+	p.kazExpect(kazKey(30), kazProtected, *clock)
+	p.add(kazKey(30), cacheItem{size: kazTestBlock, atime: *clock})
+	for i := uint64(100); i < 106; i++ { // 6 newer protected blocks
+		*clock++
+		kazPromote(t, p, clock, i)
+	}
+	k, ok = kazNextEvicted(p) // demotes 30 (oldest protected), then evicts it
+	require.True(t, ok)
+	require.Equal(t, kazKey(30), k)
+	require.Equal(t, kazPriorDemoted, kazGhostPriorOf(t, p, kazKey(30)))
+
+	p.add(kazKey(20), cacheItem{size: kazTestBlock, atime: *clock})
+	require.Equal(t, 1.0, ev("ghost_hit"))
+	require.Equal(t, 1.0, ev("ghost_hit_compaction"))
+	p.add(kazKey(30), cacheItem{size: kazTestBlock, atime: *clock})
+	require.Equal(t, 2.0, ev("ghost_hit"))
+	require.Equal(t, 1.0, ev("ghost_hit_demoted"))
+	require.Equal(t, ev("ghost_hit"), ev("ghost_hit_probation")+ev("ghost_hit_demoted")+
+		ev("ghost_hit_protected")+ev("ghost_hit_compaction"))
+}

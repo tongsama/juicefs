@@ -38,7 +38,7 @@ import (
 //	  id u64 | indx u32 | size i32 | seg u8 | origin u8 | hits u8 | atime u32 | inserted u32 | order u32
 //	  | demoted u8 (0 or 1; version 2 only)
 //	ghosts count u32, then per evicted key, oldest first:
-//	  id u64 | indx u32 | size u32 | prior u8 (0..3, kazGhostPrior; version 2 only)
+//	  id u64 | indx u32 | size u32 | prior u8 (0..4, kazGhostPrior; version 2 only)
 //	CRC32 (IEEE) of everything before it, u32
 //
 // Version 2 is always written. Version 1 (written by bf9efe73) is still read:
@@ -233,7 +233,7 @@ func decodeKazCacheState(b []byte) (kazCacheState, error) {
 		k := cacheKey{id: le.Uint64(e), indx: le.Uint32(e[8:]), size: le.Uint32(e[12:])}
 		prior := kazPriorUnknown
 		if version >= 2 {
-			if prior = kazGhostPrior(e[16]); prior > kazPriorProtected {
+			if prior = kazGhostPrior(e[16]); prior > kazPriorMax {
 				return st, fmt.Errorf("bad evicted key %d", i)
 			}
 		}

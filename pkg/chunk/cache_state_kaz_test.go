@@ -317,14 +317,14 @@ func TestKazCacheStateV2RoundTrip(t *testing.T) {
 		{key: k1, kazSaved: kazSaved{seg: kazProbation, atime: 10, inserted: 11, order: 12, origin: kazOriginFill, hits: 2, demoted: true}},
 		{key: k2, kazSaved: kazSaved{seg: kazProtected, atime: 20, inserted: 21, order: 22, origin: kazOriginCompaction, hits: 1}},
 	}}
-	priors := []kazGhostPrior{kazPriorUnknown, kazPriorProbation, kazPriorDemoted, kazPriorProtected}
+	priors := []kazGhostPrior{kazPriorUnknown, kazPriorProbation, kazPriorDemoted, kazPriorProtected, kazPriorCompaction}
 	for i, pr := range priors {
 		k := cacheKey{id: uint64(10 + i), size: 100}
 		st.ghosts = append(st.ghosts, kazGhost{key: k, size: 100, prior: pr})
 	}
 	data := encodeKazCacheState(st)
 	require.Equal(t, uint32(2), binary.LittleEndian.Uint32(data[len(kazStateMagic):]))
-	require.Len(t, data, kazStateHeader+4+2*(kazStateItemSize)+4+4*kazStateGhostSize+4)
+	require.Len(t, data, kazStateHeader+4+2*(kazStateItemSize)+4+5*kazStateGhostSize+4)
 	path := filepath.Join(t.TempDir(), "kaz-cache-state.v1")
 	require.NoError(t, writeKazCacheState(path, st))
 	got, err := readKazCacheState(path)
@@ -353,7 +353,7 @@ func TestKazCacheStateV2RoundTrip(t *testing.T) {
 	b[itemMark] = 2
 	bad["mark"] = kazResum(b)
 	b = append([]byte{}, data...)
-	b[ghostPrior] = 4
+	b[ghostPrior] = 5
 	bad["prior"] = kazResum(b)
 	b = append([]byte{}, data...)
 	binary.LittleEndian.PutUint32(b[len(kazStateMagic):], 3)

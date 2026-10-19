@@ -109,9 +109,14 @@ type kazGhostPrior uint8
 
 const (
 	kazPriorUnknown   kazGhostPrior = 0 // not recorded (loaded from a version 1 state file)
-	kazPriorProbation kazGhostPrior = 1 // evicted from probation without the demoted mark
+	kazPriorProbation kazGhostPrior = 1 // evicted from probation without the demoted mark (not a compaction output)
 	kazPriorDemoted   kazGhostPrior = 2 // evicted from probation after a demotion from protected
 	kazPriorProtected kazGhostPrior = 3 // evicted straight from protected
+	// kazPriorCompaction: a compaction output evicted from probation without
+	// the demoted mark (never protected); split from 1 to tell output
+	// placement apart from the promotion condition.
+	kazPriorCompaction kazGhostPrior = 4
+	kazPriorMax                      = kazPriorCompaction // largest valid prior
 )
 
 // event returns the name of the ghost-hit event counted for this prior;
@@ -122,6 +127,8 @@ func (g kazGhostPrior) event() string {
 		return "ghost_hit_demoted"
 	case kazPriorProtected:
 		return "ghost_hit_protected"
+	case kazPriorCompaction:
+		return "ghost_hit_compaction"
 	default:
 		return "ghost_hit_probation"
 	}
@@ -400,7 +407,7 @@ func (p *kaz2QIndex) name() string {
 // new probation block. A compaction output keeps the inherited atime; in
 // protected it is also ordered by it, in probation it enters the newest end
 // (inserted and order are now). An existing key only gets its size updated. A ghost
-// hit counts ghost_hit and one of ghost_hit_{probation,demoted,protected} by
+// hit counts ghost_hit and one of ghost_hit_{probation,demoted,protected,compaction} by
 // the prior segment of the evicted key; it enters protected without the
 // demoted mark.
 func (p *kaz2QIndex) add(key cacheKey, item cacheItem) {
@@ -657,7 +664,8 @@ func (p *kaz2QIndex) randomIter() func(yield func(key cacheKey, item cacheItem) 
 // exceeds capacity*(1-probationRatio); then it evicts the oldest probation
 // block, or the oldest protected block when probation is empty. Each victim
 // is removed from the index and remembered in the evicted-key list, with its
-// prior segment (probation, demoted or protected), before it is yielded.
+// prior segment (probation, demoted, protected, or compaction for a never
+// demoted compaction output in probation), before it is yielded.
 // Staging items are never yielded.
 func (p *kaz2QIndex) evictionIter() func(yield func(key cacheKey, item cacheItem) bool) {
 	return func(yield func(key cacheKey, item cacheItem) bool) {
@@ -670,6 +678,8 @@ func (p *kaz2QIndex) evictionIter() func(yield func(key cacheKey, item cacheItem
 				it, ev, prior = p.prob.items[0], "evict_probation", kazPriorProbation
 				if it.demoted {
 					prior = kazPriorDemoted
+				} else if it.origin == kazOriginCompaction {
+					prior = kazPriorCompaction
 				}
 			} else if p.prot.Len() > 0 {
 				it, ev, prior = p.prot.items[0], "evict_protected", kazPriorProtected
