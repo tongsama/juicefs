@@ -17,10 +17,14 @@
 package cmd
 
 import (
+	"flag"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/urfave/cli/v2"
+
+	"github.com/juicedata/juicefs/pkg/chunk"
 )
 
 // TestKazCacheDurationFlag checks that a valid duration (including a literal
@@ -43,5 +47,29 @@ func TestKazCacheDurationFlag(t *testing.T) {
 	for _, in := range []string{"", "abc", "10x", "5mm", "d", "1dx"} {
 		require.Equal(t, def, kazCacheDurationFlag("kaz-cache-promote-delay", in, def), in)
 		require.Equal(t, 5*time.Minute, kazCacheDurationFlag("kaz-cache-state-interval", in, 5*time.Minute), in)
+	}
+}
+
+// TestKazCacheCompactionPlacementFlag checks that --kaz-cache-compaction-placement
+// defaults to inherit and is copied as given into the chunk config (the value
+// is validated later by the chunk self-check).
+func TestKazCacheCompactionPlacementFlag(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{nil, chunk.KazPlacementInherit},
+		{[]string{"--kaz-cache-compaction-placement", "probation"}, chunk.KazPlacementProbation},
+		{[]string{"--kaz-cache-compaction-placement", "replace"}, chunk.KazPlacementReplace},
+		{[]string{"--kaz-cache-compaction-placement", "bogus"}, "bogus"},
+	} {
+		set := flag.NewFlagSet("kaz-placement-test", flag.ContinueOnError)
+		for _, f := range dataCacheFlags() {
+			require.NoError(t, f.Apply(set))
+		}
+		require.NoError(t, set.Parse(tc.args))
+		conf := &chunk.Config{}
+		applyKazCacheFlags(cli.NewContext(nil, set, nil), conf)
+		require.Equal(t, tc.want, conf.KazCacheCompactionPlacement, "%v", tc.args)
 	}
 }

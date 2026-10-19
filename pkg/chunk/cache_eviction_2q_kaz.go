@@ -189,6 +189,7 @@ type kaz2QIndex struct {
 	expectPruneAt   int // size of expect above which kazExpect drops expired entries
 
 	stateInterval time.Duration // save interval of the state file
+	placement     string        // compaction output placement (KazPlacement*), fixed at creation
 	// saveMu serializes writers of the state file (periodic saver and the
 	// flush at umount); it is not the store mutex and guards no index field.
 	saveMu sync.Mutex
@@ -223,6 +224,10 @@ func newKaz2QIndex(conf *Config) *kaz2QIndex {
 	if interval <= 0 {
 		interval = 5 * time.Minute
 	}
+	placement := conf.KazCacheCompactionPlacement
+	if placement != KazPlacementProbation && placement != KazPlacementReplace {
+		placement = KazPlacementInherit
+	}
 	return &kaz2QIndex{
 		keys:           make(map[cacheKey]*kazItem),
 		prob:           kazHeap{byOrder: true},
@@ -234,6 +239,7 @@ func newKaz2QIndex(conf *Config) *kaz2QIndex {
 		restore:        make(map[cacheKey]kazSaved),
 		expect:         make(map[cacheKey]kazExpectation),
 		stateInterval:  interval,
+		placement:      placement,
 		now:            func() uint32 { return uint32(time.Now().Unix()) },
 	}
 }

@@ -27,12 +27,14 @@ import (
 	"github.com/juicedata/juicefs/pkg/utils"
 )
 
-// applyKazCacheFlags copies the kaz-2q cache eviction flags into the chunk config.
+// applyKazCacheFlags copies the kaz-2q cache eviction flags into the chunk config
+// (values are range-checked later by the chunk self-check).
 func applyKazCacheFlags(c *cli.Context, conf *chunk.Config) {
 	conf.KazCacheProbationRatio = c.Float64("kaz-cache-probation-ratio")
 	conf.KazCachePromoteDelay = kazCacheDurationFlag("kaz-cache-promote-delay", c.String("kaz-cache-promote-delay"), 10*time.Minute)
 	conf.KazCacheGhostRatio = c.Float64("kaz-cache-ghost-ratio")
 	conf.KazCacheStateInterval = kazCacheDurationFlag("kaz-cache-state-interval", c.String("kaz-cache-state-interval"), 5*time.Minute)
+	conf.KazCacheCompactionPlacement = c.String("kaz-cache-compaction-placement")
 }
 
 // kazCacheDurationFlag parses the value s of the kaz-2q duration flag name.

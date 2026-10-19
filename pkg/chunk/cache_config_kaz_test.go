@@ -62,6 +62,28 @@ func TestKaz2QConfigSelfCheck(t *testing.T) {
 			}
 		})
 	}
+
+	// Compaction output placement: "" and unknown values fall back to inherit
+	// under kaz-2q; other eviction policies leave the value untouched.
+	for _, c := range []struct{ evict, dir, in, want string }{
+		{EvictionKaz2Q, "/tmp/x", "", KazPlacementInherit},
+		{EvictionKaz2Q, "/tmp/x", "bogus", KazPlacementInherit},
+		{EvictionKaz2Q, "/tmp/x", KazPlacementInherit, KazPlacementInherit},
+		{EvictionKaz2Q, "/tmp/x", KazPlacementProbation, KazPlacementProbation},
+		{EvictionKaz2Q, "/tmp/x", KazPlacementReplace, KazPlacementReplace},
+		{EvictionLRU, "/tmp/x", "bogus", "bogus"},
+		{Eviction2Random, "/tmp/x", "", ""},
+		{EvictionKaz2Q, "memory", "bogus", "bogus"},
+	} {
+		conf := Config{CacheDir: c.dir, CacheSize: 1 << 30, CacheEviction: c.evict,
+			KazCacheProbationRatio: 0.4, KazCacheStateInterval: time.Minute,
+			KazCacheCompactionPlacement: c.in}
+		conf.SelfCheck("uuid")
+		if conf.KazCacheCompactionPlacement != c.want {
+			t.Fatalf("%s/%s placement %q: got %q, want %q", c.evict, c.dir, c.in,
+				conf.KazCacheCompactionPlacement, c.want)
+		}
+	}
 }
 
 // TestKazConfigSelfCheckOnlyForKaz2Q verifies that non-kaz modes (and the

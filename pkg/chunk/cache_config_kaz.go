@@ -18,8 +18,22 @@ package chunk
 
 import "time"
 
+// Values of Config.KazCacheCompactionPlacement (--kaz-cache-compaction-placement),
+// which selects the kaz-2q segment of a cached compaction output block.
+const (
+	// KazPlacementInherit puts the output in protected when any cached source
+	// block is protected, else in probation (the original rule).
+	KazPlacementInherit = "inherit"
+	// KazPlacementProbation always puts the output in probation.
+	KazPlacementProbation = "probation"
+	// KazPlacementReplace puts the output in protected only when a protected
+	// source block was copied whole into it, else in probation.
+	KazPlacementReplace = "replace"
+)
+
 // kazCacheSelfCheck normalizes the kaz-2q options, warning and falling back to
-// defaults for out-of-range values. It never changes other eviction settings.
+// defaults for out-of-range values (an empty compaction placement silently
+// becomes inherit, an unknown one warns and becomes inherit). It never changes other eviction settings.
 func (c *Config) kazCacheSelfCheck() {
 	if c.KazCacheProbationRatio <= 0 || c.KazCacheProbationRatio >= 1 {
 		logger.Warnf("kaz-cache-probation-ratio should be in (0, 1), setting it to 0.4")
@@ -36,5 +50,14 @@ func (c *Config) kazCacheSelfCheck() {
 	if c.KazCacheStateInterval <= 0 {
 		logger.Warnf("kaz-cache-state-interval should be positive, setting it to 5m")
 		c.KazCacheStateInterval = 5 * time.Minute
+	}
+	switch c.KazCacheCompactionPlacement {
+	case KazPlacementInherit, KazPlacementProbation, KazPlacementReplace:
+	case "":
+		c.KazCacheCompactionPlacement = KazPlacementInherit
+	default:
+		logger.Warnf("kaz-cache-compaction-placement should be one of [%s, %s, %s], setting it to %s",
+			KazPlacementInherit, KazPlacementProbation, KazPlacementReplace, KazPlacementInherit)
+		c.KazCacheCompactionPlacement = KazPlacementInherit
 	}
 }

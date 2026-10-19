@@ -17,6 +17,8 @@
 package vfs
 
 import (
+	"sort"
+
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 )
@@ -33,18 +35,21 @@ type kazCompactionWriter interface {
 // indx: for every piece overlapping the output range [indx*bs, (indx+1)*bs),
 // the blocks of the source slice that hold the overlapping bytes (slice range
 // starting at Off plus the offset of the overlap inside the piece). Blocks
-// are listed in piece order without duplicates. The kaz-2q cache uses it to
-// place each output block like its sources.
+// are listed in piece order without duplicates. Whole is set on a block when
+// the union of its byte ranges copied into this output block, across all
+// pieces, covers the block entirely ([0, min(bs, SliceSize-Indx*bs))). The
+// kaz-2q cache uses it to place each output block like its sources.
 func kazCompactionSources(slices []meta.Slice, blockSize int) func(indx int) []chunk.KazBlockRef {
 	pieces := append([]meta.Slice(nil), slices...)
 	return func(indx int) []chunk.KazBlockRef {
 		lo, hi := indx*blockSize, (indx+1)*blockSize
 		var refs []chunk.KazBlockRef
-		seen := make(map[chunk.KazBlockRef]bool)
-		var pos int
+		pos := make(map[chunk.KazBlockRef]int)         // ref (Whole false) -> index in refs
+		copied := make(map[chunk.KazBlockRef][][2]int) // ref -> copied ranges inside the block
+		var off int
 		for _, s := range pieces {
-			start, end := pos, pos+int(s.Len)
-			pos = end
+			start, end := off, off+int(s.Len)
+			off = end
 			if s.Id == 0 || s.Len == 0 || end <= lo || start >= hi {
 				continue
 			}
@@ -52,12 +57,38 @@ func kazCompactionSources(slices []meta.Slice, blockSize int) func(indx int) []c
 			to := from + min(end, hi) - max(start, lo)
 			for b := from / blockSize; b <= (to-1)/blockSize; b++ {
 				ref := chunk.KazBlockRef{ID: s.Id, SliceSize: s.Size, Indx: uint32(b)}
-				if !seen[ref] {
-					seen[ref] = true
+				if _, ok := pos[ref]; !ok {
+					pos[ref] = len(refs)
 					refs = append(refs, ref)
 				}
+				base := b * blockSize
+				copied[ref] = append(copied[ref], [2]int{max(from, base) - base, min(to, base+blockSize) - base})
 			}
+		}
+		for ref, i := range pos {
+			blockLen := min(blockSize, int(ref.SliceSize)-int(ref.Indx)*blockSize)
+			refs[i].Whole = kazRangesCover(copied[ref], blockLen)
 		}
 		return refs
 	}
+}
+
+// kazRangesCover reports whether the union of the half-open ranges covers
+// [0, n). Ranges may overlap and come in any order; ranges is reordered.
+func kazRangesCover(ranges [][2]int, n int) bool {
+	if n <= 0 {
+		return false
+	}
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i][0] < ranges[j][0] })
+	covered := 0 // [0, covered) is covered so far
+	for _, r := range ranges {
+		if r[0] > covered {
+			return false
+		}
+		covered = max(covered, r[1])
+		if covered >= n {
+			return true
+		}
+	}
+	return false
 }

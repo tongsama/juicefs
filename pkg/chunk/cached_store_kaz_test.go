@@ -61,6 +61,13 @@ func kazCompKey(conf Config, id uint64, size int) string {
 // under -race).
 func newKazCompFixture(t *testing.T, eviction, dir string, cached bool, ids ...uint64) *kazCompFixture {
 	t.Helper()
+	return newKazCompFixtureConf(t, eviction, dir, cached, nil, ids...)
+}
+
+// newKazCompFixtureConf is newKazCompFixture with mutate (if not nil) applied
+// to the config before the store starts.
+func newKazCompFixtureConf(t *testing.T, eviction, dir string, cached bool, mutate func(*Config), ids ...uint64) *kazCompFixture {
+	t.Helper()
 	mem, _ := object.CreateStorage("mem", "", "", "", "")
 	conf := defaultConf
 	conf.CacheDir = dir
@@ -74,6 +81,9 @@ func newKazCompFixture(t *testing.T, eviction, dir string, cached bool, ids ...u
 	conf.KazCacheStateInterval = time.Hour
 	conf.FreeSpace = 0
 	conf.Prefetch = 1
+	if mutate != nil {
+		mutate(&conf)
+	}
 	f := &kazCompFixture{data: map[uint64][]byte{}, keys: map[uint64]string{}}
 	for _, id := range ids {
 		data := bytes.Repeat([]byte{byte(id)}, kazCompSize)
@@ -377,4 +387,72 @@ func TestKazCompactionOutputOtherPolicies(t *testing.T) {
 	key = f.kazWriteCompactionOutput(t, 203, full, nil)
 	require.Eventually(t, func() bool { _, ok := f.store.KazCacheState(key); return ok },
 		5*time.Second, 10*time.Millisecond, "lru with CacheLargeWrite must cache a full output")
+}
+
+// TestKazCompactionPlacementModes checks the segment of a compaction output
+// under each --kaz-cache-compaction-placement value: inherit takes protected
+// from any protected source, probation always uses probation, and replace
+// uses protected only when a protected source block was copied whole. In
+// every mode an output without a cached source is not cached and the output
+// takes the newest atime of its sources.
+func TestKazCompactionPlacementModes(t *testing.T) {
+	for _, tc := range []struct {
+		mode           string
+		partial, whole string // segment with the protected source partial / whole
+		probWhole      string // segment with only a whole probation source
+	}{
+		{KazPlacementInherit, "protected", "protected", "probation"},
+		{KazPlacementProbation, "probation", "probation", "probation"},
+		{KazPlacementReplace, "probation", "protected", "probation"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			f := newKazCompFixtureConf(t, EvictionKaz2Q, "", true,
+				func(c *Config) { c.KazCacheCompactionPlacement = tc.mode }, 1, 2)
+			cs := f.cs
+			idx := cs.keys.(*kaz2QIndex)
+			future := uint32(time.Now().Unix()) + 100000
+			cs.Lock()
+			orig := idx.now
+			idx.now = func() uint32 { return future }
+			cs.Unlock()
+			f.read(t, context.Background(), 1, 0, 100) // user read: promote slice 1, atime = future
+			cs.Lock()
+			idx.now = orig
+			seg1, _ := idx.kazSegmentOf(cs.getCacheKey(f.keys[1]))
+			seg2, _ := idx.kazSegmentOf(cs.getCacheKey(f.keys[2]))
+			atime2 := idx.peekAtime(cs.getCacheKey(f.keys[2]))
+			cs.Unlock()
+			require.Equal(t, kazProtected, seg1)
+			require.Equal(t, kazProbation, seg2)
+			ref := func(id uint64, whole bool) KazBlockRef {
+				return KazBlockRef{ID: id, SliceSize: kazCompSize, Indx: 0, Whole: whole}
+			}
+			out := bytes.Repeat([]byte{0xCD}, kazCompSize)
+			// atimeOf returns the atime of the cached output key.
+			atimeOf := func(key string) uint32 {
+				cs.Lock()
+				defer cs.Unlock()
+				return idx.keys[cs.getCacheKey(key)].atime
+			}
+
+			key := f.kazWriteCompactionOutput(t, 101, out, []KazBlockRef{ref(1, false), ref(2, true)})
+			require.Equal(t, tc.partial, f.waitState(t, key), "protected source copied partially")
+			require.Equal(t, future, atimeOf(key), "output must inherit the newest source atime")
+
+			key = f.kazWriteCompactionOutput(t, 102, out, []KazBlockRef{ref(2, false), ref(1, true)})
+			require.Equal(t, tc.whole, f.waitState(t, key), "protected source copied whole")
+			require.Equal(t, future, atimeOf(key), "output must inherit the newest source atime")
+
+			key = f.kazWriteCompactionOutput(t, 103, out, []KazBlockRef{ref(2, true)})
+			require.Equal(t, tc.probWhole, f.waitState(t, key), "probation source only")
+			require.Equal(t, atime2, atimeOf(key))
+
+			key = f.kazWriteCompactionOutput(t, 104, out, []KazBlockRef{ref(9, true)})
+			time.Sleep(100 * time.Millisecond)
+			_, cached := f.store.KazCacheState(key)
+			require.False(t, cached, "output without a cached source must not be cached")
+			require.Equal(t, 3.0, f.kazEvents("compaction_output_cached"))
+			require.Equal(t, 1.0, f.kazEvents("compaction_output_skipped"))
+		})
+	}
 }

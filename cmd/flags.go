@@ -391,6 +391,11 @@ func dataCacheFlags() []cli.Flag {
 			Usage: "[kaz] save interval of the kaz-cache-state.v1 file under --cache-eviction kaz-2q",
 		},
 		&cli.StringFlag{
+			Name:  "kaz-cache-compaction-placement",
+			Value: "inherit",
+			Usage: "[kaz] segment of a cached compaction output block under --cache-eviction kaz-2q: inherit (protected if any source block is protected), probation (always probation), replace (protected only if a protected source block was copied whole into it); an output is cached only when a source block is cached",
+		},
+		&cli.StringFlag{
 			Name:  "cache-scan-interval",
 			Value: "1h",
 			Usage: "interval to scan cache-dir to rebuild in-memory index",

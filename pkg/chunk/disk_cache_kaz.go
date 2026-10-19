@@ -109,28 +109,42 @@ func (m *cacheManager) kazLoadNoTouch(key string) (ReadCloser, error) {
 	return r, err
 }
 
+// kazPlacementSource is one source block of a compaction output block given
+// to kazCompactionPlacement: its block key and whether its full range was
+// copied into the output block (KazBlockRef.Whole).
+type kazPlacementSource struct {
+	key   string
+	whole bool
+}
+
 // kazCompactionPlacement decides whether the compaction output block outKey
-// is cached under kaz-2q, from its source blocks srcKeys: each source store
-// is asked separately (one store lock at a time) with kazPlacement, the
-// results are merged (protected wins, newest atime), and when any source is
-// cached the placement is registered with kazExpect in the output store, to
-// be consumed by the add after cache() flushes the block. It returns whether
-// the caller should cache the output and counts compaction_output_cached or
+// is cached under kaz-2q, from its source blocks srcs: each source store is
+// asked separately (one store lock at a time) with kazPlacement, and when any
+// source is cached the placement is registered with kazExpect in the output
+// store, to be consumed by the add after cache() flushes the block. The
+// segment follows the output store's placement mode (from
+// Config.KazCacheCompactionPlacement): inherit = protected if any cached
+// source is protected; probation = always probation; replace = protected
+// only if a protected source has whole set. In every mode the atime is the
+// newest among the cached sources. It returns whether the caller should
+// cache the output and counts compaction_output_cached or
 // compaction_output_skipped. Sources that are only pending in memory, or
 // only in a legacy store, are not considered.
-func (m *cacheManager) kazCompactionPlacement(outKey string, srcKeys []string) bool {
-	var seg kazSegment
+func (m *cacheManager) kazCompactionPlacement(outKey string, srcs []kazPlacementSource) bool {
 	var atime uint32
-	found := false
-	for _, sk := range srcKeys {
-		s := m.getStore(sk)
+	found, anyProtected, wholeProtected := false, false, false
+	for _, src := range srcs {
+		s := m.getStore(src.key)
 		if s == nil {
 			continue
 		}
 		s.Lock()
 		if idx, ok := s.keys.(*kaz2QIndex); ok {
-			if sg, at, ok := idx.kazPlacement([]cacheKey{s.getCacheKey(sk)}); ok {
-				seg = max(seg, sg) // kazProtected > kazProbation
+			if sg, at, ok := idx.kazPlacement([]cacheKey{s.getCacheKey(src.key)}); ok {
+				if sg == kazProtected {
+					anyProtected = true
+					wholeProtected = wholeProtected || src.whole
+				}
 				atime = max(atime, at)
 				found = true
 			}
@@ -142,6 +156,18 @@ func (m *cacheManager) kazCompactionPlacement(outKey string, srcKeys []string) b
 	if found && out != nil {
 		out.Lock()
 		if idx, ok := out.keys.(*kaz2QIndex); ok {
+			seg := kazProbation
+			switch idx.placement {
+			case KazPlacementProbation:
+			case KazPlacementReplace:
+				if wholeProtected {
+					seg = kazProtected
+				}
+			default: // inherit
+				if anyProtected {
+					seg = kazProtected
+				}
+			}
 			idx.kazExpect(out.getCacheKey(outKey), seg, atime)
 			placed = true
 		}

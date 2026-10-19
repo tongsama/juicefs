@@ -599,6 +599,8 @@ type Config struct {
 	KazCacheGhostRatio float64
 	// KazCacheStateInterval is the save interval of the kaz-cache-state.v1 file.
 	KazCacheStateInterval time.Duration
+	// KazCacheCompactionPlacement selects the segment of a compaction output (inherit, probation, replace).
+	KazCacheCompactionPlacement string
 }
 
 func (c *Config) SelfCheck(uuid string) {
