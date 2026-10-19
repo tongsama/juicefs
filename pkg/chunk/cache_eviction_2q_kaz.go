@@ -47,6 +47,7 @@ const (
 	kazOriginWrite                       // written through staging / write cache
 	kazOriginFill                        // filled after a read miss (GET)
 	kazOriginCompaction                  // output of a compaction
+	kazOriginCount                       // number of origins (array size, not an origin)
 )
 
 // String returns the metrics label of the origin.
@@ -79,6 +80,7 @@ type kazItem struct {
 	order     uint32     // eviction order inside probation
 	origin    kazOrigin  // how it entered the cache
 	hits      uint8      // user hits, saturating
+	demoted   bool       // demoted from protected and not promoted since (set again on each demotion)
 	pos       int        // index in its segment heap, notInLru when not in a heap
 }
 
@@ -91,6 +93,7 @@ type kazSaved struct {
 	order    uint32
 	origin   kazOrigin
 	hits     uint8
+	demoted  bool
 }
 
 // kazExpectation is the placement registered for a coming compaction output.
@@ -100,10 +103,35 @@ type kazExpectation struct {
 	at    uint32 // when it was registered
 }
 
+// kazGhostPrior is the segment an evicted key was in before its eviction; it
+// splits ghost hits by where the block came from.
+type kazGhostPrior uint8
+
+const (
+	kazPriorUnknown   kazGhostPrior = 0 // not recorded (loaded from a version 1 state file)
+	kazPriorProbation kazGhostPrior = 1 // evicted from probation without the demoted mark
+	kazPriorDemoted   kazGhostPrior = 2 // evicted from probation after a demotion from protected
+	kazPriorProtected kazGhostPrior = 3 // evicted straight from protected
+)
+
+// event returns the name of the ghost-hit event counted for this prior;
+// an unknown prior counts as probation.
+func (g kazGhostPrior) event() string {
+	switch g {
+	case kazPriorDemoted:
+		return "ghost_hit_demoted"
+	case kazPriorProtected:
+		return "ghost_hit_protected"
+	default:
+		return "ghost_hit_probation"
+	}
+}
+
 // kazGhost is an entry of the evicted-key list (2Q A1out).
 type kazGhost struct {
-	key  cacheKey
-	size int64
+	key   cacheKey
+	size  int64
+	prior kazGhostPrior // segment before the eviction
 }
 
 // kazHeap is a min-heap of kazItem ordered by order (probation) or atime
@@ -173,6 +201,8 @@ type kaz2QIndex struct {
 	prot   kazHeap // protected, evictable items only
 	used   [3]int64
 	counts [3]int64
+	// usedByOrigin splits used by the origin of the items (staging excluded).
+	usedByOrigin [3][kazOriginCount]int64
 
 	capacity       int64   // bytes set by kazSetCapacity; 0 = no protected limit, no ghost list
 	probationRatio float64 // share of probation
@@ -200,6 +230,9 @@ type kaz2QIndex struct {
 	// to the gauges, which are shared by all stores of a cache manager.
 	pubUsed   [3]int64
 	pubCounts [3]int64
+	// pubUsedByOrigin is the per-segment, per-origin share added to the
+	// shared bytes_by_origin gauges.
+	pubUsedByOrigin [3][kazOriginCount]int64
 	// pubGhostBlocks and pubGhostBytes are the evicted-key list size this
 	// index has added to the shared ghost gauges.
 	pubGhostBlocks int64
@@ -260,17 +293,24 @@ func (p *kaz2QIndex) kazSetMetrics(m *kaz2QMetrics) {
 		for _, s := range []kazSegment{kazProbation, kazProtected} {
 			old.blocks.WithLabelValues(s.String()).Sub(float64(p.pubCounts[s]))
 			old.bytes.WithLabelValues(s.String()).Sub(float64(p.pubUsed[s]))
+			for o := kazOrigin(0); o < kazOriginCount; o++ {
+				old.bytesByOrigin.WithLabelValues(s.String(), o.String()).Sub(float64(p.pubUsedByOrigin[s][o]))
+			}
 		}
 		old.ghostBlocks.Sub(float64(p.pubGhostBlocks))
 		old.ghostBytes.Sub(float64(p.pubGhostBytes))
 	}
 	p.metrics = m
 	p.pubUsed, p.pubCounts = [3]int64{}, [3]int64{}
+	p.pubUsedByOrigin = [3][kazOriginCount]int64{}
 	p.pubGhostBlocks, p.pubGhostBytes = 0, 0
 	if m != nil { // export both segments from the start, even when empty
 		for _, s := range []kazSegment{kazProbation, kazProtected} {
 			m.blocks.WithLabelValues(s.String()).Add(0)
 			m.bytes.WithLabelValues(s.String()).Add(0)
+			for o := kazOrigin(0); o < kazOriginCount; o++ {
+				m.bytesByOrigin.WithLabelValues(s.String(), o.String()).Add(0)
+			}
 		}
 	}
 	p.syncGauges()
@@ -283,8 +323,8 @@ func (p *kaz2QIndex) event(name string) {
 	}
 }
 
-// syncGauges publishes the per-segment block and byte counts and the size of
-// the evicted-key list. The gauges are shared by the stores of a cache
+// syncGauges publishes the per-segment block and byte counts (also split by
+// origin) and the size of the evicted-key list. The gauges are shared by the stores of a cache
 // manager, so only the change since the last sync of this index is added; the
 // gauges then hold the sum over all stores.
 func (p *kaz2QIndex) syncGauges() {
@@ -299,6 +339,12 @@ func (p *kaz2QIndex) syncGauges() {
 		if d := p.used[s] - p.pubUsed[s]; d != 0 {
 			p.metrics.bytes.WithLabelValues(s.String()).Add(float64(d))
 			p.pubUsed[s] = p.used[s]
+		}
+		for o := kazOrigin(0); o < kazOriginCount; o++ {
+			if d := p.usedByOrigin[s][o] - p.pubUsedByOrigin[s][o]; d != 0 {
+				p.metrics.bytesByOrigin.WithLabelValues(s.String(), o.String()).Add(float64(d))
+				p.pubUsedByOrigin[s][o] = p.usedByOrigin[s][o]
+			}
 		}
 	}
 	if d := int64(p.ghost.Len()) - p.pubGhostBlocks; d != 0 {
@@ -319,14 +365,16 @@ func (p *kaz2QIndex) heapOf(seg kazSegment) *kazHeap {
 	return &p.prob
 }
 
-// link puts an evictable item into its segment heap and accounts its size.
-// Staging items (size<0) stay only in the map.
+// link puts an evictable item into its segment heap and accounts its size
+// (per segment and per segment and origin). Staging items (size<0) stay only
+// in the map. A change of segment, size or origin goes unlink -> change -> link.
 func (p *kaz2QIndex) link(it *kazItem) {
 	if it.size <= 0 {
 		return
 	}
 	heap.Push(p.heapOf(it.seg), it)
 	p.used[it.seg] += int64(it.size)
+	p.usedByOrigin[it.seg][it.origin] += int64(it.size)
 	p.counts[it.seg]++
 }
 
@@ -338,6 +386,7 @@ func (p *kaz2QIndex) unlink(it *kazItem) {
 	}
 	heap.Remove(p.heapOf(it.seg), it.pos)
 	p.used[it.seg] -= int64(it.size)
+	p.usedByOrigin[it.seg][it.origin] -= int64(it.size)
 	p.counts[it.seg]--
 }
 
@@ -348,7 +397,10 @@ func (p *kaz2QIndex) name() string {
 
 // add implements KeyIndex. A new key is placed by (in order) staging,
 // a compaction expectation, the restore state, the evicted-key list, or as a
-// new probation block. An existing key only gets its size updated.
+// new probation block. An existing key only gets its size updated. A ghost
+// hit counts ghost_hit and one of ghost_hit_{probation,demoted,protected} by
+// the prior segment of the evicted key; it enters protected without the
+// demoted mark.
 func (p *kaz2QIndex) add(key cacheKey, item cacheItem) {
 	if it, ok := p.keys[key]; ok {
 		p.updateSize(it, item.size)
@@ -367,16 +419,17 @@ func (p *kaz2QIndex) add(key cacheKey, item cacheItem) {
 	} else if s, ok := p.restore[key]; ok {
 		delete(p.restore, key)
 		it.seg, it.atime, it.inserted, it.order = s.seg, s.atime, s.inserted, s.order
-		it.origin, it.hits = s.origin, s.hits
+		it.origin, it.hits, it.demoted = s.origin, s.hits, s.demoted
 		if item.atime > it.atime { // the block was read after the state was saved
 			it.atime = item.atime
 		}
 	} else if el, ok := p.ghostKeys[key]; ok {
-		p.dropGhost(el)
+		g := p.dropGhost(el)
 		it.seg = kazProtected
 		it.inserted, it.order = item.atime, item.atime
 		it.origin = kazOriginFill
 		p.event("ghost_hit")
+		p.event(g.prior.event())
 	} else {
 		it.inserted, it.order = item.atime, item.atime
 		if item.atime+kazFillWindow >= now {
@@ -427,7 +480,8 @@ func (p *kaz2QIndex) remove(key cacheKey, staging bool) *cacheItem {
 
 // get implements KeyIndex as a user hit: it updates atime and hits, counts
 // the hit by origin, and promotes a probation block read after the
-// correlation period. It returns a copy of the updated item.
+// correlation period (clearing its demoted mark). It returns a copy of the
+// updated item.
 func (p *kaz2QIndex) get(key cacheKey) *cacheItem {
 	it, ok := p.keys[key]
 	if !ok {
@@ -447,6 +501,7 @@ func (p *kaz2QIndex) get(key cacheKey) *cacheItem {
 	case it.seg == kazProbation && now >= it.inserted && now-it.inserted >= p.promoteDelay:
 		p.unlink(it)
 		it.seg = kazProtected
+		it.demoted = false
 		p.link(it)
 		p.event("promote")
 		p.syncGauges()
@@ -563,7 +618,7 @@ func (p *kaz2QIndex) reset() KeyIndex {
 	}
 	for k, it := range p.keys {
 		restore[k] = kazSaved{seg: it.seg, atime: it.atime, inserted: it.inserted,
-			order: it.order, origin: it.origin, hits: it.hits}
+			order: it.order, origin: it.origin, hits: it.hits, demoted: it.demoted}
 	}
 	p.restore, p.restoreFromFile = restore, false
 	p.pruneExpect(p.now())
@@ -571,6 +626,7 @@ func (p *kaz2QIndex) reset() KeyIndex {
 	p.prob = kazHeap{byOrder: true}
 	p.prot = kazHeap{}
 	p.used, p.counts = [3]int64{}, [3]int64{}
+	p.usedByOrigin = [3][kazOriginCount]int64{}
 	p.syncGauges()
 	return snap
 }
@@ -590,24 +646,29 @@ func (p *kaz2QIndex) randomIter() func(yield func(key cacheKey, item cacheItem) 
 // oldest protected blocks to the newest end of probation while protected
 // exceeds capacity*(1-probationRatio); then it evicts the oldest probation
 // block, or the oldest protected block when probation is empty. Each victim
-// is removed from the index and remembered in the evicted-key list before it
-// is yielded. Staging items are never yielded.
+// is removed from the index and remembered in the evicted-key list, with its
+// prior segment (probation, demoted or protected), before it is yielded.
+// Staging items are never yielded.
 func (p *kaz2QIndex) evictionIter() func(yield func(key cacheKey, item cacheItem) bool) {
 	return func(yield func(key cacheKey, item cacheItem) bool) {
 		for {
 			p.demoteOverflow()
 			var it *kazItem
 			var ev string
+			var prior kazGhostPrior
 			if p.prob.Len() > 0 {
-				it, ev = p.prob.items[0], "evict_probation"
+				it, ev, prior = p.prob.items[0], "evict_probation", kazPriorProbation
+				if it.demoted {
+					prior = kazPriorDemoted
+				}
 			} else if p.prot.Len() > 0 {
-				it, ev = p.prot.items[0], "evict_protected"
+				it, ev, prior = p.prot.items[0], "evict_protected", kazPriorProtected
 			} else {
 				return
 			}
 			p.unlink(it)
 			delete(p.keys, it.key)
-			p.addGhost(it.key, int64(it.size))
+			p.addGhost(it.key, int64(it.size), prior)
 			p.event(ev)
 			p.syncGauges()
 			if !yield(it.key, it.cacheItem) {
@@ -619,7 +680,7 @@ func (p *kaz2QIndex) evictionIter() func(yield func(key cacheKey, item cacheItem
 
 // demoteOverflow moves the least recently read protected blocks to the newest
 // end of probation while protected is over its limit (no limit without a
-// capacity).
+// capacity), marking them as demoted.
 func (p *kaz2QIndex) demoteOverflow() {
 	if p.capacity <= 0 {
 		return
@@ -631,6 +692,7 @@ func (p *kaz2QIndex) demoteOverflow() {
 		p.unlink(it)
 		it.seg = kazProbation
 		it.inserted, it.order = now, now
+		it.demoted = true
 		p.link(it)
 		p.event("demote")
 	}
@@ -644,24 +706,26 @@ func (p *kaz2QIndex) ghostCap() int64 {
 	return int64(float64(p.capacity) * p.ghostRatio)
 }
 
-// addGhost remembers an evicted key, forgetting the oldest beyond the cap.
-func (p *kaz2QIndex) addGhost(key cacheKey, size int64) {
+// addGhost remembers an evicted key with the segment it was evicted from,
+// forgetting the oldest beyond the cap.
+func (p *kaz2QIndex) addGhost(key cacheKey, size int64, prior kazGhostPrior) {
 	if p.ghostCap() == 0 {
 		return
 	}
 	if el, ok := p.ghostKeys[key]; ok {
 		p.dropGhost(el)
 	}
-	p.ghostKeys[key] = p.ghost.PushBack(kazGhost{key: key, size: size})
+	p.ghostKeys[key] = p.ghost.PushBack(kazGhost{key: key, size: size, prior: prior})
 	p.ghostBytes += size
 	p.trimGhost()
 }
 
-// dropGhost removes one entry from the evicted-key list.
-func (p *kaz2QIndex) dropGhost(el *list.Element) {
+// dropGhost removes one entry from the evicted-key list and returns it.
+func (p *kaz2QIndex) dropGhost(el *list.Element) kazGhost {
 	g := p.ghost.Remove(el).(kazGhost)
 	delete(p.ghostKeys, g.key)
 	p.ghostBytes -= g.size
+	return g
 }
 
 // trimGhost forgets the oldest evicted keys while the list is over its cap.

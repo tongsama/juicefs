@@ -382,6 +382,7 @@ func TestKaz2QPlacement(t *testing.T) {
 func kazVerify(t *testing.T, p *kaz2QIndex) {
 	t.Helper()
 	var used, counts [3]int64
+	var byOrigin [3][kazOriginCount]int64
 	for k, it := range p.keys {
 		require.Equal(t, k, it.key)
 		if it.size <= 0 {
@@ -392,9 +393,11 @@ func kazVerify(t *testing.T, p *kaz2QIndex) {
 		require.Less(t, it.pos, h.Len())
 		require.Same(t, it, h.items[it.pos])
 		used[it.seg] += int64(it.size)
+		byOrigin[it.seg][it.origin] += int64(it.size)
 		counts[it.seg]++
 	}
 	require.Equal(t, used, p.used)
+	require.Equal(t, byOrigin, p.usedByOrigin)
 	require.Equal(t, counts, p.counts)
 	require.Equal(t, int(counts[kazProbation]), p.prob.Len())
 	require.Equal(t, int(counts[kazProtected]), p.prot.Len())
@@ -519,4 +522,106 @@ func TestKaz2QPlacementDuringRescan(t *testing.T) {
 	seg, _, ok = p.kazPlacement([]cacheKey{kazKey(2)})
 	require.True(t, ok)
 	require.Equal(t, kazProbation, seg)
+}
+
+// kazGhostPriorOf returns the prior segment recorded for key in the evicted-key
+// list, failing when the key is not in the list.
+func kazGhostPriorOf(t *testing.T, p *kaz2QIndex, key cacheKey) kazGhostPrior {
+	t.Helper()
+	el, ok := p.ghostKeys[key]
+	require.True(t, ok, "key %v not in the evicted-key list", key)
+	return el.Value.(kazGhost).prior
+}
+
+// kazPriorScenario builds an index whose evicted-key list holds one key of
+// each known prior: kazKey(2) never protected (1), kazKey(100) demoted (2) and
+// kazKey(101) evicted straight from protected (3). Along the way it checks
+// that the demoted mark is set on demotion, cleared on promotion and set again
+// on a second demotion.
+func kazPriorScenario(t *testing.T) (*kaz2QIndex, *kaz2QMetrics, *uint32) {
+	t.Helper()
+	p, clock := newKazTestIndex(t, 10, 4) // protected limit: 6 blocks
+	m := newKaz2QMetrics()
+	p.kazSetMetrics(m)
+	for i := uint64(100); i < 107; i++ { // 7 protected
+		kazPromote(t, p, clock, i)
+	}
+	for i := uint64(1); i <= 3; i++ {
+		*clock++
+		p.add(kazKey(i), cacheItem{size: kazTestBlock, atime: *clock})
+	}
+	k, ok := kazNextEvicted(p) // demotes 100, evicts 1
+	require.True(t, ok)
+	require.Equal(t, kazKey(1), k)
+	require.True(t, p.keys[kazKey(100)].demoted, "demotion sets the mark")
+	require.Equal(t, kazPriorProbation, kazGhostPriorOf(t, p, kazKey(1)))
+	for i := uint64(101); i < 107; i++ {
+		require.False(t, p.keys[kazKey(i)].demoted)
+	}
+
+	*clock += 600
+	require.NotNil(t, p.get(kazKey(100))) // promoted again
+	require.Equal(t, kazProtected, p.keys[kazKey(100)].seg)
+	require.False(t, p.keys[kazKey(100)].demoted, "promotion clears the mark")
+	*clock++
+	for i := uint64(101); i < 107; i++ { // make 100 the oldest protected block
+		p.get(kazKey(i))
+	}
+	p.demoteOverflow()
+	require.Equal(t, kazProbation, p.keys[kazKey(100)].seg)
+	require.True(t, p.keys[kazKey(100)].demoted, "a second demotion sets the mark again")
+
+	// probation now holds 2, 3 (unmarked) and 100 (marked, newest)
+	for _, want := range []uint64{2, 3, 100} {
+		k, ok = kazNextEvicted(p)
+		require.True(t, ok)
+		require.Equal(t, kazKey(want), k)
+	}
+	require.Equal(t, kazPriorProbation, kazGhostPriorOf(t, p, kazKey(2)))
+	require.Equal(t, kazPriorProbation, kazGhostPriorOf(t, p, kazKey(3)))
+	require.Equal(t, kazPriorDemoted, kazGhostPriorOf(t, p, kazKey(100)))
+	// probation is empty and protected (6) is at its limit: evict from protected
+	k, ok = kazNextEvicted(p)
+	require.True(t, ok)
+	require.Equal(t, kazKey(101), k) // 101..106 share an atime; the lowest id goes first
+	return p, m, clock
+}
+
+// TestKaz2QDemotedMark checks the demoted mark (set on demotion, cleared on
+// promotion, not set by a ghost hit) and the prior segment it gives an
+// evicted key.
+func TestKaz2QDemotedMark(t *testing.T) {
+	p, _, clock := kazPriorScenario(t)
+	require.Equal(t, kazPriorProtected, kazGhostPriorOf(t, p, kazKey(101)))
+	// a ghost hit enters protected without the mark
+	p.add(kazKey(100), cacheItem{size: kazTestBlock, atime: *clock})
+	it := p.keys[kazKey(100)]
+	require.Equal(t, kazProtected, it.seg)
+	require.False(t, it.demoted)
+	// the mark survives reset and re-add through restore
+	p.keys[kazKey(103)].demoted = true
+	p.reset()
+	p.add(kazKey(103), cacheItem{size: kazTestBlock, atime: *clock})
+	require.True(t, p.keys[kazKey(103)].demoted)
+}
+
+// TestKaz2QGhostHitByPrior checks that each ghost hit counts ghost_hit and
+// exactly one of ghost_hit_probation/_demoted/_protected by the recorded prior.
+func TestKaz2QGhostHitByPrior(t *testing.T) {
+	p, m, clock := kazPriorScenario(t)
+	ev := func(name string) float64 { return testutil.ToFloat64(m.events.WithLabelValues(name)) }
+	steps := []struct {
+		id    uint64
+		event string
+	}{{2, "ghost_hit_probation"}, {100, "ghost_hit_demoted"}, {101, "ghost_hit_protected"}}
+	for i, s := range steps {
+		before := ev(s.event)
+		p.add(kazKey(s.id), cacheItem{size: kazTestBlock, atime: *clock})
+		require.Equal(t, before+1, ev(s.event), s.event)
+		require.Equal(t, float64(i+1), ev("ghost_hit"))
+	}
+	require.Equal(t, ev("ghost_hit"), ev("ghost_hit_probation")+ev("ghost_hit_demoted")+ev("ghost_hit_protected"))
+	require.Equal(t, 1.0, ev("ghost_hit_probation"))
+	require.Equal(t, 1.0, ev("ghost_hit_demoted"))
+	require.Equal(t, 1.0, ev("ghost_hit_protected"))
 }

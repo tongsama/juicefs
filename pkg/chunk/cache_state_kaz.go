@@ -30,22 +30,30 @@ import (
 // The kaz-2q state file keeps the 2Q segments and the evicted-key list of a
 // cache store across restarts. It lives in cache.dir, outside raw/ and
 // rawstaging/, so stores of other eviction policies and unmodified JuiceFS
-// never see it. Layout (little endian):
+// never see it. The file name keeps its ".v1" suffix; the layout version is
+// the field after the magic. Layout (little endian):
 //
-//	magic "KAZ2QST1" | version u32 = 1 | savedAt u32
+//	magic "KAZ2QST1" | version u32 (1 or 2) | savedAt u32
 //	items count u32, then per item:
 //	  id u64 | indx u32 | size i32 | seg u8 | origin u8 | hits u8 | atime u32 | inserted u32 | order u32
+//	  | demoted u8 (0 or 1; version 2 only)
 //	ghosts count u32, then per evicted key, oldest first:
-//	  id u64 | indx u32 | size u32
+//	  id u64 | indx u32 | size u32 | prior u8 (0..3, kazGhostPrior; version 2 only)
 //	CRC32 (IEEE) of everything before it, u32
+//
+// Version 2 is always written. Version 1 (written by bf9efe73) is still read:
+// its items have no demoted mark and its evicted keys an unknown prior (0).
+// Any other version is rejected, so the file is ignored.
 const (
-	kazStateFile      = "kaz-cache-state.v1"
-	kazStateMagic     = "KAZ2QST1"
-	kazStateVersion   = uint32(1)
-	kazStateHeader    = len(kazStateMagic) + 4 + 4
-	kazStateItemSize  = 8 + 4 + 4 + 1 + 1 + 1 + 4 + 4 + 4
-	kazStateGhostSize = 8 + 4 + 4
-	kazFlushTimeout   = 30 * time.Second // bound of the state flush at umount
+	kazStateFile        = "kaz-cache-state.v1"
+	kazStateMagic       = "KAZ2QST1"
+	kazStateVersion     = uint32(2)
+	kazStateHeader      = len(kazStateMagic) + 4 + 4
+	kazStateV1ItemSize  = 8 + 4 + 4 + 1 + 1 + 1 + 4 + 4 + 4
+	kazStateV1GhostSize = 8 + 4 + 4
+	kazStateItemSize    = kazStateV1ItemSize + 1  // + demoted
+	kazStateGhostSize   = kazStateV1GhostSize + 1 // + prior
+	kazFlushTimeout     = 30 * time.Second        // bound of the state flush at umount
 )
 
 // kazStateItem is the saved state of one cached block. key.size is the block
@@ -80,7 +88,7 @@ func (p *kaz2QIndex) kazExport(withRestore bool) kazCacheState {
 			continue
 		}
 		st.items = append(st.items, kazStateItem{key: k, kazSaved: kazSaved{seg: it.seg, atime: it.atime,
-			inserted: it.inserted, order: it.order, origin: it.origin, hits: it.hits}})
+			inserted: it.inserted, order: it.order, origin: it.origin, hits: it.hits, demoted: it.demoted}})
 	}
 	if withRestore {
 		for k, s := range p.restore {
@@ -123,7 +131,7 @@ func (p *kaz2QIndex) kazImportState(st kazCacheState) {
 	}
 }
 
-// encodeKazCacheState serializes a state in the file layout.
+// encodeKazCacheState serializes a state in the file layout, version 2.
 func encodeKazCacheState(st kazCacheState) []byte {
 	n := kazStateHeader + 4 + len(st.items)*kazStateItemSize + 4 + len(st.ghosts)*kazStateGhostSize + 4
 	b := make([]byte, 0, n)
@@ -140,17 +148,24 @@ func encodeKazCacheState(st kazCacheState) []byte {
 		b = le.AppendUint32(b, it.atime)
 		b = le.AppendUint32(b, it.inserted)
 		b = le.AppendUint32(b, it.order)
+		var mark byte
+		if it.demoted {
+			mark = 1
+		}
+		b = append(b, mark)
 	}
 	b = le.AppendUint32(b, uint32(len(st.ghosts)))
 	for _, g := range st.ghosts {
 		b = le.AppendUint64(b, g.key.id)
 		b = le.AppendUint32(b, g.key.indx)
 		b = le.AppendUint32(b, g.key.size)
+		b = append(b, byte(g.prior))
 	}
 	return le.AppendUint32(b, crc32.ChecksumIEEE(b))
 }
 
-// decodeKazCacheState parses the file layout; any mismatch of magic, version,
+// decodeKazCacheState parses the file layout, version 1 or 2 (the per-item and
+// per-ghost sizes follow the version); any mismatch of magic, version,
 // length, CRC or field range is an error.
 func decodeKazCacheState(b []byte) (kazCacheState, error) {
 	var st kazCacheState
@@ -166,45 +181,64 @@ func decodeKazCacheState(b []byte) (kazCacheState, error) {
 		return st, errors.New("checksum mismatch")
 	}
 	off := len(kazStateMagic)
-	if v := le.Uint32(body[off:]); v != kazStateVersion {
-		return st, fmt.Errorf("unsupported version %d", v)
+	version := le.Uint32(body[off:])
+	itemSize, ghostSize := kazStateItemSize, kazStateGhostSize
+	switch version {
+	case 1:
+		itemSize, ghostSize = kazStateV1ItemSize, kazStateV1GhostSize
+	case kazStateVersion:
+	default:
+		return st, fmt.Errorf("unsupported version %d", version)
 	}
 	st.savedAt = le.Uint32(body[off+4:])
 	off = kazStateHeader
 	nItems := int(le.Uint32(body[off:]))
 	off += 4
-	if nItems > (len(body)-off)/kazStateItemSize {
+	if nItems > (len(body)-off)/itemSize {
 		return st, fmt.Errorf("bad item count %d", nItems)
 	}
 	st.items = make([]kazStateItem, 0, nItems)
 	for i := 0; i < nItems; i++ {
-		e := body[off : off+kazStateItemSize]
+		e := body[off : off+itemSize]
 		size := int32(le.Uint32(e[12:]))
 		seg := kazSegment(e[16])
 		if size <= 0 || (seg != kazProbation && seg != kazProtected) || kazOrigin(e[17]) > kazOriginCompaction {
 			return st, fmt.Errorf("bad item %d", i)
 		}
+		var demoted bool
+		if version >= 2 {
+			if e[31] > 1 {
+				return st, fmt.Errorf("bad item %d", i)
+			}
+			demoted = e[31] == 1
+		}
 		st.items = append(st.items, kazStateItem{
 			key: cacheKey{id: le.Uint64(e), indx: le.Uint32(e[8:]), size: uint32(size)},
 			kazSaved: kazSaved{seg: seg, origin: kazOrigin(e[17]), hits: e[18],
-				atime: le.Uint32(e[19:]), inserted: le.Uint32(e[23:]), order: le.Uint32(e[27:])},
+				atime: le.Uint32(e[19:]), inserted: le.Uint32(e[23:]), order: le.Uint32(e[27:]), demoted: demoted},
 		})
-		off += kazStateItemSize
+		off += itemSize
 	}
 	if len(body)-off < 4 {
 		return st, errors.New("missing ghost count")
 	}
 	nGhosts := int(le.Uint32(body[off:]))
 	off += 4
-	if nGhosts*kazStateGhostSize != len(body)-off {
+	if nGhosts > (len(body)-off)/ghostSize || nGhosts*ghostSize != len(body)-off {
 		return st, fmt.Errorf("bad ghost count %d", nGhosts)
 	}
 	st.ghosts = make([]kazGhost, 0, nGhosts)
 	for i := 0; i < nGhosts; i++ {
-		e := body[off : off+kazStateGhostSize]
+		e := body[off : off+ghostSize]
 		k := cacheKey{id: le.Uint64(e), indx: le.Uint32(e[8:]), size: le.Uint32(e[12:])}
-		st.ghosts = append(st.ghosts, kazGhost{key: k, size: int64(k.size)})
-		off += kazStateGhostSize
+		prior := kazPriorUnknown
+		if version >= 2 {
+			if prior = kazGhostPrior(e[16]); prior > kazPriorProtected {
+				return st, fmt.Errorf("bad evicted key %d", i)
+			}
+		}
+		st.ghosts = append(st.ghosts, kazGhost{key: k, size: int64(k.size), prior: prior})
+		off += ghostSize
 	}
 	return st, nil
 }

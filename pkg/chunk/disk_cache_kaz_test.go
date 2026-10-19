@@ -18,6 +18,7 @@ package chunk
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"testing"
@@ -316,6 +317,7 @@ func TestKaz2QMetricsRegister(t *testing.T) {
 	m.kaz2Q.hits.WithLabelValues("fill").Inc()
 	m.kaz2Q.blocks.WithLabelValues("probation").Set(1)
 	m.kaz2Q.bytes.WithLabelValues("probation").Set(1)
+	m.kaz2Q.bytesByOrigin.WithLabelValues("probation", "fill").Set(1)
 	mfs, err := reg.Gather()
 	require.NoError(t, err)
 	names := map[string]bool{}
@@ -323,7 +325,7 @@ func TestKaz2QMetricsRegister(t *testing.T) {
 		names[mf.GetName()] = true
 	}
 	for _, n := range []string{"kaz_cache_2q_blocks", "kaz_cache_2q_bytes", "kaz_cache_2q_events_total", "kaz_cache_2q_hits_total",
-		"kaz_cache_2q_ghost_blocks", "kaz_cache_2q_ghost_bytes"} {
+		"kaz_cache_2q_ghost_blocks", "kaz_cache_2q_ghost_bytes", "kaz_cache_2q_bytes_by_origin"} {
 		require.True(t, names[n], "metric %s not registered", n)
 	}
 }
@@ -497,4 +499,101 @@ func TestKaz2QStoreAtimeNotLost(t *testing.T) {
 	s.scanCached(false)
 	require.Equal(t, uint32(newer.Unix()), kazAtime(s, key))
 	require.Equal(t, kazProbation, kazSeg(t, s, idx, key))
+}
+
+// kazCheckBytesByOrigin checks that, per segment, the bytes_by_origin gauges
+// sum to the segment bytes gauge and to the bytes the indexes account.
+func kazCheckBytesByOrigin(t *testing.T, m *kaz2QMetrics, idx ...*kaz2QIndex) {
+	t.Helper()
+	for _, s := range []kazSegment{kazProbation, kazProtected} {
+		var sum, want float64
+		for o := kazOrigin(0); o < kazOriginCount; o++ {
+			sum += testutil.ToFloat64(m.bytesByOrigin.WithLabelValues(s.String(), o.String()))
+		}
+		for _, p := range idx {
+			want += float64(p.used[s])
+		}
+		require.Equal(t, want, testutil.ToFloat64(m.bytes.WithLabelValues(s.String())), "segment %s", s)
+		require.Equal(t, want, sum, "bytes_by_origin of segment %s", s)
+	}
+}
+
+// TestKaz2QBytesByOrigin runs random operations on two indexes sharing one set
+// of collectors and checks that the per-origin byte gauges stay consistent
+// with the per-segment byte gauge after each operation (add, get, staging
+// upload, compaction output, demotion and eviction, remove, reset and re-add,
+// and re-attaching the metrics).
+func TestKaz2QBytesByOrigin(t *testing.T) {
+	m := newKaz2QMetrics()
+	p, pclock := newKazTestIndex(t, 20, 2)
+	q, qclock := newKazTestIndex(t, 20, 2)
+	p.kazSetMetrics(m)
+	q.kazSetMetrics(m)
+	idx := []*kaz2QIndex{p, q}
+	clocks := []*uint32{pclock, qclock}
+	r := rand.New(rand.NewSource(2))
+	var seen [3][kazOriginCount]bool // segment and origin pairs that held bytes at some step
+	for i := 0; i < 5000; i++ {
+		n := r.Intn(2)
+		x, clock := idx[n], clocks[n]
+		k := kazKey(uint64(r.Intn(60)))
+		*clock += uint32(r.Intn(120))
+		switch r.Intn(9) {
+		case 0, 1:
+			size := int32(1 + r.Intn(kazTestBlock))
+			if r.Intn(4) == 0 {
+				size = -size // staging; a later positive add completes the upload
+			}
+			atime := *clock
+			if r.Intn(3) == 0 {
+				atime -= 3600 // legacy
+			}
+			x.add(k, cacheItem{size: size, atime: atime})
+		case 2:
+			seg := kazProbation
+			if r.Intn(2) == 0 {
+				seg = kazProtected
+			}
+			x.kazExpect(k, seg, *clock)
+			x.add(k, cacheItem{size: kazTestBlock, atime: *clock})
+		case 3, 4:
+			x.get(k)
+		case 5:
+			x.remove(k, r.Intn(2) == 0)
+		case 6:
+			c := r.Intn(4)
+			for range x.evictionIter() {
+				if c--; c < 0 {
+					break
+				}
+			}
+		case 7:
+			if r.Intn(20) == 0 {
+				x.reset()
+			}
+		case 8:
+			if r.Intn(50) == 0 {
+				x.kazSetMetrics(m)
+			}
+		}
+		kazVerify(t, x)
+		kazCheckBytesByOrigin(t, m, p, q)
+		for _, s := range []kazSegment{kazProbation, kazProtected} {
+			for o := kazOrigin(0); o < kazOriginCount; o++ {
+				seen[s][o] = seen[s][o] || x.usedByOrigin[s][o] > 0
+			}
+		}
+	}
+	require.NotZero(t, testutil.ToFloat64(m.events.WithLabelValues("demote")))
+	require.NotZero(t, testutil.ToFloat64(m.events.WithLabelValues("promote")))
+	for o := kazOrigin(0); o < kazOriginCount; o++ {
+		require.True(t, seen[kazProbation][o], "origin %s never held probation bytes", o)
+		require.True(t, seen[kazProtected][o], "origin %s never held protected bytes", o)
+	}
+	// staging is never counted
+	p.add(kazKey(1000), cacheItem{size: -kazTestBlock, atime: *pclock})
+	kazCheckBytesByOrigin(t, m, p, q)
+	// withdrawing one index leaves the share of the other
+	p.kazSetMetrics(nil)
+	kazCheckBytesByOrigin(t, m, q)
 }

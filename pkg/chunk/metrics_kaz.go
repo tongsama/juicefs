@@ -26,8 +26,10 @@ import (
 type kaz2QMetrics struct {
 	blocks *prometheus.GaugeVec   // evictable blocks per segment (probation|protected)
 	bytes  *prometheus.GaugeVec   // evictable bytes per segment
-	events *prometheus.CounterVec // promote, demote, evict_*, ghost_hit, compaction_*, state_*
+	events *prometheus.CounterVec // promote, demote, evict_*, ghost_hit(_*), compaction_*, state_*
 	hits   *prometheus.CounterVec // user cache hits by origin (legacy, write, fill, compaction)
+	// bytesByOrigin splits bytes by the origin of the blocks (segment, origin).
+	bytesByOrigin *prometheus.GaugeVec
 
 	ghostBlocks prometheus.Gauge // keys in the evicted-key lists (2Q A1out)
 	ghostBytes  prometheus.Gauge // bytes the evicted keys had when cached
@@ -44,9 +46,13 @@ func newKaz2QMetrics() *kaz2QMetrics {
 			Name: "kaz_cache_2q_bytes",
 			Help: "[kaz] Bytes of cached blocks per 2Q segment (staging excluded).",
 		}, []string{"segment"}),
+		bytesByOrigin: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "kaz_cache_2q_bytes_by_origin",
+			Help: "[kaz] Bytes of cached blocks per 2Q segment and origin (legacy, write, fill, compaction; staging excluded).",
+		}, []string{"segment", "origin"}),
 		events: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "kaz_cache_2q_events_total",
-			Help: "[kaz] 2Q cache events (promote, demote, evictions, ghost hits, compaction output, state file).",
+			Help: "[kaz] 2Q cache events (promote, demote, evictions, ghost hits in total and by prior segment, compaction output, state file).",
 		}, []string{"event"}),
 		hits: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "kaz_cache_2q_hits_total",
@@ -74,6 +80,7 @@ func (c *cacheManagerMetrics) kazInitMetrics() {
 func (c *cacheManagerMetrics) kazRegisterMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(c.kaz2Q.blocks)
 	reg.MustRegister(c.kaz2Q.bytes)
+	reg.MustRegister(c.kaz2Q.bytesByOrigin)
 	reg.MustRegister(c.kaz2Q.events)
 	reg.MustRegister(c.kaz2Q.hits)
 	reg.MustRegister(c.kaz2Q.ghostBlocks)
