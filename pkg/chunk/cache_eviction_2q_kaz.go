@@ -187,6 +187,10 @@ type kaz2QIndex struct {
 
 	now     func() uint32
 	metrics *kaz2QMetrics
+	// pubUsed and pubCounts are the per-segment values this index has added
+	// to the gauges, which are shared by all stores of a cache manager.
+	pubUsed   [3]int64
+	pubCounts [3]int64
 }
 
 // newKaz2QIndex creates an empty kaz 2Q index from the (self-checked) config.
@@ -224,9 +228,17 @@ func (p *kaz2QIndex) kazSetCapacity(capacity int64) {
 	p.trimGhost()
 }
 
-// kazSetMetrics sets the collectors to update; nil disables counting.
+// kazSetMetrics sets the collectors to update; nil disables counting. It is
+// called once per store before use; this index's share is published anew.
 func (p *kaz2QIndex) kazSetMetrics(m *kaz2QMetrics) {
 	p.metrics = m
+	p.pubUsed, p.pubCounts = [3]int64{}, [3]int64{}
+	if m != nil { // export both segments from the start, even when empty
+		for _, s := range []kazSegment{kazProbation, kazProtected} {
+			m.blocks.WithLabelValues(s.String()).Add(0)
+			m.bytes.WithLabelValues(s.String()).Add(0)
+		}
+	}
 	p.syncGauges()
 }
 
@@ -237,14 +249,22 @@ func (p *kaz2QIndex) event(name string) {
 	}
 }
 
-// syncGauges publishes the per-segment block and byte counts.
+// syncGauges publishes the per-segment block and byte counts. The gauges are
+// shared by the stores of a cache manager, so only the change since the last
+// sync of this index is added; the gauges then hold the sum over all stores.
 func (p *kaz2QIndex) syncGauges() {
 	if p.metrics == nil {
 		return
 	}
 	for _, s := range []kazSegment{kazProbation, kazProtected} {
-		p.metrics.blocks.WithLabelValues(s.String()).Set(float64(p.counts[s]))
-		p.metrics.bytes.WithLabelValues(s.String()).Set(float64(p.used[s]))
+		if d := p.counts[s] - p.pubCounts[s]; d != 0 {
+			p.metrics.blocks.WithLabelValues(s.String()).Add(float64(d))
+			p.pubCounts[s] = p.counts[s]
+		}
+		if d := p.used[s] - p.pubUsed[s]; d != 0 {
+			p.metrics.bytes.WithLabelValues(s.String()).Add(float64(d))
+			p.pubUsed[s] = p.used[s]
+		}
 	}
 }
 

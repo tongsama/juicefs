@@ -151,6 +151,7 @@ func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64
 		c.state = newDCState(dcNormal, c)
 	}
 
+	c.kazAttach(cacheSize)
 	c.createDir(c.dir)
 	usage := c.curFreeRatio()
 	if usage.br < c.freeRatio || usage.fr < c.freeRatio {
@@ -461,7 +462,7 @@ func (cache *cacheStore) cache(key string, p *Page, force, dropCache bool) {
 		return
 	}
 	k := cache.getCacheKey(key)
-	if cache.keys.get(k) != nil {
+	if kazLookupNoTouch(cache.keys, k) != nil {
 		return
 	}
 	p.Acquire()
@@ -831,7 +832,7 @@ func (cache *cacheStore) add(key string, size int32, atime uint32) {
 	k := cache.getCacheKey(key)
 	cache.Lock()
 	defer cache.Unlock()
-	iter := cache.keys.get(k)
+	iter := kazLookupNoTouch(cache.keys, k)
 	if iter == nil {
 		iter = &cacheItem{size: size, atime: atime}
 	} else {

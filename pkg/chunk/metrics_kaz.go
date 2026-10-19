@@ -51,3 +51,18 @@ func newKaz2QMetrics() *kaz2QMetrics {
 		}, []string{"origin"}),
 	}
 }
+
+// kazInitMetrics creates the kaz-2q collectors of a cache manager. They are
+// shared by all cache stores of that manager.
+func (c *cacheManagerMetrics) kazInitMetrics() {
+	c.kaz2Q = newKaz2QMetrics()
+}
+
+// kazRegisterMetrics registers the kaz-2q collectors; reg must not be nil
+// (the caller checks it, as for the other cache metrics).
+func (c *cacheManagerMetrics) kazRegisterMetrics(reg prometheus.Registerer) {
+	reg.MustRegister(c.kaz2Q.blocks)
+	reg.MustRegister(c.kaz2Q.bytes)
+	reg.MustRegister(c.kaz2Q.events)
+	reg.MustRegister(c.kaz2Q.hits)
+}

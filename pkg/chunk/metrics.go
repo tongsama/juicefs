@@ -30,6 +30,7 @@ type cacheManagerMetrics struct {
 	stageBlocks     prometheus.Gauge
 	stageBlockBytes prometheus.Gauge
 	stageWriteBytes prometheus.Counter
+	kaz2Q           *kaz2QMetrics // kaz-2q policy collectors (metrics_kaz.go)
 }
 
 func newCacheManagerMetrics(reg prometheus.Registerer) *cacheManagerMetrics {
@@ -49,6 +50,7 @@ func (c *cacheManagerMetrics) registerMetrics(reg prometheus.Registerer) {
 		reg.MustRegister(c.stageBlocks)
 		reg.MustRegister(c.stageBlockBytes)
 		reg.MustRegister(c.stageWriteBytes)
+		c.kazRegisterMetrics(reg)
 		reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "staging_writing_blocks",
 			Help: "Number of writing blocks in staging.",
@@ -92,4 +94,5 @@ func (c *cacheManagerMetrics) initMetrics() {
 		Name: "staging_write_bytes",
 		Help: "write bytes of blocks in the staging path.",
 	})
+	c.kazInitMetrics()
 }
