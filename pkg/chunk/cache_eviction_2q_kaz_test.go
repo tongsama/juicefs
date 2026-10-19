@@ -446,3 +446,77 @@ func TestKaz2QRandomOpsConsistent(t *testing.T) {
 		kazVerify(t, p)
 	}
 }
+
+// TestKaz2QExpectPrunedWithoutReset checks that expectations older than
+// kazExpectTTL are dropped while new ones are registered, even when reset()
+// never runs (cache-scan-interval 0 or negative).
+func TestKaz2QExpectPrunedWithoutReset(t *testing.T) {
+	p, clock := newKazTestIndex(t, 10, 4)
+	const n = 2 * kazExpectPruneMin
+	for i := uint64(0); i < n; i++ {
+		p.kazExpect(kazKey(i), kazProtected, *clock)
+	}
+	*clock += kazExpectTTL + 1
+	for i := uint64(n); i < 2*n; i++ {
+		p.kazExpect(kazKey(i), kazProtected, *clock)
+	}
+	for i := uint64(0); i < n; i++ {
+		require.NotContains(t, p.expect, kazKey(i), "expired expectation %d kept", i)
+	}
+	for i := uint64(n); i < 2*n; i++ {
+		require.Contains(t, p.expect, kazKey(i))
+	}
+	require.LessOrEqual(t, len(p.expect), int(n))
+}
+
+// TestKaz2QRestoreKeepsNewerDiskAtime checks that a key restored after a
+// rescan (or from the state file) keeps the newer of the saved atime and the
+// atime found on disk.
+func TestKaz2QRestoreKeepsNewerDiskAtime(t *testing.T) {
+	p, clock := newKazTestIndex(t, 10, 4)
+	kazPromote(t, p, clock, 1)
+	saved := p.keys[kazKey(1)].atime
+	p.reset()
+	disk := saved + 300
+	p.add(kazKey(1), cacheItem{size: kazTestBlock, atime: disk})
+	it := p.keys[kazKey(1)]
+	require.Equal(t, kazProtected, it.seg)
+	require.Equal(t, disk, it.atime)
+	require.Equal(t, disk, p.peekAtime(kazKey(1)))
+	kazVerify(t, p)
+
+	// an older disk atime does not lower the saved one
+	p.restore[kazKey(2)] = kazSaved{seg: kazProtected, atime: saved, inserted: saved, order: saved}
+	p.add(kazKey(2), cacheItem{size: kazTestBlock, atime: saved - 100})
+	require.Equal(t, saved, p.keys[kazKey(2)].atime)
+	kazVerify(t, p)
+}
+
+// TestKaz2QPlacementDuringRescan checks that kazPlacement still sees source
+// keys that reset() moved into restore and that are not re-added yet.
+func TestKaz2QPlacementDuringRescan(t *testing.T) {
+	p, clock := newKazTestIndex(t, 10, 4)
+	kazPromote(t, p, clock, 1)
+	protAtime := p.keys[kazKey(1)].atime
+	*clock += 10
+	p.add(kazKey(2), cacheItem{size: kazTestBlock, atime: *clock})
+	probAtime := p.keys[kazKey(2)].atime
+	p.reset()
+	require.Equal(t, 0, p.len())
+
+	seg, at, ok := p.kazPlacement([]cacheKey{kazKey(1)})
+	require.True(t, ok)
+	require.Equal(t, kazProtected, seg)
+	require.Equal(t, protAtime, at)
+
+	seg, at, ok = p.kazPlacement([]cacheKey{kazKey(2), kazKey(9)})
+	require.True(t, ok)
+	require.Equal(t, kazProbation, seg)
+	require.Equal(t, probAtime, at)
+
+	// a re-added key is answered from the index, not from restore
+	p.add(kazKey(2), cacheItem{size: kazTestBlock, atime: probAtime})
+	seg, _, ok = p.kazPlacement([]cacheKey{kazKey(2)})
+	require.True(t, ok)
+	require.Equal(t, kazProbation, seg)
+}

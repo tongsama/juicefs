@@ -64,9 +64,10 @@ func (o kazOrigin) String() string {
 }
 
 const (
-	kazFillWindow    = 60  // seconds: a new key with atime this recent counts as a fill
-	kazExpectTTL     = 600 // seconds: expectations older than this are dropped on reset
-	kazHitsSaturated = ^uint8(0)
+	kazFillWindow     = 60   // seconds: a new key with atime this recent counts as a fill
+	kazExpectTTL      = 600  // seconds: expectations older than this are dropped (on reset and while registering)
+	kazExpectPruneMin = 1024 // expectation count below which kazExpect does not scan for expired ones
+	kazHitsSaturated  = ^uint8(0)
 )
 
 // kazItem is the per-key state of the kaz 2Q index.
@@ -185,6 +186,7 @@ type kaz2QIndex struct {
 	restore         map[cacheKey]kazSaved
 	restoreFromFile bool // restore was loaded from the state file
 	expect          map[cacheKey]kazExpectation
+	expectPruneAt   int // size of expect above which kazExpect drops expired entries
 
 	stateInterval time.Duration // save interval of the state file
 	// saveMu serializes writers of the state file (periodic saver and the
@@ -343,6 +345,9 @@ func (p *kaz2QIndex) add(key cacheKey, item cacheItem) {
 		delete(p.restore, key)
 		it.seg, it.atime, it.inserted, it.order = s.seg, s.atime, s.inserted, s.order
 		it.origin, it.hits = s.origin, s.hits
+		if item.atime > it.atime { // the block was read after the state was saved
+			it.atime = item.atime
+		}
 	} else if el, ok := p.ghostKeys[key]; ok {
 		p.dropGhost(el)
 		it.seg = kazProtected
@@ -456,31 +461,56 @@ func (p *kaz2QIndex) kazSegmentOf(key cacheKey) (kazSegment, bool) {
 // kazPlacement decides where a compaction output goes from its source keys:
 // protected if any source is protected, probation if they are only in
 // probation (or staging), with the newest atime among them; ok is false when
-// no source is cached.
+// no source is cached. A key not in the index but kept in restore (moved there
+// by reset() during a rescan, or loaded from the state file) counts with its
+// saved segment and atime, so that a rescan window does not lose placements.
 func (p *kaz2QIndex) kazPlacement(keys []cacheKey) (seg kazSegment, atime uint32, ok bool) {
 	for _, k := range keys {
-		it, found := p.keys[k]
-		if !found {
+		var kseg kazSegment
+		var katime uint32
+		if it, found := p.keys[k]; found {
+			kseg, katime = it.seg, it.atime
+		} else if s, found := p.restore[k]; found {
+			kseg, katime = s.seg, s.atime
+		} else {
 			continue
 		}
 		if !ok {
 			seg = kazProbation
 		}
-		if it.seg == kazProtected {
+		if kseg == kazProtected {
 			seg = kazProtected
 		}
 		ok = true
-		if it.atime > atime {
-			atime = it.atime
+		if katime > atime {
+			atime = katime
 		}
 	}
 	return
 }
 
 // kazExpect registers the segment and atime the next add of key should use
-// (a compaction output).
+// (a compaction output). Expectations whose output never arrived are dropped
+// here as well as on reset(): when the map outgrows expectPruneAt, entries
+// older than kazExpectTTL are removed and the threshold is set to twice the
+// remaining size (at least kazExpectPruneMin), so the scan cost is amortized
+// and the map stays bounded without rescans.
 func (p *kaz2QIndex) kazExpect(key cacheKey, seg kazSegment, atime uint32) {
-	p.expect[key] = kazExpectation{seg: seg, atime: atime, at: p.now()}
+	now := p.now()
+	p.expect[key] = kazExpectation{seg: seg, atime: atime, at: now}
+	if len(p.expect) > p.expectPruneAt {
+		p.pruneExpect(now)
+		p.expectPruneAt = max(2*len(p.expect), kazExpectPruneMin)
+	}
+}
+
+// pruneExpect drops the expectations registered more than kazExpectTTL ago.
+func (p *kaz2QIndex) pruneExpect(now uint32) {
+	for k, e := range p.expect {
+		if now-e.at > kazExpectTTL {
+			delete(p.expect, k)
+		}
+	}
 }
 
 // peekAtime implements KeyIndex.
@@ -513,12 +543,7 @@ func (p *kaz2QIndex) reset() KeyIndex {
 			order: it.order, origin: it.origin, hits: it.hits}
 	}
 	p.restore, p.restoreFromFile = restore, false
-	now := p.now()
-	for k, e := range p.expect {
-		if now-e.at > kazExpectTTL {
-			delete(p.expect, k)
-		}
-	}
+	p.pruneExpect(p.now())
 	p.keys = make(map[cacheKey]*kazItem, len(snap.keys))
 	p.prob = kazHeap{byOrder: true}
 	p.prot = kazHeap{}
