@@ -64,6 +64,9 @@ func Compact(conf chunk.Config, store chunk.ChunkStore, slices []meta.Slice, id 
 
 	writer := store.NewWriter(id, tierID)
 	writer.SetWriteback(false)
+	if w, ok := writer.(kazCompactionWriter); ok {
+		w.KazSetCompactionSources(kazCompactionSources(slices, conf.BlockSize)) // kaz-2q: cache output like its sources
+	}
 
 	var pos int
 	for i, s := range slices {

@@ -62,3 +62,68 @@ func (store *cachedStore) kazLoadForRead(ctx context.Context, key string) (ReadC
 	}
 	return store.bcache.load(key)
 }
+
+// KazBlockRef names one block of a source slice of a compaction: the slice id,
+// its full size (to build the block key) and the block index.
+type KazBlockRef struct {
+	ID        uint64
+	SliceSize uint32
+	Indx      uint32
+}
+
+// KazSetCompactionSources marks the slice as a compaction output whose block
+// indx is made from the source blocks f(indx). Under kaz-2q the synchronous
+// upload then places each output block like its sources (see
+// kazCacheCompactionOutput); under any other eviction policy it does nothing,
+// so the upstream caching rule applies unchanged.
+func (s *wSlice) KazSetCompactionSources(f func(indx int) []KazBlockRef) {
+	if s.store.conf.CacheEviction != EvictionKaz2Q {
+		return
+	}
+	s.kazSources = f
+}
+
+// kazCacheCompactionOutput replaces the upstream caching rule for a block of
+// a compaction output under kaz-2q (it takes precedence over CacheLargeWrite
+// and the small-block rule): the block is cached only when at least one of
+// its source blocks is cached, in the segment and with the newest user-read
+// atime of the sources. Like the upstream branch, cache() takes its own page
+// reference and the caller releases block afterwards in both cases. A block
+// cache without kaz placement (memory cache) keeps the upstream rule.
+func (store *cachedStore) kazCacheCompactionOutput(key string, block *Page, sources func(int) []KazBlockRef) {
+	placer, ok := store.bcache.(interface {
+		kazCompactionPlacement(outKey string, srcKeys []string) bool
+	})
+	if !ok {
+		if len(block.Data) < store.conf.BlockSize || store.conf.CacheLargeWrite {
+			store.bcache.cache(key, block, false, false)
+		}
+		return
+	}
+	// getCacheKey only parses the key, it does not use the store.
+	indx := (*cacheStore)(nil).getCacheKey(key).indx
+	refs := sources(int(indx))
+	srcKeys := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		srcKeys = append(srcKeys, sliceForRead(ref.ID, int(ref.SliceSize), store).key(int(ref.Indx)))
+	}
+	if placer.kazCompactionPlacement(key, srcKeys) {
+		store.bcache.cache(key, block, false, false)
+	}
+}
+
+// KazCacheState reports, for diagnostics and tests, whether the block key is
+// in the local cache and its kaz-2q segment ("probation" or "protected"). It
+// never counts as a read (no atime update, no promotion). A block that is
+// still queued to be written to disk is reported as cached with segment ""
+// (its segment is decided when it enters the index), so callers wait for a
+// non-empty segment. Other eviction policies report segment "".
+func (store *cachedStore) KazCacheState(key string) (segment string, cached bool) {
+	if m, ok := store.bcache.(interface {
+		kazCacheState(key string) (string, bool)
+	}); ok {
+		return m.kazCacheState(key)
+	}
+	_, cached = store.bcache.exist(key)
+	return "", cached
+}

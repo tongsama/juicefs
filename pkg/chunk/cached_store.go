@@ -238,6 +238,7 @@ type wSlice struct {
 	pendings    int
 	writeback   bool
 	tierID      uint8
+	kazSources  func(indx int) []KazBlockRef // kaz-2q: source blocks of a compaction output (cached_store_kaz.go)
 }
 
 func sliceForWrite(id uint64, store *cachedStore, tierID uint8) *wSlice {
@@ -364,7 +365,9 @@ func (store *cachedStore) upload(ctx context.Context, key string, block *Page, s
 		buf.Acquire()
 	}
 	defer buf.Release()
-	if sync && (blen < store.conf.BlockSize || store.conf.CacheLargeWrite) {
+	if sync && s.kazSources != nil {
+		store.kazCacheCompactionOutput(key, block, s.kazSources)
+	} else if sync && (blen < store.conf.BlockSize || store.conf.CacheLargeWrite) {
 		// block will be freed after written into disk
 		store.bcache.cache(key, block, false, false)
 	}

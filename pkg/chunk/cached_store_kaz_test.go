@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -262,4 +263,118 @@ func TestKazCompactionReadSharedWithUser(t *testing.T) {
 			require.Equal(t, c.f.data[c.id], results[i], "slice %d reader %d", c.id, i)
 		}
 	}
+}
+
+// kazWriteCompactionOutput writes data as the single-block compaction output
+// slice id with the given source blocks (synchronous upload, like
+// vfs.Compact) and returns its block key.
+func (f *kazCompFixture) kazWriteCompactionOutput(t *testing.T, id uint64, data []byte, srcs []KazBlockRef) string {
+	t.Helper()
+	w := f.store.NewWriter(id, 0)
+	w.(*wSlice).KazSetCompactionSources(func(indx int) []KazBlockRef {
+		require.Equal(t, 0, indx)
+		return srcs
+	})
+	w.SetWriteback(false)
+	_, err := w.WriteAt(data, 0)
+	require.NoError(t, err)
+	require.NoError(t, w.Finish(len(data)))
+	return kazCompKey(f.store.conf, id, len(data))
+}
+
+// waitState polls KazCacheState until the key has a segment (it was flushed
+// into the index) and returns that segment.
+func (f *kazCompFixture) waitState(t *testing.T, key string) string {
+	t.Helper()
+	var seg string
+	require.Eventually(t, func() bool {
+		seg, _ = f.store.KazCacheState(key)
+		return seg != ""
+	}, 5*time.Second, 10*time.Millisecond, "output %s must be cached", key)
+	return seg
+}
+
+// kazEvents returns the kaz-2q event counter of the fixture's cache manager.
+func (f *kazCompFixture) kazEvents(name string) float64 {
+	return testutil.ToFloat64(f.cs.m.kaz2Q.events.WithLabelValues(name))
+}
+
+// TestKazCompactionOutputInherits checks that under kaz-2q a compaction output
+// takes the segment and the newest user-read atime of its source blocks, and
+// is not cached when no source block is cached.
+func TestKazCompactionOutputInherits(t *testing.T) {
+	f := newKazCompFixture(t, EvictionKaz2Q, "", true, 1, 2)
+	cs := f.cs
+	idx := cs.keys.(*kaz2QIndex)
+	future := uint32(time.Now().Unix()) + 100000
+	cs.Lock()
+	orig := idx.now
+	idx.now = func() uint32 { return future }
+	cs.Unlock()
+	f.read(t, context.Background(), 1, 0, 100) // user read: promote slice 1, atime = future
+	cs.Lock()
+	idx.now = orig
+	k1, k2 := cs.getCacheKey(f.keys[1]), cs.getCacheKey(f.keys[2])
+	seg1, _ := idx.kazSegmentOf(k1)
+	seg2, _ := idx.kazSegmentOf(k2)
+	atime2 := idx.peekAtime(k2)
+	cs.Unlock()
+	require.Equal(t, kazProtected, seg1)
+	require.Equal(t, kazProbation, seg2)
+	require.Less(t, atime2, future)
+	ref := func(id uint64) KazBlockRef { return KazBlockRef{ID: id, SliceSize: kazCompSize, Indx: 0} }
+	out := bytes.Repeat([]byte{0xAB}, kazCompSize)
+
+	// Protected and probation sources: protected, with the newest atime.
+	key := f.kazWriteCompactionOutput(t, 101, out, []KazBlockRef{ref(2), ref(1)})
+	require.Equal(t, "protected", f.waitState(t, key))
+	cs.Lock()
+	it := idx.keys[cs.getCacheKey(key)]
+	cs.Unlock()
+	require.Equal(t, future, it.atime, "output must inherit the newest source atime")
+	require.Equal(t, kazOriginCompaction, it.origin)
+
+	// Probation source only: probation, with its atime.
+	key = f.kazWriteCompactionOutput(t, 102, out, []KazBlockRef{ref(2)})
+	require.Equal(t, "probation", f.waitState(t, key))
+	cs.Lock()
+	require.Equal(t, atime2, idx.peekAtime(cs.getCacheKey(key)))
+	cs.Unlock()
+	require.Equal(t, 2.0, f.kazEvents("compaction_output_cached"))
+
+	// No cached source: the output is not cached.
+	key = f.kazWriteCompactionOutput(t, 103, out, []KazBlockRef{ref(9)})
+	time.Sleep(100 * time.Millisecond)
+	seg, cached := f.store.KazCacheState(key)
+	require.False(t, cached, "output without a cached source must not be cached")
+	require.Equal(t, "", seg)
+	require.Equal(t, 1.0, f.kazEvents("compaction_output_skipped"))
+
+	// The data is uploaded in every case (read without caching a miss).
+	for _, id := range []uint64{101, 102, 103} {
+		p := NewOffPage(kazCompSize)
+		n, err := f.store.NewReader(id, kazCompSize).ReadAt(KazCompactionReadContext(context.Background()), p, 0)
+		require.NoError(t, err)
+		require.Equal(t, out, p.Data[:n])
+		p.Release()
+	}
+}
+
+// TestKazCompactionOutputOtherPolicies checks that the compaction sources are
+// ignored under lru: the output is cached as before for a block smaller than
+// BlockSize, and for a full block with CacheLargeWrite.
+func TestKazCompactionOutputOtherPolicies(t *testing.T) {
+	f := newKazCompFixture(t, EvictionLRU, "", true, 1)
+	w := f.store.NewWriter(201, 0).(*wSlice)
+	w.KazSetCompactionSources(func(int) []KazBlockRef { return nil })
+	require.Nil(t, w.kazSources, "sources must be ignored under lru")
+	key := f.kazWriteCompactionOutput(t, 202, bytes.Repeat([]byte{1}, kazCompSize), nil)
+	require.Eventually(t, func() bool { _, ok := f.store.KazCacheState(key); return ok },
+		5*time.Second, 10*time.Millisecond, "lru must cache a small output")
+
+	f.store.conf.CacheLargeWrite = true
+	full := bytes.Repeat([]byte{2}, f.store.conf.BlockSize)
+	key = f.kazWriteCompactionOutput(t, 203, full, nil)
+	require.Eventually(t, func() bool { _, ok := f.store.KazCacheState(key); return ok },
+		5*time.Second, 10*time.Millisecond, "lru with CacheLargeWrite must cache a full output")
 }

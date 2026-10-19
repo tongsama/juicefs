@@ -108,3 +108,74 @@ func (m *cacheManager) kazLoadNoTouch(key string) (ReadCloser, error) {
 	}
 	return r, err
 }
+
+// kazCompactionPlacement decides whether the compaction output block outKey
+// is cached under kaz-2q, from its source blocks srcKeys: each source store
+// is asked separately (one store lock at a time) with kazPlacement, the
+// results are merged (protected wins, newest atime), and when any source is
+// cached the placement is registered with kazExpect in the output store, to
+// be consumed by the add after cache() flushes the block. It returns whether
+// the caller should cache the output and counts compaction_output_cached or
+// compaction_output_skipped. Sources that are only pending in memory, or
+// only in a legacy store, are not considered.
+func (m *cacheManager) kazCompactionPlacement(outKey string, srcKeys []string) bool {
+	var seg kazSegment
+	var atime uint32
+	found := false
+	for _, sk := range srcKeys {
+		s := m.getStore(sk)
+		if s == nil {
+			continue
+		}
+		s.Lock()
+		if idx, ok := s.keys.(*kaz2QIndex); ok {
+			if sg, at, ok := idx.kazPlacement([]cacheKey{s.getCacheKey(sk)}); ok {
+				seg = max(seg, sg) // kazProtected > kazProbation
+				atime = max(atime, at)
+				found = true
+			}
+		}
+		s.Unlock()
+	}
+	out := m.getStore(outKey)
+	placed := false
+	if found && out != nil {
+		out.Lock()
+		if idx, ok := out.keys.(*kaz2QIndex); ok {
+			idx.kazExpect(out.getCacheKey(outKey), seg, atime)
+			placed = true
+		}
+		out.Unlock()
+	}
+	if km := m.getMetrics().kaz2Q; km != nil {
+		if placed {
+			km.events.WithLabelValues("compaction_output_cached").Inc()
+		} else {
+			km.events.WithLabelValues("compaction_output_skipped").Inc()
+		}
+	}
+	return placed
+}
+
+// kazCacheState reports whether key is cached in its store and its kaz-2q
+// segment, without counting a read (see cachedStore.KazCacheState). A key
+// only pending in memory is cached with segment ""; under other eviction
+// policies the segment is "" and presence is taken from peekAtime.
+func (m *cacheManager) kazCacheState(key string) (string, bool) {
+	s := m.getStore(key)
+	if s == nil {
+		return "", false
+	}
+	s.Lock()
+	defer s.Unlock()
+	k := s.getCacheKey(key)
+	if idx, ok := s.keys.(*kaz2QIndex); ok {
+		if seg, ok := idx.kazSegmentOf(k); ok {
+			return seg.String(), true
+		}
+	} else if s.keys.peekAtime(k) != 0 {
+		return "", true
+	}
+	_, pending := s.pages[key]
+	return "", pending
+}
