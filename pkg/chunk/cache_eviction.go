@@ -27,6 +27,8 @@ const (
 	EvictionNone    = "none"
 	Eviction2Random = "2-random"
 	EvictionLRU     = "lru"
+	// EvictionKaz2Q is the kaz 2Q-style policy (probation/protected segments).
+	EvictionKaz2Q = "kaz-2q"
 )
 
 const notInLru = math.MinInt // to trigger panic when misused

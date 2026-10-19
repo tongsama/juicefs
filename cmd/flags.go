@@ -368,7 +368,27 @@ func dataCacheFlags() []cli.Flag {
 		&cli.StringFlag{
 			Name:  "cache-eviction",
 			Value: chunk.Eviction2Random,
-			Usage: fmt.Sprintf("cache eviction policy [%s, %s, %s]", chunk.EvictionNone, chunk.Eviction2Random, chunk.EvictionLRU),
+			Usage: fmt.Sprintf("cache eviction policy [%s, %s, %s, %s]", chunk.EvictionNone, chunk.Eviction2Random, chunk.EvictionLRU, chunk.EvictionKaz2Q),
+		},
+		&cli.Float64Flag{
+			Name:  "kaz-cache-probation-ratio",
+			Value: 0.4,
+			Usage: "[kaz] share of the cache capacity for newly cached blocks under --cache-eviction kaz-2q (0 < x < 1)",
+		},
+		&cli.StringFlag{
+			Name:  "kaz-cache-promote-delay",
+			Value: "10m",
+			Usage: "[kaz] correlated-reference period before a cached block can be promoted under --cache-eviction kaz-2q",
+		},
+		&cli.Float64Flag{
+			Name:  "kaz-cache-ghost-ratio",
+			Value: 4,
+			Usage: "[kaz] capacity of the evicted-key list as a multiple of the cache capacity under --cache-eviction kaz-2q (0 disables)",
+		},
+		&cli.StringFlag{
+			Name:  "kaz-cache-state-interval",
+			Value: "5m",
+			Usage: "[kaz] save interval of the kaz-cache-state.v1 file under --cache-eviction kaz-2q",
 		},
 		&cli.StringFlag{
 			Name:  "cache-scan-interval",
