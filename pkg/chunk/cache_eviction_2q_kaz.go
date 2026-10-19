@@ -228,9 +228,16 @@ func (p *kaz2QIndex) kazSetCapacity(capacity int64) {
 	p.trimGhost()
 }
 
-// kazSetMetrics sets the collectors to update; nil disables counting. It is
-// called once per store before use; this index's share is published anew.
+// kazSetMetrics sets the collectors to update; nil disables counting. The
+// share this index published to previous collectors is withdrawn first, so
+// calling it again does not double count; the share is then published anew.
 func (p *kaz2QIndex) kazSetMetrics(m *kaz2QMetrics) {
+	if old := p.metrics; old != nil {
+		for _, s := range []kazSegment{kazProbation, kazProtected} {
+			old.blocks.WithLabelValues(s.String()).Sub(float64(p.pubCounts[s]))
+			old.bytes.WithLabelValues(s.String()).Sub(float64(p.pubUsed[s]))
+		}
+	}
 	p.metrics = m
 	p.pubUsed, p.pubCounts = [3]int64{}, [3]int64{}
 	if m != nil { // export both segments from the start, even when empty

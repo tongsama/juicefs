@@ -36,9 +36,12 @@ func kazStoreKey(id uint64) string {
 	return fmt.Sprintf("chunks/0/0/%d_0_%d", id, kazStoreBlock)
 }
 
-// newKazTestStore builds a kaz-2q cacheStore without background goroutines,
-// attaches the index as newCacheStore does, and fixes the index clock to the
-// returned pointer. m may be shared by several stores.
+// newKazTestStore builds a kaz-2q cacheStore without background goroutines.
+// newTestCacheStore bypasses newCacheStore, so the helper attaches the index
+// itself with the store's effective capacity, as newCacheStore does after
+// setLimitByFreeRatio (that path is covered by TestKaz2QStoreAttachEffectiveCapacity).
+// It fixes the index clock to the returned pointer. m may be shared by
+// several stores.
 func newKazTestStore(t *testing.T, m *cacheManagerMetrics) (*cacheStore, *kaz2QIndex, *uint32) {
 	t.Helper()
 	conf := defaultConf
@@ -321,4 +324,40 @@ func TestKaz2QMetricsRegister(t *testing.T) {
 	for _, n := range []string{"kaz_cache_2q_blocks", "kaz_cache_2q_bytes", "kaz_cache_2q_events_total", "kaz_cache_2q_hits_total"} {
 		require.True(t, names[n], "metric %s not registered", n)
 	}
+}
+
+// TestKaz2QStoreAttachEffectiveCapacity checks that newCacheStore sizes the 2Q
+// index from the capacity left by setLimitByFreeRatio, not from cacheSize.
+func TestKaz2QStoreAttachEffectiveCapacity(t *testing.T) {
+	conf := defaultConf
+	conf.CacheEviction = EvictionKaz2Q
+	conf.CacheScanInterval = -1
+	conf.FreeSpace = 0.1
+	const cacheSize = int64(1) << 60 // larger than any disk: the free-ratio limit must lower it
+	// Like TestSetlimitByFreeRatio, the store goroutines are left running and
+	// the directory is removed best effort: shutdownStore writes s.state
+	// without the lock that available() lacks too, which -race reports.
+	dir, err := os.MkdirTemp("", "kaz-attach-")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+	s := newCacheStore(newKazTestMetrics(), dir, cacheSize, 0, 1, &conf, nil)
+	idx, ok := s.keys.(*kaz2QIndex)
+	require.True(t, ok)
+	s.Lock()
+	defer s.Unlock()
+	require.Less(t, s.capacity, cacheSize, "setLimitByFreeRatio should lower the capacity")
+	require.Equal(t, s.capacity, idx.capacity)
+}
+
+// TestKaz2QMetricsReattach checks that setting the metrics again withdraws
+// the share published before, so the shared gauges are not double counted.
+func TestKaz2QMetricsReattach(t *testing.T) {
+	m := newKazTestMetrics()
+	s, _, clock := newKazTestStore(t, m)
+	s.add(kazStoreKey(1), kazStoreBlock, *clock)
+	km := m.kaz2Q
+	require.Equal(t, 1.0, testutil.ToFloat64(km.blocks.WithLabelValues("probation")))
+	s.kazAttach(s.capacity)
+	require.Equal(t, 1.0, testutil.ToFloat64(km.blocks.WithLabelValues("probation")))
+	require.Equal(t, float64(kazStoreBlock), testutil.ToFloat64(km.bytes.WithLabelValues("probation")))
 }

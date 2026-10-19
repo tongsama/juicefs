@@ -151,7 +151,6 @@ func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64
 		c.state = newDCState(dcNormal, c)
 	}
 
-	c.kazAttach(cacheSize)
 	c.createDir(c.dir)
 	usage := c.curFreeRatio()
 	if usage.br < c.freeRatio || usage.fr < c.freeRatio {
@@ -161,6 +160,7 @@ func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64
 		c.dir, humanize.FtoaWithDigits(float64((1-usage.br)*100), 1), humanize.FtoaWithDigits(float64((1-usage.fr)*100), 1))
 
 	c.setLimitByFreeRatio(usage, c.freeRatio)
+	c.kazAttach(c.capacity)
 
 	c.createLockFile()
 	go c.checkLockFile()
