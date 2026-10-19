@@ -63,3 +63,26 @@ func TestKaz2QConfigSelfCheck(t *testing.T) {
 		})
 	}
 }
+
+// TestKazConfigSelfCheckOnlyForKaz2Q verifies that non-kaz modes (and the
+// memory fallback) leave zero-valued kaz options untouched, and that kaz-2q
+// accepts a zero promote delay and ghost ratio.
+func TestKazConfigSelfCheckOnlyForKaz2Q(t *testing.T) {
+	for _, tc := range []struct{ evict, dir string }{
+		{EvictionLRU, "/tmp/x"}, {Eviction2Random, "/tmp/x"}, {EvictionNone, "/tmp/x"},
+		{EvictionKaz2Q, "memory"},
+	} {
+		conf := Config{CacheDir: tc.dir, CacheSize: 1 << 30, CacheEviction: tc.evict}
+		conf.SelfCheck("uuid")
+		if conf.KazCacheProbationRatio != 0 || conf.KazCachePromoteDelay != 0 ||
+			conf.KazCacheGhostRatio != 0 || conf.KazCacheStateInterval != 0 {
+			t.Fatalf("%s/%s: kaz fields changed: %+v", tc.evict, tc.dir, conf)
+		}
+	}
+	conf := Config{CacheDir: "/tmp/x", CacheSize: 1 << 30, CacheEviction: EvictionKaz2Q,
+		KazCacheProbationRatio: 0.4, KazCacheStateInterval: time.Minute}
+	conf.SelfCheck("uuid")
+	if conf.KazCachePromoteDelay != 0 || conf.KazCacheGhostRatio != 0 {
+		t.Fatalf("zero delay/ghost changed: %+v", conf)
+	}
+}

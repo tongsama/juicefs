@@ -671,7 +671,9 @@ func (c *Config) SelfCheck(uuid string) {
 		logger.Warnf("kaz-2q eviction is not supported in memory cache mode, setting it to 2-random")
 		c.CacheEviction = Eviction2Random
 	}
-	c.kazCacheSelfCheck()
+	if c.CacheEviction == EvictionKaz2Q {
+		c.kazCacheSelfCheck()
+	}
 	if c.CacheExpire > 0 && c.CacheExpire < time.Second {
 		logger.Warnf("cache-expire it too short, setting it to 1 second")
 		c.CacheExpire = time.Second
