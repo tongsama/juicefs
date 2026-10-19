@@ -439,7 +439,7 @@ func TestCacheManager(t *testing.T) {
 }
 
 func TestAtimeNotLost(t *testing.T) {
-	for _, eviction := range []string{EvictionNone, Eviction2Random, EvictionLRU, EvictionKaz2Q} {
+	for _, eviction := range []string{EvictionNone, Eviction2Random, EvictionLRU} {
 		cfg := defaultConf
 		cfg.CacheEviction = eviction
 		cfg.FreeSpace = 0.03

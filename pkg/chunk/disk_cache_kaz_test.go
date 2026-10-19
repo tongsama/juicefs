@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -468,4 +469,32 @@ func TestKaz2QGhostMetrics(t *testing.T) {
 	blocks, bytes = kazGhostGauges(m)
 	require.Equal(t, float64(na+nb), blocks)
 	require.Equal(t, float64(ba+bb), bytes)
+}
+
+// TestKaz2QStoreAtimeNotLost is the kaz-2q counterpart of TestAtimeNotLost.
+// An existence check does not touch atime under kaz-2q, so the upstream
+// test's premise ("exist touches atime") does not hold; instead this checks
+// that a rescan keeps the in-memory atime when it is newer than the file's,
+// and takes the file's atime when that is newer (read outside the index).
+func TestKaz2QStoreAtimeNotLost(t *testing.T) {
+	s, idx, _ := newKazTestStore(t, nil)
+	key := kazStoreKey(1)
+	kazWriteBlock(t, s, key)
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	require.NoError(t, os.Chtimes(s.cachePath(key), old, old))
+	mem := uint32(old.Unix()) + 100
+	s.add(key, kazStoreBlock, mem)
+	ok, err := s.exist(key)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, mem, kazAtime(s, key))
+	s.scanCached(false)
+	require.Equal(t, mem, kazAtime(s, key))
+	require.Equal(t, kazProbation, kazSeg(t, s, idx, key))
+
+	newer := old.Add(500 * time.Second)
+	require.NoError(t, os.Chtimes(s.cachePath(key), newer, newer))
+	s.scanCached(false)
+	require.Equal(t, uint32(newer.Unix()), kazAtime(s, key))
+	require.Equal(t, kazProbation, kazSeg(t, s, idx, key))
 }
