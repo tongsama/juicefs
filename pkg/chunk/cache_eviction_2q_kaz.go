@@ -199,6 +199,10 @@ type kaz2QIndex struct {
 	// to the gauges, which are shared by all stores of a cache manager.
 	pubUsed   [3]int64
 	pubCounts [3]int64
+	// pubGhostBlocks and pubGhostBytes are the evicted-key list size this
+	// index has added to the shared ghost gauges.
+	pubGhostBlocks int64
+	pubGhostBytes  int64
 }
 
 // newKaz2QIndex creates an empty kaz 2Q index from the (self-checked) config.
@@ -239,6 +243,7 @@ func newKaz2QIndex(conf *Config) *kaz2QIndex {
 func (p *kaz2QIndex) kazSetCapacity(capacity int64) {
 	p.capacity = capacity
 	p.trimGhost()
+	p.syncGauges()
 }
 
 // kazSetMetrics sets the collectors to update; nil disables counting. The
@@ -250,9 +255,12 @@ func (p *kaz2QIndex) kazSetMetrics(m *kaz2QMetrics) {
 			old.blocks.WithLabelValues(s.String()).Sub(float64(p.pubCounts[s]))
 			old.bytes.WithLabelValues(s.String()).Sub(float64(p.pubUsed[s]))
 		}
+		old.ghostBlocks.Sub(float64(p.pubGhostBlocks))
+		old.ghostBytes.Sub(float64(p.pubGhostBytes))
 	}
 	p.metrics = m
 	p.pubUsed, p.pubCounts = [3]int64{}, [3]int64{}
+	p.pubGhostBlocks, p.pubGhostBytes = 0, 0
 	if m != nil { // export both segments from the start, even when empty
 		for _, s := range []kazSegment{kazProbation, kazProtected} {
 			m.blocks.WithLabelValues(s.String()).Add(0)
@@ -269,9 +277,10 @@ func (p *kaz2QIndex) event(name string) {
 	}
 }
 
-// syncGauges publishes the per-segment block and byte counts. The gauges are
-// shared by the stores of a cache manager, so only the change since the last
-// sync of this index is added; the gauges then hold the sum over all stores.
+// syncGauges publishes the per-segment block and byte counts and the size of
+// the evicted-key list. The gauges are shared by the stores of a cache
+// manager, so only the change since the last sync of this index is added; the
+// gauges then hold the sum over all stores.
 func (p *kaz2QIndex) syncGauges() {
 	if p.metrics == nil {
 		return
@@ -285,6 +294,14 @@ func (p *kaz2QIndex) syncGauges() {
 			p.metrics.bytes.WithLabelValues(s.String()).Add(float64(d))
 			p.pubUsed[s] = p.used[s]
 		}
+	}
+	if d := int64(p.ghost.Len()) - p.pubGhostBlocks; d != 0 {
+		p.metrics.ghostBlocks.Add(float64(d))
+		p.pubGhostBlocks += d
+	}
+	if d := p.ghostBytes - p.pubGhostBytes; d != 0 {
+		p.metrics.ghostBytes.Add(float64(d))
+		p.pubGhostBytes += d
 	}
 }
 

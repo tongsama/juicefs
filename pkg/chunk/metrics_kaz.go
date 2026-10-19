@@ -28,6 +28,9 @@ type kaz2QMetrics struct {
 	bytes  *prometheus.GaugeVec   // evictable bytes per segment
 	events *prometheus.CounterVec // promote, demote, evict_*, ghost_hit, compaction_*, state_*
 	hits   *prometheus.CounterVec // user cache hits by origin (legacy, write, fill, compaction)
+
+	ghostBlocks prometheus.Gauge // keys in the evicted-key lists (2Q A1out)
+	ghostBytes  prometheus.Gauge // bytes the evicted keys had when cached
 }
 
 // newKaz2QMetrics creates (but does not register) the kaz-2q collectors.
@@ -49,6 +52,14 @@ func newKaz2QMetrics() *kaz2QMetrics {
 			Name: "kaz_cache_2q_hits_total",
 			Help: "[kaz] User cache hits by the origin of the block (legacy, write, fill, compaction).",
 		}, []string{"origin"}),
+		ghostBlocks: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kaz_cache_2q_ghost_blocks",
+			Help: "[kaz] Number of keys in the 2Q evicted-key list.",
+		}),
+		ghostBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kaz_cache_2q_ghost_bytes",
+			Help: "[kaz] Bytes the keys in the 2Q evicted-key list had when cached.",
+		}),
 	}
 }
 
@@ -65,4 +76,6 @@ func (c *cacheManagerMetrics) kazRegisterMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(c.kaz2Q.bytes)
 	reg.MustRegister(c.kaz2Q.events)
 	reg.MustRegister(c.kaz2Q.hits)
+	reg.MustRegister(c.kaz2Q.ghostBlocks)
+	reg.MustRegister(c.kaz2Q.ghostBytes)
 }

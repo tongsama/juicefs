@@ -774,7 +774,7 @@ func (cache *cacheStore) exist(key string) (bool, error) {
 		return true, nil
 	}
 	k := cache.getCacheKey(key)
-	if cache.scanned && cache.keys.get(k) == nil {
+	if cache.scanned && kazLookupNoTouch(cache.keys, k) == nil {
 		return false, errNotCached
 	}
 	cache.Unlock()

@@ -321,7 +321,8 @@ func TestKaz2QMetricsRegister(t *testing.T) {
 	for _, mf := range mfs {
 		names[mf.GetName()] = true
 	}
-	for _, n := range []string{"kaz_cache_2q_blocks", "kaz_cache_2q_bytes", "kaz_cache_2q_events_total", "kaz_cache_2q_hits_total"} {
+	for _, n := range []string{"kaz_cache_2q_blocks", "kaz_cache_2q_bytes", "kaz_cache_2q_events_total", "kaz_cache_2q_hits_total",
+		"kaz_cache_2q_ghost_blocks", "kaz_cache_2q_ghost_bytes"} {
 		require.True(t, names[n], "metric %s not registered", n)
 	}
 }
@@ -360,4 +361,111 @@ func TestKaz2QMetricsReattach(t *testing.T) {
 	s.kazAttach(s.capacity)
 	require.Equal(t, 1.0, testutil.ToFloat64(km.blocks.WithLabelValues("probation")))
 	require.Equal(t, float64(kazStoreBlock), testutil.ToFloat64(km.bytes.WithLabelValues("probation")))
+}
+
+// TestKaz2QStoreExistNoTouch checks that an existence check (warmup --check,
+// FillCache) does not count as a read under kaz-2q: a probation block stays
+// in probation with its atime, even with a promote delay of 0. Under lru the
+// check still updates atime as upstream does.
+func TestKaz2QStoreExistNoTouch(t *testing.T) {
+	s, idx, clock := newKazTestStore(t, nil)
+	key := kazStoreKey(1)
+	kazWriteBlock(t, s, key)
+	s.add(key, kazStoreBlock, *clock)
+	*clock += 5
+	ok, err := s.exist(key)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, kazProbation, kazSeg(t, s, idx, key))
+	require.Equal(t, kazTestStart, kazAtime(s, key))
+
+	conf := defaultConf
+	conf.CacheEviction = EvictionLRU
+	conf.CacheScanInterval = -1
+	lru := newTestCacheStore(t.TempDir(), &conf, nil)
+	kazWriteBlock(t, lru, key)
+	lru.add(key, kazStoreBlock, 1000)
+	ok, err = lru.exist(key)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Greater(t, kazAtime(lru, key), uint32(1000), "lru exist() should touch atime as before")
+}
+
+// kazGhostGauges returns the evicted-key list gauges (blocks, bytes).
+func kazGhostGauges(m *cacheManagerMetrics) (float64, float64) {
+	return testutil.ToFloat64(m.kaz2Q.ghostBlocks), testutil.ToFloat64(m.kaz2Q.ghostBytes)
+}
+
+// kazGhostOf returns the evicted-key list size of an index under the store lock.
+func kazGhostOf(s *cacheStore, idx *kaz2QIndex) (int, int64) {
+	s.Lock()
+	defer s.Unlock()
+	return idx.ghost.Len(), idx.ghostBytes
+}
+
+// TestKaz2QGhostMetrics checks that the evicted-key list gauges follow
+// evictions, ghost hits and trimming, sum over the stores of a manager and
+// are not double counted when the metrics are attached again.
+func TestKaz2QGhostMetrics(t *testing.T) {
+	m := newKazTestMetrics()
+	a, ia, clockA := newKazTestStore(t, m)
+	b, ib, clockB := newKazTestStore(t, m)
+	blocks, bytes := kazGhostGauges(m)
+	require.Zero(t, blocks)
+	require.Zero(t, bytes)
+
+	for _, id := range []uint64{1, 2, 3} {
+		k := kazStoreKey(id)
+		kazWriteBlock(t, a, k)
+		a.add(k, kazStoreBlock, *clockA)
+		kazWriteBlock(t, b, k)
+		b.add(k, kazStoreBlock, *clockB)
+	}
+	// evict two blocks of each store into the evicted-key lists
+	for _, s := range []*cacheStore{a, b} {
+		s.capacity = 6000
+		kazCleanup(s)
+	}
+	na, ba := kazGhostOf(a, ia)
+	nb, bb := kazGhostOf(b, ib)
+	require.Equal(t, 2, na)
+	require.Equal(t, 2, nb)
+	blocks, bytes = kazGhostGauges(m)
+	require.Equal(t, float64(na+nb), blocks)
+	require.Equal(t, float64(ba+bb), bytes)
+
+	// a ghost hit takes the key out of the list
+	a.Lock()
+	var ghostKey cacheKey
+	for k := range ia.ghostKeys {
+		ghostKey = k
+		break
+	}
+	a.Unlock()
+	a.Lock()
+	ia.add(ghostKey, cacheItem{size: kazStoreBlock, atime: *clockA})
+	a.Unlock()
+	na, ba = kazGhostOf(a, ia)
+	require.Equal(t, 1, na)
+	blocks, bytes = kazGhostGauges(m)
+	require.Equal(t, float64(na+nb), blocks)
+	require.Equal(t, float64(ba+bb), bytes)
+
+	// shrinking the capacity trims the list of store b
+	b.Lock()
+	ib.kazSetCapacity(1)
+	b.Unlock()
+	nb, bb = kazGhostOf(b, ib)
+	require.Zero(t, nb)
+	blocks, bytes = kazGhostGauges(m)
+	require.Equal(t, float64(na+nb), blocks)
+	require.Equal(t, float64(ba+bb), bytes)
+
+	// attaching the metrics again does not double count
+	a.Lock()
+	ia.kazSetMetrics(m.kaz2Q)
+	a.Unlock()
+	blocks, bytes = kazGhostGauges(m)
+	require.Equal(t, float64(na+nb), blocks)
+	require.Equal(t, float64(ba+bb), bytes)
 }

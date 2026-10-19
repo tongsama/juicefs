@@ -119,6 +119,7 @@ func (p *kaz2QIndex) kazImportState(st kazCacheState) {
 			p.ghostBytes += g.size
 		}
 		p.trimGhost()
+		p.syncGauges()
 	}
 }
 
