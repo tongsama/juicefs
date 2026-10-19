@@ -319,6 +319,13 @@ func (p *kaz2QIndex) kazSetMetrics(m *kaz2QMetrics) {
 				m.bytesByOrigin.WithLabelValues(s.String(), o.String()).Add(0)
 			}
 		}
+		// export ghost_hit and its per-prior split at 0 from the mount on, so
+		// that tools taking differences do not miss the first hits; Add(0)
+		// on a counter shared by several stores changes nothing.
+		m.events.WithLabelValues("ghost_hit").Add(0)
+		for g := kazPriorUnknown; g <= kazPriorMax; g++ {
+			m.events.WithLabelValues(g.event()).Add(0)
+		}
 	}
 	p.syncGauges()
 }

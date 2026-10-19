@@ -713,3 +713,22 @@ func TestKaz2QGhostPriorCompaction(t *testing.T) {
 	require.Equal(t, ev("ghost_hit"), ev("ghost_hit_probation")+ev("ghost_hit_demoted")+
 		ev("ghost_hit_protected")+ev("ghost_hit_compaction"))
 }
+
+// TestKaz2QGhostHitEventsExportedAtZero checks that attaching metrics exports
+// ghost_hit and its per-prior events at 0 from the start, and that attaching
+// again or from a second store does not change them.
+func TestKaz2QGhostHitEventsExportedAtZero(t *testing.T) {
+	names := []string{"ghost_hit", "ghost_hit_demoted", "ghost_hit_probation", "ghost_hit_protected", "ghost_hit_compaction"}
+	m := newKaz2QMetrics()
+	require.Equal(t, 0, testutil.CollectAndCount(m.events))
+	p, _ := newKazTestIndex(t, 10, 4)
+	q, _ := newKazTestIndex(t, 10, 4)
+	p.kazSetMetrics(m)
+	require.Equal(t, len(names), testutil.CollectAndCount(m.events))
+	p.kazSetMetrics(m)
+	q.kazSetMetrics(m)
+	require.Equal(t, len(names), testutil.CollectAndCount(m.events))
+	for _, n := range names {
+		require.Equal(t, 0.0, testutil.ToFloat64(m.events.WithLabelValues(n)), n)
+	}
+}
