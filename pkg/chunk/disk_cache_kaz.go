@@ -35,8 +35,10 @@ func kazLookupNoTouch(keys KeyIndex, k cacheKey) *cacheItem {
 
 // kazAttach gives a kaz-2q index the effective store capacity (after the
 // free-ratio limit; it sizes the protected limit and the evicted-key list
-// cap) and the shared metrics. It does nothing for other eviction policies.
-// It must run before the store goroutines start.
+// cap) and the shared metrics, imports the state file (so that the first
+// scan restores the segments) and starts the periodic state saver. It does
+// nothing for other eviction policies. It must run before the store
+// goroutines start.
 func (cache *cacheStore) kazAttach(capacity int64) {
 	idx, ok := cache.keys.(*kaz2QIndex)
 	if !ok {
@@ -46,4 +48,6 @@ func (cache *cacheStore) kazAttach(capacity int64) {
 	if cache.m != nil {
 		idx.kazSetMetrics(cache.m.kaz2Q)
 	}
+	cache.kazLoadState(idx)
+	go cache.kazSaveLoop(idx.stateInterval)
 }

@@ -19,6 +19,7 @@ package chunk
 import (
 	"container/heap"
 	"container/list"
+	"sync"
 	"time"
 )
 
@@ -185,6 +186,11 @@ type kaz2QIndex struct {
 	restoreFromFile bool // restore was loaded from the state file
 	expect          map[cacheKey]kazExpectation
 
+	stateInterval time.Duration // save interval of the state file
+	// saveMu serializes writers of the state file (periodic saver and the
+	// flush at umount); it is not the store mutex and guards no index field.
+	saveMu sync.Mutex
+
 	now     func() uint32
 	metrics *kaz2QMetrics
 	// pubUsed and pubCounts are the per-segment values this index has added
@@ -207,6 +213,10 @@ func newKaz2QIndex(conf *Config) *kaz2QIndex {
 	if delay < 0 {
 		delay = 0
 	}
+	interval := conf.KazCacheStateInterval
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
 	return &kaz2QIndex{
 		keys:           make(map[cacheKey]*kazItem),
 		prob:           kazHeap{byOrder: true},
@@ -217,6 +227,7 @@ func newKaz2QIndex(conf *Config) *kaz2QIndex {
 		ghostKeys:      make(map[cacheKey]*list.Element),
 		restore:        make(map[cacheKey]kazSaved),
 		expect:         make(map[cacheKey]kazExpectation),
+		stateInterval:  interval,
 		now:            func() uint32 { return uint32(time.Now().Unix()) },
 	}
 }

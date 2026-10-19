@@ -742,6 +742,9 @@ func mount(c *cli.Context) error {
 	if err := v.FlushAll(""); err != nil {
 		logger.Errorf("flush all delayed data: %s", err)
 	}
+	if s, ok := store.(interface{ KazFlushCacheState() }); ok {
+		s.KazFlushCacheState()
+	}
 	err = metaCli.CloseSession()
 	object.Shutdown(blob)
 	logger.Infof("The juicefs mount process exit successfully, mountpoint: %q", metaConf.MountPoint)
