@@ -625,3 +625,52 @@ func TestKaz2QGhostHitByPrior(t *testing.T) {
 	require.Equal(t, 1.0, ev("ghost_hit_demoted"))
 	require.Equal(t, 1.0, ev("ghost_hit_protected"))
 }
+
+// TestKaz2QCompactionProbationPlacedNewest checks that a compaction output
+// placed in probation enters the newest end of probation (inserted and order
+// are now) while keeping the inherited atime, so it is not the next eviction
+// victim and still needs promoteDelay after its insertion to be promoted.
+func TestKaz2QCompactionProbationPlacedNewest(t *testing.T) {
+	p, clock := newKazTestIndex(t, 10, 4)
+	for i := uint64(1); i <= 3; i++ { // fills in probation
+		*clock++
+		p.add(kazKey(i), cacheItem{size: kazTestBlock, atime: *clock})
+	}
+	*clock += 10
+	out := kazKey(20)
+	p.kazExpect(out, kazProbation, kazTestStart-100) // sources read long ago
+	p.add(out, cacheItem{size: kazTestBlock, atime: *clock})
+	it := p.keys[out]
+	require.Equal(t, kazProbation, it.seg)
+	require.Equal(t, kazOriginCompaction, it.origin)
+	require.Equal(t, kazTestStart-100, it.atime, "atime is inherited from the sources")
+	require.Equal(t, *clock, it.inserted)
+	require.Equal(t, *clock, it.order)
+	kazVerify(t, p)
+
+	k, ok := kazNextEvicted(p)
+	require.True(t, ok)
+	require.Equal(t, kazKey(1), k, "the oldest fill goes first, not the compaction output")
+
+	inserted := it.inserted
+	*clock = inserted + 599
+	require.NotNil(t, p.get(out))
+	require.Equal(t, kazProbation, p.keys[out].seg, "no promotion inside the correlation period")
+	*clock = inserted + 600
+	require.NotNil(t, p.get(out))
+	require.Equal(t, kazProtected, p.keys[out].seg)
+}
+
+// TestKaz2QCompactionProtectedKeepsOrder checks that a compaction output placed
+// in protected keeps the inherited atime as its times (unchanged behavior).
+func TestKaz2QCompactionProtectedKeepsOrder(t *testing.T) {
+	p, clock := newKazTestIndex(t, 10, 4)
+	*clock += 100
+	p.kazExpect(kazKey(20), kazProtected, kazTestStart+5)
+	p.add(kazKey(20), cacheItem{size: kazTestBlock, atime: *clock})
+	it := p.keys[kazKey(20)]
+	require.Equal(t, kazProtected, it.seg)
+	require.Equal(t, kazTestStart+5, it.atime)
+	require.Equal(t, kazTestStart+5, it.inserted)
+	require.Equal(t, kazTestStart+5, it.order)
+}

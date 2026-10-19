@@ -397,7 +397,9 @@ func (p *kaz2QIndex) name() string {
 
 // add implements KeyIndex. A new key is placed by (in order) staging,
 // a compaction expectation, the restore state, the evicted-key list, or as a
-// new probation block. An existing key only gets its size updated. A ghost
+// new probation block. A compaction output keeps the inherited atime; in
+// protected it is also ordered by it, in probation it enters the newest end
+// (inserted and order are now). An existing key only gets its size updated. A ghost
 // hit counts ghost_hit and one of ghost_hit_{probation,demoted,protected} by
 // the prior segment of the evicted key; it enters protected without the
 // demoted mark.
@@ -415,7 +417,15 @@ func (p *kaz2QIndex) add(key cacheKey, item cacheItem) {
 	} else if e, ok := p.expect[key]; ok {
 		delete(p.expect, key)
 		it.seg, it.atime, it.origin = e.seg, e.atime, kazOriginCompaction
-		it.inserted, it.order = e.atime, e.atime
+		if e.seg == kazProtected {
+			it.inserted, it.order = e.atime, e.atime
+		} else {
+			// probation: enter the newest end (and start the correlation
+			// period) now, keeping the inherited atime; with the old atime as
+			// order it would be the next eviction victim and never get the
+			// chance to be read again and promoted.
+			it.inserted, it.order = now, now
+		}
 	} else if s, ok := p.restore[key]; ok {
 		delete(p.restore, key)
 		it.seg, it.atime, it.inserted, it.order = s.seg, s.atime, s.inserted, s.order
