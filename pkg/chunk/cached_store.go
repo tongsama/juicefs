@@ -131,7 +131,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	key := s.key(indx)
 	if s.store.conf.CacheEnabled() {
 		start := time.Now()
-		r, err := s.store.bcache.load(key)
+		r, err := s.store.kazLoadForRead(ctx, key)
 		if err == nil {
 			n, err = r.ReadAt(p, int64(boff))
 			if !s.store.conf.OSCache {
@@ -160,7 +160,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		}
 	}
 
-	if s.store.conf.FinishCanceledGet && s.store.conf.CacheEnabled() && s.store.shouldCache(blockSize) {
+	if s.store.conf.FinishCanceledGet && s.store.conf.CacheEnabled() && s.store.shouldCache(blockSize) && !s.store.kazCompactionRead(ctx) {
 		return s.readBlockDetached(ctx, p, key, boff, blockSize)
 	}
 
@@ -171,7 +171,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		} else {
 			tmp.Acquire()
 		}
-		err = s.store.load(ctx, key, tmp, s.store.shouldCache(blockSize), false)
+		err = s.store.load(ctx, key, tmp, s.store.shouldCache(blockSize) && !s.store.kazCompactionRead(ctx), false)
 		return tmp, err
 	})
 	defer block.Release()
@@ -853,7 +853,9 @@ func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page,
 	store.objectDataBytes.WithLabelValues("GET", sc).Add(float64(n))
 	store.objectReqsHistogram.WithLabelValues("GET", sc).Observe(used.Seconds())
 	if err == nil {
-		store.fetcher.fetch(key)
+		if !store.kazCompactionRead(ctx) {
+			store.fetcher.fetch(key)
+		}
 		return n, nil
 	}
 	store.objectReqErrors.Add(1)

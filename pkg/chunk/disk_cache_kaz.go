@@ -16,6 +16,11 @@
 
 package chunk
 
+import (
+	"errors"
+	"os"
+)
+
 // kazPeeker is implemented by key indexes that can look up a key without
 // counting it as a user read (the kaz-2q index).
 type kazPeeker interface {
@@ -50,4 +55,56 @@ func (cache *cacheStore) kazAttach(capacity int64) {
 	}
 	cache.kazLoadState(idx)
 	go cache.kazSaveLoop(idx.stateInterval)
+}
+
+// kazLoadNoTouch is load for a compaction read: it opens the cached block key
+// exactly as load does (pending pages, the scanned check, removing an index
+// entry whose file cannot be opened) but looks the key up without counting
+// it as a user read, so that neither atime nor the 2Q segment changes.
+func (cache *cacheStore) kazLoadNoTouch(key string) (ReadCloser, error) {
+	cache.Lock()
+	defer cache.Unlock()
+	if p, ok := cache.pages[key]; ok {
+		return NewPageReader(p), nil
+	}
+	k := cache.getCacheKey(key)
+	if cache.scanned && kazLookupNoTouch(cache.keys, k) == nil {
+		return nil, errNotCached
+	}
+	cache.Unlock()
+
+	var f *cacheFile
+	var err error
+	err = cache.checkErr(func() error {
+		f, err = openCacheFile(cache.cachePath(key), parseObjOrigSize(key), cache.checksum)
+		if err != nil && !os.IsNotExist(err) {
+			logger.Warnf("Open cache file %s failed: %s", cache.cachePath(key), err)
+		}
+		return err
+	})
+
+	cache.Lock()
+	if err != nil {
+		if it := cache.keys.remove(k, false); it != nil {
+			cache.used -= int64(it.size + 4096)
+		}
+	}
+	return f, err
+}
+
+// kazLoadNoTouch is cacheManager.load for a compaction read: the same store
+// routing and legacy-store fallback, using cacheStore.kazLoadNoTouch.
+func (m *cacheManager) kazLoadNoTouch(key string) (ReadCloser, error) {
+	store := m.getStore(key)
+	if store == nil {
+		return nil, errors.New("no available cache dir")
+	}
+	r, err := store.kazLoadNoTouch(key)
+	if err == errNotCached {
+		legacy := m.getStoreLegacy(key)
+		if legacy != store && legacy != nil {
+			r, err = legacy.kazLoadNoTouch(key)
+		}
+	}
+	return r, err
 }
