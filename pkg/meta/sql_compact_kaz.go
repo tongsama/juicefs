@@ -25,7 +25,7 @@ import (
 )
 
 // doKazReplaceChunk follows dbMeta.doCompactChunk with a list of new records.
-func (m *dbMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []Slice, delayed []byte, delayedKey uint64) syscall.Errno {
+func (m *dbMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []kazCreated, delayed []byte, delayedKey uint64) syscall.Errno {
 	st := errno(m.txn(func(s *xorm.Session) error {
 		var c2 = chunk{Inode: inode, Indx: indx}
 		_, err := s.ForUpdate().MustCols("indx").Get(&c2)
@@ -41,7 +41,7 @@ func (m *dbMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []by
 			return err
 		}
 		for _, c := range created {
-			if err = mustInsert(s, sliceRef{c.Id, c.Size, 1}); err != nil { // create the key to tracking it
+			if err = mustInsert(s, sliceRef{c.Id, c.Size, c.Refs}); err != nil { // create the key to tracking it
 				return err
 			}
 		}
@@ -89,10 +89,8 @@ func (m *dbMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []by
 			return nil
 		})
 	} else if st == 0 && delayed == nil {
-		for _, s := range removed {
-			if s.id == 0 {
-				continue
-			}
+		// a slice referenced by several removed records is announced once
+		for _, s := range kazDedupDeletes(removed, func(s *slice) bool {
 			var ref = sliceRef{Id: s.id}
 			var ok bool
 			err := m.simpleTxn(Background(), func(s *xorm.Session) error {
@@ -100,10 +98,13 @@ func (m *dbMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []by
 				ok, e = s.Get(&ref)
 				return e
 			})
-			if err == nil && ok && ref.Refs <= 0 {
-				m.enqueueCompactionDelete(s.id, s.size)
-			}
+			return err == nil && ok && ref.Refs <= 0
+		}) {
+			m.enqueueCompactionDelete(s.id, s.size)
 		}
 	}
 	return st
 }
+
+// kazDeltaCapable tells that SQL counts shared slice references correctly (clone adds one per record).
+func (m *dbMeta) kazDeltaCapable() bool { return true }

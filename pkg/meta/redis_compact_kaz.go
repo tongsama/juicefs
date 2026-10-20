@@ -18,6 +18,7 @@ package meta
 
 import (
 	"fmt"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -25,7 +26,7 @@ import (
 )
 
 // doKazReplaceChunk follows redisMeta.doCompactChunk with a list of new records.
-func (m *redisMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []Slice, delayed []byte, delayedKey uint64) syscall.Errno {
+func (m *redisMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []kazCreated, delayed []byte, delayedKey uint64) syscall.Errno {
 	var rs []*redis.IntCmd // trash disabled: check reference of slices
 	if delayed == nil {
 		rs = make([]*redis.IntCmd, len(removed))
@@ -52,7 +53,7 @@ func (m *redisMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced [
 				pipe.LPush(ctx, key, replaced[(i-1)*sliceBytes:i*sliceBytes])
 			}
 			for _, c := range created {
-				pipe.HSet(ctx, m.sliceRefs(), m.sliceKey(c.Id, c.Size), "0") // create the key to tracking it
+				pipe.HSet(ctx, m.sliceRefs(), m.sliceKey(c.Id, c.Size), strconv.Itoa(c.Refs-1)) // create the key to tracking it, holding Refs-1 as redis does
 			}
 			if delayed != nil {
 				if len(delayed) > 0 {
@@ -96,3 +97,6 @@ func (m *redisMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced [
 	}
 	return st
 }
+
+// kazDeltaCapable tells that redis counts shared slice references correctly (clone adds one per record).
+func (m *redisMeta) kazDeltaCapable() bool { return true }

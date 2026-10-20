@@ -33,7 +33,40 @@ type kazChunkReplacer interface {
 	// when they still match, creates a reference for each created slice and either
 	// records delayed (trash, keyed by delayedKey) or drops one reference of each
 	// removed record. It returns EINVAL when the chunk no longer starts with origin.
-	doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []Slice, delayed []byte, delayedKey uint64) syscall.Errno
+	doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []kazCreated, delayed []byte, delayedKey uint64) syscall.Errno
+}
+
+// kazCreated is a slice made by a compaction together with the number of
+// records that will point to it (Refs >= 1). A block output has one record; a
+// delta slice may be pointed to by several, so its reference count starts at Refs.
+type kazCreated struct {
+	Slice
+	Refs int
+}
+
+// kazDeltaCapable is implemented by engines that count references safely when
+// one slice is pointed to by several records of a file (see spec 5.9); the TKV
+// engines do not implement it and fall back to block mode.
+type kazDeltaCapable interface {
+	kazDeltaCapable() bool
+}
+
+// kazDedupDeletes returns the removed slices for which dead reports true, keeping
+// one entry per slice id, so a slice dropped by several records is announced once.
+// The reference decrement itself stays per record and is done by the caller.
+func kazDedupDeletes(removed []*slice, dead func(*slice) bool) []*slice {
+	var out []*slice
+	seen := make(map[uint64]bool)
+	for _, s := range removed {
+		if s.id == 0 || seen[s.id] {
+			continue
+		}
+		if dead(s) {
+			seen[s.id] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 const (
@@ -269,8 +302,8 @@ func (m *baseMeta) runKazBlockCompaction(r kazChunkReplacer, inode Ino, indx uin
 // writeKazBlocks allocates one slice per data output and writes them through the
 // CompactChunk message, at most kazBlockWriteConcurrency at a time, so a chunk's
 // blocks upload in parallel as upstream's single slice does. It returns the
-// slices written successfully (in output order) and the joined errors.
-func (m *baseMeta) writeKazBlocks(inode Ino, indx uint32, outs []kazBlockOut, tier int, readSlices int, totalBytes *uint32) ([]Slice, error) {
+// slices written successfully (in output order, each with one reference) and the joined errors.
+func (m *baseMeta) writeKazBlocks(inode Ino, indx uint32, outs []kazBlockOut, tier int, readSlices int, totalBytes *uint32) ([]kazCreated, error) {
 	var data []kazBlockOut
 	for _, o := range outs {
 		if !o.mask {
@@ -307,14 +340,14 @@ func (m *baseMeta) writeKazBlocks(inode Ino, indx uint32, outs []kazBlockOut, ti
 		}(i, o)
 	}
 	wg.Wait()
-	var written []Slice
+	var written []kazCreated
 	var err error
 	for i, o := range data {
 		if errs[i] != nil {
 			err = errors.Join(err, errs[i])
 			continue
 		}
-		written = append(written, Slice{Id: ids[i], Size: o.length, Len: o.length})
+		written = append(written, kazCreated{Slice{Id: ids[i], Size: o.length, Len: o.length}, 1})
 	}
 	return written, err
 }
