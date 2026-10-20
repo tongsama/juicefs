@@ -417,9 +417,10 @@ func TestKazCacheStateV3RoundTrip(t *testing.T) {
 
 // TestKazCacheStateReadsV2 checks that a version 2 file (as written by
 // 57b3de8a, the running production version) is still restored: segments,
-// demoted marks and priors are kept, and the read mark of a protected item is
-// derived from its hit count (>= 1); probation items get no mark. A store that
-// loads it writes version 3 on its next save.
+// demoted marks and priors are kept, and every item is loaded without the
+// read mark (whatever its hit count), so a protected block gets the mark only
+// when it is read again. A store that loads it writes version 3 on its next
+// save.
 func TestKazCacheStateReadsV2(t *testing.T) {
 	conf := kazStateTestConf()
 	k1 := cacheKey{id: 1, size: 1024}
@@ -435,10 +436,7 @@ func TestKazCacheStateReadsV2(t *testing.T) {
 	require.Len(t, data, kazStateHeader+4+3*kazStateV2ItemSize+4+kazStateGhostSize+4)
 	got, err := decodeKazCacheState(data)
 	require.NoError(t, err)
-	want := v2
-	want.items = append([]kazStateItem(nil), v2.items...)
-	want.items[0].read = true // protected with hits >= 1
-	require.Equal(t, want, got)
+	require.Equal(t, v2, got) // no read mark, even for protected with hits >= 1
 	_, err = decodeKazCacheState(kazResum(data[:len(data)-1]))
 	require.Error(t, err)
 	b := append([]byte{}, data...)
@@ -454,10 +452,14 @@ func TestKazCacheStateReadsV2(t *testing.T) {
 	for _, k := range []cacheKey{k1, k2, k3} {
 		p.add(k, cacheItem{size: int32(k.size), atime: 5})
 	}
-	require.True(t, p.keys[k1].read)
+	require.False(t, p.keys[k1].read)
 	require.False(t, p.keys[k2].read)
 	require.False(t, p.keys[k3].read)
 	require.True(t, p.keys[k3].demoted)
+	require.Equal(t, int64(1024+2048), p.usedUnread)
+	require.Equal(t, 3072.0, testutil.ToFloat64(m.protectedUnread))
+	p.get(k1) // read again after the upgrade: marked
+	require.True(t, p.keys[k1].read)
 	require.Equal(t, int64(2048), p.usedUnread)
 	require.Equal(t, 2048.0, testutil.ToFloat64(m.protectedUnread))
 	require.Equal(t, kazPriorDemoted, kazGhostPriorOf(t, p, g1))
@@ -481,7 +483,7 @@ func TestKazCacheStateReadsV2(t *testing.T) {
 	require.Zero(t, kazStateEvents(s, "state_load_failed"))
 	require.Equal(t, kazProtected, kazSeg(t, s, idx, prot))
 	s.Lock()
-	require.True(t, idx.keys[s.getCacheKey(prot)].read)
+	require.False(t, idx.keys[s.getCacheKey(prot)].read)
 	s.Unlock()
 	s.kazSaveState()
 	b, err = os.ReadFile(s.kazStatePath())
@@ -490,14 +492,15 @@ func TestKazCacheStateReadsV2(t *testing.T) {
 	st, err := decodeKazCacheState(b)
 	require.NoError(t, err)
 	require.Len(t, st.items, 1)
-	require.True(t, st.items[0].read)
+	require.Equal(t, kazProtected, st.items[0].seg)
+	require.False(t, st.items[0].read)
 }
 
 // TestKazCacheStateReadsV1 checks that a version 1 file (as written by the
 // previous binary) is still restored: segments, atime and evicted keys are
 // kept, items have no demoted mark and evicted keys an unknown prior, which a
-// ghost hit counts as ghost_hit_probation; a protected item with hits >= 1
-// gets the read mark.
+// ghost hit counts as ghost_hit_probation; items are loaded without the read
+// mark, protected ones with hits included.
 func TestKazCacheStateReadsV1(t *testing.T) {
 	conf := kazStateTestConf()
 	k1 := cacheKey{id: 1, size: 1024}
@@ -511,10 +514,7 @@ func TestKazCacheStateReadsV1(t *testing.T) {
 	require.Len(t, data, kazStateHeader+4+2*kazStateV1ItemSize+4+kazStateV1GhostSize+4)
 	got, err := decodeKazCacheState(data)
 	require.NoError(t, err)
-	want := v1
-	want.items = append([]kazStateItem(nil), v1.items...)
-	want.items[0].read = true   // protected with hits >= 1
-	require.Equal(t, want, got) // no demoted mark, prior 0
+	require.Equal(t, v1, got) // no demoted or read mark, prior 0
 	// robustness checks hold for version 1 too
 	_, err = decodeKazCacheState(kazResum(data[:len(data)-1]))
 	require.Error(t, err)
@@ -531,7 +531,7 @@ func TestKazCacheStateReadsV1(t *testing.T) {
 	require.Equal(t, kazProtected, p.keys[k1].seg)
 	require.Equal(t, uint32(10), p.keys[k1].atime)
 	require.False(t, p.keys[k1].demoted)
-	require.True(t, p.keys[k1].read)
+	require.False(t, p.keys[k1].read, "loaded unread despite hits >= 1")
 	require.False(t, p.keys[k2].read)
 	require.Equal(t, kazProbation, p.keys[k2].seg)
 	require.Equal(t, uint32(20), p.keys[k2].atime)

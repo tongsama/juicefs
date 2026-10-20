@@ -43,9 +43,10 @@ import (
 //	CRC32 (IEEE) of everything before it, u32
 //
 // Version 3 is always written. Version 2 (written by 57b3de8a) and version 1
-// (written by bf9efe73) are still read; their items have no read mark, so a
-// protected item gets it when its hit count is at least 1 (probation items
-// never have it). Version 1 items have no demoted mark and its evicted keys an
+// (written by bf9efe73) are still read; their items have no read mark and
+// are loaded unread, so that a protected block read again after the upgrade
+// gets the mark and the others are demoted first under
+// --kaz-cache-demote-unread-first. Version 1 items have no demoted mark and its evicted keys an
 // unknown prior (0). Any other version is rejected, so the file is ignored;
 // binaries before version 3 ignore a version 3 file the same way.
 const (
@@ -176,8 +177,7 @@ func kazBoolByte(v bool) byte {
 // decodeKazCacheState parses the file layout, version 1, 2 or 3 (the per-item
 // and per-ghost sizes follow the version); any mismatch of magic, version,
 // length, CRC or field range (including a read mark on a probation item) is
-// an error. Items of versions 1 and 2 get the read mark when they are
-// protected with at least one hit.
+// an error. Items of versions 1 and 2 are loaded without the read mark.
 func decodeKazCacheState(b []byte) (kazCacheState, error) {
 	var st kazCacheState
 	le := binary.LittleEndian
@@ -225,7 +225,7 @@ func decodeKazCacheState(b []byte) (kazCacheState, error) {
 			}
 			demoted = e[31] == 1
 		}
-		read := seg == kazProtected && e[18] >= 1 // versions 1 and 2: hits stand in
+		read := false // versions 1 and 2: no mark recorded, loaded unread
 		if version >= 3 {
 			if e[32] > 1 || (e[32] == 1 && seg != kazProtected) {
 				return st, fmt.Errorf("bad item %d", i)

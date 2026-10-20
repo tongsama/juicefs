@@ -780,6 +780,7 @@ func (p *kaz2QIndex) demoteOverflow() {
 		it.seg = kazProbation
 		it.inserted, it.order = now, now
 		it.demoted = true
+		p.event("demote") // the total first, so a scrape never sees the split exceed it
 		if it.read {
 			p.event("demote_read")
 		} else {
@@ -787,7 +788,6 @@ func (p *kaz2QIndex) demoteOverflow() {
 		}
 		it.read = false
 		p.link(it)
-		p.event("demote")
 	}
 }
 

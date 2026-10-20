@@ -402,7 +402,7 @@ func dataCacheFlags() []cli.Flag {
 		},
 		&cli.BoolFlag{
 			Name:  "kaz-cache-demote-unread-first",
-			Usage: "[kaz] under --cache-eviction kaz-2q, when the protected segment overflows, demote the protected blocks not read since they entered it (e.g. compaction outputs) first, oldest read first, and the read ones only after them; off demotes by last read time only",
+			Usage: "[kaz] under --cache-eviction kaz-2q, when the protected segment overflows, demote the protected blocks not read since they entered it (e.g. compaction outputs) first, oldest read first, and the read ones only after them; the same order applies to direct eviction from protected when probation is empty; off orders both by last read time only",
 		},
 		&cli.StringFlag{
 			Name:  "cache-scan-interval",
