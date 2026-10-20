@@ -283,6 +283,41 @@ func TestPlanKazDeltaFold(t *testing.T) {
 	require.Len(t, after, n)
 }
 
+// TestPlanKazDeltaFoldZero folds a block whose record count comes from many
+// small id 0 records (guest discard) instead of rewriting the chunk whole
+// (spec §5.2: such records are cleaned by the §5.4-5 fold).
+func TestPlanKazDeltaFoldZero(t *testing.T) {
+	c := kazDC(kazDeltaTrigger, 16)
+	c.maxRecords = 60
+	ss := []*slice{kazRec(0, 1, 16*kazEB), kazRec(kazEB+100, 100, 8), kazRec(kazEB+200, 101, 8)}
+	for k := uint32(0); k < 64; k++ { // block 6 discarded in 64-byte pieces
+		ss = append(ss, &slice{pos: 6*kazEB + k*64, len: 64})
+	}
+	p, n := planKazDelta(ss, kazEB, c)
+	require.NotNil(t, p)
+	require.Equal(t, "delta_fold", p.event)
+	require.False(t, p.full)
+	require.Equal(t, 1, p.foldBlocks)
+	require.LessOrEqual(t, n, c.maxRecords-kazDeltaFoldMargin)
+	var masks, deltas int
+	for _, o := range p.outs {
+		switch {
+		case o.mask:
+			masks++
+			require.Equal(t, uint32(6), o.pos/kazEB)
+		case o.delta:
+			deltas++
+		}
+	}
+	require.Equal(t, 1, masks)
+	require.Equal(t, 2, deltas)
+	require.Len(t, p.removed, 66)
+	f := newKazFakeStore()
+	next := uint64(1 << 20)
+	after, _ := kazApplyDelta(t, f, ss, p, &next, 16*kazEB)
+	require.Len(t, after, n)
+}
+
 // TestPlanKazDeltaPrune drops a fully hidden base record without uploading anything.
 func TestPlanKazDeltaPrune(t *testing.T) {
 	ss := append(kazBase16(), kazRec(3*kazEB, 100, kazEB))

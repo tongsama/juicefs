@@ -172,11 +172,14 @@ func (d *kazDeltaPlanner) outs(drop []bool, t [][2]uint32) *kazBlockPlan {
 }
 
 // foldCandidate returns the block outside the rewritten set holding the most
-// kept delta records (wholly inside it) and delta ranges, or false if none has any.
+// kept delta and id 0 records (wholly inside it; rewriting the block removes
+// them) and delta ranges, or false if none has any. Counting id 0 records lets
+// the fold clean up many small hole punches (guest discard, spec §5.2) instead
+// of falling back to a whole rewrite.
 func (d *kazDeltaPlanner) foldCandidate(drop []bool, t [][2]uint32) (uint32, bool) {
 	count := make(map[uint32]int)
 	for i, s := range d.ss {
-		if !drop[i] && d.kinds[i] == kazRecDelta && s.len > 0 && d.g.first(s) == d.g.last(s) && !d.fset[d.g.first(s)] {
+		if !drop[i] && (d.kinds[i] == kazRecDelta || d.kinds[i] == kazRecZero) && s.len > 0 && d.g.first(s) == d.g.last(s) && !d.fset[d.g.first(s)] {
 			count[d.g.first(s)]++
 		}
 	}
