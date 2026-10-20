@@ -26,13 +26,15 @@ import (
 type kaz2QMetrics struct {
 	blocks *prometheus.GaugeVec   // evictable blocks per segment (probation|protected)
 	bytes  *prometheus.GaugeVec   // evictable bytes per segment
-	events *prometheus.CounterVec // promote, demote, evict_*, ghost_hit(_*), compaction_*, state_*
+	events *prometheus.CounterVec // promote, demote(_unread|_read), evict_*, ghost_hit(_*), compaction_*, state_*
 	hits   *prometheus.CounterVec // user cache hits by origin (legacy, write, fill, compaction)
 	// bytesByOrigin splits bytes by the origin of the blocks (segment, origin).
 	bytesByOrigin *prometheus.GaugeVec
 
 	ghostBlocks prometheus.Gauge // keys in the evicted-key lists (2Q A1out)
 	ghostBytes  prometheus.Gauge // bytes the evicted keys had when cached
+	// protectedUnread is the bytes of protected blocks without the read mark.
+	protectedUnread prometheus.Gauge
 }
 
 // newKaz2QMetrics creates (but does not register) the kaz-2q collectors.
@@ -52,7 +54,7 @@ func newKaz2QMetrics() *kaz2QMetrics {
 		}, []string{"segment", "origin"}),
 		events: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "kaz_cache_2q_events_total",
-			Help: "[kaz] 2Q cache events (promote, demote, evictions, ghost hits in total and by prior segment, compaction output, state file).",
+			Help: "[kaz] 2Q cache events (promote, demote in total and by read mark, evictions, ghost hits in total and by prior segment, compaction output, state file).",
 		}, []string{"event"}),
 		hits: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "kaz_cache_2q_hits_total",
@@ -65,6 +67,10 @@ func newKaz2QMetrics() *kaz2QMetrics {
 		ghostBytes: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "kaz_cache_2q_ghost_bytes",
 			Help: "[kaz] Bytes the keys in the 2Q evicted-key list had when cached.",
+		}),
+		protectedUnread: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "kaz_cache_2q_protected_unread_bytes",
+			Help: "[kaz] Bytes of protected 2Q blocks without the read mark (not read by a user since they entered protected).",
 		}),
 	}
 }
@@ -85,4 +91,5 @@ func (c *cacheManagerMetrics) kazRegisterMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(c.kaz2Q.hits)
 	reg.MustRegister(c.kaz2Q.ghostBlocks)
 	reg.MustRegister(c.kaz2Q.ghostBytes)
+	reg.MustRegister(c.kaz2Q.protectedUnread)
 }

@@ -603,6 +603,8 @@ type Config struct {
 	KazCacheCompactionPlacement string
 	// KazCacheCompactionPlacementShareRatio is the protected share threshold of the share placement (0 < x <= 1).
 	KazCacheCompactionPlacementShareRatio float64
+	// KazCacheDemoteUnreadFirst demotes protected blocks without the read mark before those with it.
+	KazCacheDemoteUnreadFirst bool
 }
 
 func (c *Config) SelfCheck(uuid string) {

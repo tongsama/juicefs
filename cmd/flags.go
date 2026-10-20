@@ -400,6 +400,10 @@ func dataCacheFlags() []cli.Flag {
 			Value: 0.5,
 			Usage: "[kaz] threshold of --kaz-cache-compaction-placement share: the share of an output block's non-hole bytes copied from protected source blocks needed to cache it in protected (0 < x <= 1; used only with share)",
 		},
+		&cli.BoolFlag{
+			Name:  "kaz-cache-demote-unread-first",
+			Usage: "[kaz] under --cache-eviction kaz-2q, when the protected segment overflows, demote the protected blocks not read since they entered it (e.g. compaction outputs) first, oldest read first, and the read ones only after them; off demotes by last read time only",
+		},
 		&cli.StringFlag{
 			Name:  "cache-scan-interval",
 			Value: "1h",

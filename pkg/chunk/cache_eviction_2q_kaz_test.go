@@ -21,7 +21,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -330,9 +332,9 @@ func TestKaz2QResetKeepsSegments(t *testing.T) {
 	require.NotContains(t, p.restore, kazKey(7))
 
 	// reset drops expectations older than 10 minutes
-	p.kazExpect(kazKey(30), kazProtected, *clock)
+	p.kazExpect(kazKey(30), kazProtected, *clock, false)
 	*clock += 601
-	p.kazExpect(kazKey(31), kazProtected, *clock)
+	p.kazExpect(kazKey(31), kazProtected, *clock, false)
 	p.reset()
 	require.NotContains(t, p.expect, kazKey(30))
 	require.Contains(t, p.expect, kazKey(31))
@@ -348,28 +350,28 @@ func TestKaz2QPlacement(t *testing.T) {
 	*clock += 10
 	p.add(kazKey(3), cacheItem{size: -kazTestBlock, atime: *clock}) // staging
 
-	seg, at, ok := p.kazPlacement([]cacheKey{kazKey(1), kazKey(2), kazKey(9)})
+	seg, at, _, ok := p.kazPlacement([]cacheKey{kazKey(1), kazKey(2), kazKey(9)})
 	require.True(t, ok)
 	require.Equal(t, kazProtected, seg)
 	require.Equal(t, kazTestStart+610, at)
 
-	seg, at, ok = p.kazPlacement([]cacheKey{kazKey(2), kazKey(3)})
+	seg, at, _, ok = p.kazPlacement([]cacheKey{kazKey(2), kazKey(3)})
 	require.True(t, ok)
 	require.Equal(t, kazProbation, seg)
 	require.Equal(t, kazTestStart+620, at)
 
-	seg, at, ok = p.kazPlacement([]cacheKey{kazKey(3)})
+	seg, at, _, ok = p.kazPlacement([]cacheKey{kazKey(3)})
 	require.True(t, ok)
 	require.Equal(t, kazProbation, seg)
 	require.Equal(t, kazTestStart+620, at)
 
-	_, _, ok = p.kazPlacement([]cacheKey{kazKey(8), kazKey(9)})
+	_, _, _, ok = p.kazPlacement([]cacheKey{kazKey(8), kazKey(9)})
 	require.False(t, ok)
-	_, _, ok = p.kazPlacement(nil)
+	_, _, _, ok = p.kazPlacement(nil)
 	require.False(t, ok)
 
 	// expect places a compaction output with the inherited segment and atime
-	p.kazExpect(kazKey(20), kazProtected, kazTestStart+5)
+	p.kazExpect(kazKey(20), kazProtected, kazTestStart+5, false)
 	p.add(kazKey(20), cacheItem{size: kazTestBlock, atime: *clock})
 	it := p.keys[kazKey(20)]
 	require.Equal(t, kazProtected, it.seg)
@@ -383,11 +385,15 @@ func kazVerify(t *testing.T, p *kaz2QIndex) {
 	t.Helper()
 	var used, counts [3]int64
 	var byOrigin [3][kazOriginCount]int64
+	var unread int64
 	for k, it := range p.keys {
 		require.Equal(t, k, it.key)
 		if it.size <= 0 {
 			require.Equal(t, notInLru, it.pos)
 			continue
+		}
+		if it.seg == kazProtected && !it.read {
+			unread += int64(it.size)
 		}
 		h := p.heapOf(it.seg)
 		require.Less(t, it.pos, h.Len())
@@ -399,6 +405,7 @@ func kazVerify(t *testing.T, p *kaz2QIndex) {
 	require.Equal(t, used, p.used)
 	require.Equal(t, byOrigin, p.usedByOrigin)
 	require.Equal(t, counts, p.counts)
+	require.Equal(t, unread, p.usedUnread)
 	require.Equal(t, int(counts[kazProbation]), p.prob.Len())
 	require.Equal(t, int(counts[kazProtected]), p.prot.Len())
 	for _, h := range []*kazHeap{&p.prob, &p.prot} {
@@ -457,11 +464,11 @@ func TestKaz2QExpectPrunedWithoutReset(t *testing.T) {
 	p, clock := newKazTestIndex(t, 10, 4)
 	const n = 2 * kazExpectPruneMin
 	for i := uint64(0); i < n; i++ {
-		p.kazExpect(kazKey(i), kazProtected, *clock)
+		p.kazExpect(kazKey(i), kazProtected, *clock, false)
 	}
 	*clock += kazExpectTTL + 1
 	for i := uint64(n); i < 2*n; i++ {
-		p.kazExpect(kazKey(i), kazProtected, *clock)
+		p.kazExpect(kazKey(i), kazProtected, *clock, false)
 	}
 	for i := uint64(0); i < n; i++ {
 		require.NotContains(t, p.expect, kazKey(i), "expired expectation %d kept", i)
@@ -507,19 +514,19 @@ func TestKaz2QPlacementDuringRescan(t *testing.T) {
 	p.reset()
 	require.Equal(t, 0, p.len())
 
-	seg, at, ok := p.kazPlacement([]cacheKey{kazKey(1)})
+	seg, at, _, ok := p.kazPlacement([]cacheKey{kazKey(1)})
 	require.True(t, ok)
 	require.Equal(t, kazProtected, seg)
 	require.Equal(t, protAtime, at)
 
-	seg, at, ok = p.kazPlacement([]cacheKey{kazKey(2), kazKey(9)})
+	seg, at, _, ok = p.kazPlacement([]cacheKey{kazKey(2), kazKey(9)})
 	require.True(t, ok)
 	require.Equal(t, kazProbation, seg)
 	require.Equal(t, probAtime, at)
 
 	// a re-added key is answered from the index, not from restore
 	p.add(kazKey(2), cacheItem{size: kazTestBlock, atime: probAtime})
-	seg, _, ok = p.kazPlacement([]cacheKey{kazKey(2)})
+	seg, _, _, ok = p.kazPlacement([]cacheKey{kazKey(2)})
 	require.True(t, ok)
 	require.Equal(t, kazProbation, seg)
 }
@@ -638,7 +645,7 @@ func TestKaz2QCompactionProbationPlacedNewest(t *testing.T) {
 	}
 	*clock += 10
 	out := kazKey(20)
-	p.kazExpect(out, kazProbation, kazTestStart-100) // sources read long ago
+	p.kazExpect(out, kazProbation, kazTestStart-100, false) // sources read long ago
 	p.add(out, cacheItem{size: kazTestBlock, atime: *clock})
 	it := p.keys[out]
 	require.Equal(t, kazProbation, it.seg)
@@ -666,7 +673,7 @@ func TestKaz2QCompactionProbationPlacedNewest(t *testing.T) {
 func TestKaz2QCompactionProtectedKeepsOrder(t *testing.T) {
 	p, clock := newKazTestIndex(t, 10, 4)
 	*clock += 100
-	p.kazExpect(kazKey(20), kazProtected, kazTestStart+5)
+	p.kazExpect(kazKey(20), kazProtected, kazTestStart+5, false)
 	p.add(kazKey(20), cacheItem{size: kazTestBlock, atime: *clock})
 	it := p.keys[kazKey(20)]
 	require.Equal(t, kazProtected, it.seg)
@@ -685,7 +692,7 @@ func TestKaz2QGhostPriorCompaction(t *testing.T) {
 	p.kazSetMetrics(m)
 	ev := func(name string) float64 { return testutil.ToFloat64(m.events.WithLabelValues(name)) }
 
-	p.kazExpect(kazKey(20), kazProbation, *clock)
+	p.kazExpect(kazKey(20), kazProbation, *clock, false)
 	p.add(kazKey(20), cacheItem{size: kazTestBlock, atime: *clock})
 	k, ok := kazNextEvicted(p)
 	require.True(t, ok)
@@ -693,7 +700,7 @@ func TestKaz2QGhostPriorCompaction(t *testing.T) {
 	require.Equal(t, kazPriorCompaction, kazGhostPriorOf(t, p, kazKey(20)))
 
 	// a compaction output demoted from protected is counted as demoted
-	p.kazExpect(kazKey(30), kazProtected, *clock)
+	p.kazExpect(kazKey(30), kazProtected, *clock, false)
 	p.add(kazKey(30), cacheItem{size: kazTestBlock, atime: *clock})
 	for i := uint64(100); i < 106; i++ { // 6 newer protected blocks
 		*clock++
@@ -718,7 +725,8 @@ func TestKaz2QGhostPriorCompaction(t *testing.T) {
 // ghost_hit and its per-prior events at 0 from the start, and that attaching
 // again or from a second store does not change them.
 func TestKaz2QGhostHitEventsExportedAtZero(t *testing.T) {
-	names := []string{"ghost_hit", "ghost_hit_demoted", "ghost_hit_probation", "ghost_hit_protected", "ghost_hit_compaction"}
+	names := []string{"ghost_hit", "ghost_hit_demoted", "ghost_hit_probation", "ghost_hit_protected", "ghost_hit_compaction",
+		"demote", "demote_unread", "demote_read"}
 	m := newKaz2QMetrics()
 	require.Equal(t, 0, testutil.CollectAndCount(m.events))
 	p, _ := newKazTestIndex(t, 10, 4)
@@ -731,4 +739,222 @@ func TestKaz2QGhostHitEventsExportedAtZero(t *testing.T) {
 	for _, n := range names {
 		require.Equal(t, 0.0, testutil.ToFloat64(m.events.WithLabelValues(n)), n)
 	}
+}
+
+// newKazTestIndexB is newKazTestIndex with --kaz-cache-demote-unread-first set
+// to unreadFirst.
+func newKazTestIndexB(t *testing.T, blocks int64, ghostRatio float64, unreadFirst bool) (*kaz2QIndex, *uint32) {
+	t.Helper()
+	conf := &Config{
+		CacheEviction:             EvictionKaz2Q,
+		KazCacheProbationRatio:    0.4,
+		KazCachePromoteDelay:      10 * time.Minute,
+		KazCacheGhostRatio:        ghostRatio,
+		KazCacheDemoteUnreadFirst: unreadFirst,
+	}
+	clock := kazTestStart
+	p := newKaz2QIndex(conf)
+	p.now = func() uint32 { return clock }
+	p.kazSetCapacity(blocks * kazTestBlock)
+	return p, &clock
+}
+
+// kazReadOf returns the read mark of a cached key, failing when it is absent.
+func kazReadOf(t *testing.T, p *kaz2QIndex, k cacheKey) bool {
+	t.Helper()
+	it, ok := p.keys[k]
+	require.True(t, ok, "key %v not cached", k)
+	return it.read
+}
+
+// TestKaz2QReadMark checks the read mark: set by a promotion after the
+// correlation period, by a ghost hit (entry into protected) and by a user read
+// while protected; cleared by a demotion; carried into a compaction output
+// placed in protected only when a protected source has it; and not set by
+// reads inside the correlation period or on a probation output. The mark is
+// recorded with the option off (the default here).
+func TestKaz2QReadMark(t *testing.T) {
+	p, clock := newKazTestIndex(t, 10, 4) // protected limit: 6 blocks
+	p.add(kazKey(1), cacheItem{size: kazTestBlock, atime: *clock})
+	*clock += 10
+	p.get(kazKey(1))
+	require.False(t, kazReadOf(t, p, kazKey(1)), "a read inside the correlation period does not mark")
+	*clock += 600
+	p.get(kazKey(1))
+	require.Equal(t, kazProtected, p.keys[kazKey(1)].seg)
+	require.True(t, kazReadOf(t, p, kazKey(1)), "promotion by a user read marks")
+
+	// ghost hit: enters protected with the mark
+	*clock++
+	p.add(kazKey(2), cacheItem{size: kazTestBlock, atime: *clock})
+	k, ok := kazNextEvicted(p)
+	require.True(t, ok)
+	require.Equal(t, kazKey(2), k)
+	p.add(kazKey(2), cacheItem{size: kazTestBlock, atime: *clock})
+	require.Equal(t, kazProtected, p.keys[kazKey(2)].seg)
+	require.True(t, kazReadOf(t, p, kazKey(2)), "ghost hit marks")
+
+	// compaction outputs: protected without / with the mark, probation never
+	p.kazExpect(kazKey(20), kazProtected, *clock, false)
+	p.add(kazKey(20), cacheItem{size: kazTestBlock, atime: *clock})
+	require.Equal(t, kazProtected, p.keys[kazKey(20)].seg)
+	require.False(t, kazReadOf(t, p, kazKey(20)))
+	p.kazExpect(kazKey(21), kazProtected, *clock, true)
+	p.add(kazKey(21), cacheItem{size: kazTestBlock, atime: *clock})
+	require.True(t, kazReadOf(t, p, kazKey(21)))
+	p.kazExpect(kazKey(22), kazProbation, *clock, true)
+	p.add(kazKey(22), cacheItem{size: kazTestBlock, atime: *clock})
+	require.Equal(t, kazProbation, p.keys[kazKey(22)].seg)
+	require.False(t, kazReadOf(t, p, kazKey(22)), "a probation output has no mark")
+	kazVerify(t, p)
+
+	// a user read while protected marks
+	*clock++
+	p.get(kazKey(20))
+	require.True(t, kazReadOf(t, p, kazKey(20)))
+	kazVerify(t, p)
+
+	// kazPlacement reports the mark of protected sources only
+	p.kazExpect(kazKey(23), kazProtected, *clock, false)
+	p.add(kazKey(23), cacheItem{size: kazTestBlock, atime: *clock})
+	seg, _, read, ok := p.kazPlacement([]cacheKey{kazKey(23), kazKey(22)})
+	require.True(t, ok)
+	require.Equal(t, kazProtected, seg)
+	require.False(t, read, "no protected source has the mark")
+	seg, _, read, ok = p.kazPlacement([]cacheKey{kazKey(23), kazKey(1)})
+	require.True(t, ok)
+	require.Equal(t, kazProtected, seg)
+	require.True(t, read)
+	_, _, read, ok = p.kazPlacement([]cacheKey{kazKey(22)})
+	require.True(t, ok)
+	require.False(t, read)
+
+	// demotion clears the mark: 1, 2, 20, 21, 23 are protected; add two more
+	for i := uint64(100); i < 102; i++ {
+		*clock++
+		kazPromote(t, p, clock, i)
+	}
+	p.demoteOverflow()
+	require.Equal(t, kazProbation, p.keys[kazKey(1)].seg, "oldest atime is demoted with the option off")
+	require.False(t, kazReadOf(t, p, kazKey(1)), "demotion clears the mark")
+	require.True(t, p.keys[kazKey(1)].demoted)
+	kazVerify(t, p)
+
+	// the mark survives reset and re-add through restore
+	require.True(t, kazReadOf(t, p, kazKey(21)))
+	p.reset()
+	require.True(t, p.restore[kazKey(21)].read)
+	p.add(kazKey(21), cacheItem{size: kazTestBlock, atime: *clock})
+	require.True(t, kazReadOf(t, p, kazKey(21)))
+	seg, _, read, ok = p.kazPlacement([]cacheKey{kazKey(20)}) // from restore
+	require.True(t, ok)
+	require.Equal(t, kazProtected, seg)
+	require.True(t, read)
+}
+
+// TestKaz2QDemoteUnreadFirst checks the demotion order: with the option on,
+// unmarked protected blocks go first (oldest atime first) even when a marked
+// block is older, and marked blocks follow by atime once no unmarked block is
+// left; with the option off the order is by atime only.
+func TestKaz2QDemoteUnreadFirst(t *testing.T) {
+	// build: 101..104 marked (promoted by reads, oldest atimes), then
+	// 201..203 unmarked compaction outputs with newer atimes; 7 > limit 6
+	build := func(unreadFirst bool) (*kaz2QIndex, *uint32) {
+		p, clock := newKazTestIndexB(t, 10, 4, unreadFirst)
+		for i := uint64(101); i <= 104; i++ {
+			*clock++
+			kazPromote(t, p, clock, i)
+		}
+		for i := uint64(201); i <= 203; i++ {
+			*clock++
+			p.kazExpect(kazKey(i), kazProtected, *clock, false)
+			p.add(kazKey(i), cacheItem{size: kazTestBlock, atime: *clock})
+		}
+		kazVerify(t, p)
+		return p, clock
+	}
+	// demoted lists the keys demoted, in order, while the protected limit is
+	// lowered one block at a time down to n blocks (each limit sits half a
+	// block above the target so that float rounding cannot demote one more).
+	demoted := func(p *kaz2QIndex, n int64) []uint64 {
+		var got []uint64
+		for target := p.counts[kazProtected] - 1; target >= n; target-- {
+			before := map[uint64]bool{}
+			for k, it := range p.keys {
+				if it.seg == kazProtected {
+					before[k.id] = true
+				}
+			}
+			p.probationRatio = 1 - float64(target*kazTestBlock+kazTestBlock/2)/float64(p.capacity)
+			p.demoteOverflow()
+			for k, it := range p.keys {
+				if before[k.id] && it.seg == kazProbation {
+					got = append(got, k.id)
+				}
+			}
+			require.Equal(t, target, p.counts[kazProtected])
+		}
+		kazVerify(t, p)
+		return got
+	}
+
+	p, _ := build(true)
+	p.demoteOverflow() // 7 > 6: the oldest unmarked goes, not the older marked
+	require.Equal(t, kazProbation, p.keys[kazKey(201)].seg)
+	require.Equal(t, kazProtected, p.keys[kazKey(101)].seg)
+	require.Equal(t, []uint64{202, 203, 101, 102}, demoted(p, 2))
+
+	// a read of an unmarked block moves it behind the other unmarked ones
+	p, clock := build(true)
+	*clock++
+	p.get(kazKey(201))
+	require.True(t, kazReadOf(t, p, kazKey(201)))
+	kazVerify(t, p)
+	require.Equal(t, []uint64{202, 203, 101, 102, 103}, demoted(p, 2))
+
+	p, _ = build(false)
+	require.Equal(t, []uint64{101, 102, 103, 104, 201}, demoted(p, 2))
+}
+
+// TestKaz2QDemoteEvents checks that each demotion counts demote and one of
+// demote_unread / demote_read by the mark, and that all three are exported at
+// 0 as soon as metrics are attached.
+func TestKaz2QDemoteEvents(t *testing.T) {
+	m := newKaz2QMetrics()
+	ev := func(name string) float64 { return testutil.ToFloat64(m.events.WithLabelValues(name)) }
+	p, clock := newKazTestIndexB(t, 10, 4, true)
+	p.kazSetMetrics(m)
+	got := map[string]bool{}
+	ch := make(chan prometheus.Metric, 64)
+	m.events.Collect(ch)
+	close(ch)
+	for mt := range ch {
+		var d dto.Metric
+		require.NoError(t, mt.Write(&d))
+		for _, l := range d.GetLabel() {
+			got[l.GetValue()] = true
+		}
+		require.Zero(t, d.GetCounter().GetValue())
+	}
+	for _, n := range []string{"demote", "demote_unread", "demote_read"} {
+		require.True(t, got[n], "%s must be exported at 0", n)
+	}
+
+	for i := uint64(101); i <= 105; i++ { // marked
+		*clock++
+		kazPromote(t, p, clock, i)
+	}
+	for i := uint64(201); i <= 203; i++ { // unmarked
+		*clock++
+		p.kazExpect(kazKey(i), kazProtected, *clock, false)
+		p.add(kazKey(i), cacheItem{size: kazTestBlock, atime: *clock})
+	}
+	p.demoteOverflow() // 8 > 6: two unmarked
+	require.Equal(t, 2.0, ev("demote_unread"))
+	require.Equal(t, 0.0, ev("demote_read"))
+	p.probationRatio = 0.75 // limit 2.5 blocks: one unmarked, then three marked
+	p.demoteOverflow()
+	require.Equal(t, 3.0, ev("demote_unread"))
+	require.Equal(t, 3.0, ev("demote_read"))
+	require.Equal(t, ev("demote"), ev("demote_unread")+ev("demote_read"))
 }

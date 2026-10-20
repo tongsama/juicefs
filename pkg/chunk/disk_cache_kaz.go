@@ -130,7 +130,9 @@ type kazPlacementSource struct {
 // only if a protected source has whole set; share = protected if the bytes of
 // the protected sources are at least the share ratio of outBytes (the
 // non-hole bytes of the output block; 0 gives probation). In every mode the
-// atime is the newest among the cached sources. It returns whether the caller should
+// atime is the newest among the cached sources, and an output placed in
+// protected gets the read mark when a protected source has it (an output in
+// probation never does). It returns whether the caller should
 // cache the output and counts compaction_output_cached or
 // compaction_output_skipped. Sources that are only pending in memory, or
 // only in a legacy store, are not considered.
@@ -138,6 +140,7 @@ func (m *cacheManager) kazCompactionPlacement(outKey string, outBytes uint32, sr
 	var atime uint32
 	var protectedBytes uint64 // bytes copied from protected sources (share)
 	found, anyProtected, wholeProtected := false, false, false
+	protectedRead := false // some protected source has the read mark
 	for _, src := range srcs {
 		s := m.getStore(src.key)
 		if s == nil {
@@ -145,9 +148,10 @@ func (m *cacheManager) kazCompactionPlacement(outKey string, outBytes uint32, sr
 		}
 		s.Lock()
 		if idx, ok := s.keys.(*kaz2QIndex); ok {
-			if sg, at, ok := idx.kazPlacement([]cacheKey{s.getCacheKey(src.key)}); ok {
+			if sg, at, read, ok := idx.kazPlacement([]cacheKey{s.getCacheKey(src.key)}); ok {
 				if sg == kazProtected {
 					anyProtected = true
+					protectedRead = protectedRead || read
 					wholeProtected = wholeProtected || src.whole
 					protectedBytes += uint64(src.bytes)
 				}
@@ -178,7 +182,7 @@ func (m *cacheManager) kazCompactionPlacement(outKey string, outBytes uint32, sr
 					seg = kazProtected
 				}
 			}
-			idx.kazExpect(out.getCacheKey(outKey), seg, atime)
+			idx.kazExpect(out.getCacheKey(outKey), seg, atime, seg == kazProtected && protectedRead)
 			placed = true
 		}
 		out.Unlock()

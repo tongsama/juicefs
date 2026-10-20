@@ -115,7 +115,7 @@ func TestKazCacheStateRoundTrip(t *testing.T) {
 	require.True(t, dst.restoreFromFile)
 	it1 := src.keys[k1]
 	require.Equal(t, kazSaved{seg: kazProtected, atime: it1.atime, inserted: it1.inserted,
-		order: it1.order, origin: it1.origin, hits: 1}, dst.restore[k1])
+		order: it1.order, origin: it1.origin, hits: 1, read: true}, dst.restore[k1])
 	require.Equal(t, kazProbation, dst.restore[k2].seg)
 	require.Len(t, dst.restore, 2)
 	var ghosts []cacheKey
@@ -305,17 +305,54 @@ func kazResum(b []byte) []byte {
 	return binary.LittleEndian.AppendUint32(append([]byte{}, body...), crc32.ChecksumIEEE(body))
 }
 
-// TestKazCacheStateV2RoundTrip checks that the demoted mark of items and the
-// prior segment of evicted keys survive write -> read -> import, that the file
-// is written as version 2, and that out-of-range mark / prior bytes and an
-// unknown version are rejected.
-func TestKazCacheStateV2RoundTrip(t *testing.T) {
+// encodeKazCacheStateV2 builds a state file in the version 2 layout written
+// by 57b3de8a (a demoted mark per item and a prior per evicted key, no read
+// mark), so that the tests can check that the current reader still restores it.
+func encodeKazCacheStateV2(st kazCacheState) []byte {
+	le := binary.LittleEndian
+	var b []byte
+	b = append(b, kazStateMagic...)
+	b = le.AppendUint32(b, 2)
+	b = le.AppendUint32(b, st.savedAt)
+	b = le.AppendUint32(b, uint32(len(st.items)))
+	for _, it := range st.items {
+		b = le.AppendUint64(b, it.key.id)
+		b = le.AppendUint32(b, it.key.indx)
+		b = le.AppendUint32(b, uint32(int32(it.key.size)))
+		b = append(b, byte(it.seg), byte(it.origin), it.hits)
+		b = le.AppendUint32(b, it.atime)
+		b = le.AppendUint32(b, it.inserted)
+		b = le.AppendUint32(b, it.order)
+		var mark byte
+		if it.demoted {
+			mark = 1
+		}
+		b = append(b, mark)
+	}
+	b = le.AppendUint32(b, uint32(len(st.ghosts)))
+	for _, g := range st.ghosts {
+		b = le.AppendUint64(b, g.key.id)
+		b = le.AppendUint32(b, g.key.indx)
+		b = le.AppendUint32(b, g.key.size)
+		b = append(b, byte(g.prior))
+	}
+	return le.AppendUint32(b, crc32.ChecksumIEEE(b))
+}
+
+// TestKazCacheStateV3RoundTrip checks that the demoted and read marks of items
+// and the prior segment of evicted keys survive write -> read -> import ->
+// export, that the file is written as version 3, and that out-of-range mark /
+// prior bytes, a read mark on a probation item and an unknown version are
+// rejected.
+func TestKazCacheStateV3RoundTrip(t *testing.T) {
 	conf := kazStateTestConf()
 	k1 := cacheKey{id: 1, size: 1024}
 	k2 := cacheKey{id: 2, size: 2048}
+	k3 := cacheKey{id: 3, size: 4096}
 	st := kazCacheState{savedAt: kazTestStart, items: []kazStateItem{
 		{key: k1, kazSaved: kazSaved{seg: kazProbation, atime: 10, inserted: 11, order: 12, origin: kazOriginFill, hits: 2, demoted: true}},
 		{key: k2, kazSaved: kazSaved{seg: kazProtected, atime: 20, inserted: 21, order: 22, origin: kazOriginCompaction, hits: 1}},
+		{key: k3, kazSaved: kazSaved{seg: kazProtected, atime: 30, inserted: 31, order: 32, origin: kazOriginFill, hits: 0, read: true}},
 	}}
 	priors := []kazGhostPrior{kazPriorUnknown, kazPriorProbation, kazPriorDemoted, kazPriorProtected, kazPriorCompaction}
 	for i, pr := range priors {
@@ -323,8 +360,8 @@ func TestKazCacheStateV2RoundTrip(t *testing.T) {
 		st.ghosts = append(st.ghosts, kazGhost{key: k, size: 100, prior: pr})
 	}
 	data := encodeKazCacheState(st)
-	require.Equal(t, uint32(2), binary.LittleEndian.Uint32(data[len(kazStateMagic):]))
-	require.Len(t, data, kazStateHeader+4+2*(kazStateItemSize)+4+5*kazStateGhostSize+4)
+	require.Equal(t, uint32(3), binary.LittleEndian.Uint32(data[len(kazStateMagic):]))
+	require.Len(t, data, kazStateHeader+4+3*kazStateItemSize+4+5*kazStateGhostSize+4)
 	path := filepath.Join(t.TempDir(), "kaz-cache-state.v1")
 	require.NoError(t, writeKazCacheState(path, st))
 	got, err := readKazCacheState(path)
@@ -336,28 +373,38 @@ func TestKazCacheStateV2RoundTrip(t *testing.T) {
 	dst.kazImportState(got)
 	require.True(t, dst.restore[k1].demoted)
 	require.False(t, dst.restore[k2].demoted)
+	require.False(t, dst.restore[k2].read, "the stored mark wins over the hit count")
+	require.True(t, dst.restore[k3].read, "the stored mark wins over the hit count")
 	dst.add(k1, cacheItem{size: 1024, atime: 1})
 	require.True(t, dst.keys[k1].demoted)
+	dst.add(k3, cacheItem{size: 4096, atime: 1})
+	require.True(t, dst.keys[k3].read)
 	for i, pr := range priors {
 		require.Equal(t, pr, kazGhostPriorOf(t, dst, cacheKey{id: uint64(10 + i), size: 100}))
 	}
-	// the export carries the mark and the priors again
+	// the export carries the marks and the priors again
 	exp := dst.kazExportState()
 	require.ElementsMatch(t, st.items, exp.items)
 	require.Equal(t, st.ghosts, exp.ghosts)
 
-	itemMark := kazStateHeader + 4 + kazStateItemSize - 1 // mark byte of the first item
-	ghostPrior := len(data) - 4 - 1                       // prior byte of the last evicted key
+	item := kazStateHeader + 4 // first item (probation)
+	ghostPrior := len(data) - 4 - 1
 	bad := map[string][]byte{}
 	b := append([]byte{}, data...)
-	b[itemMark] = 2
-	bad["mark"] = kazResum(b)
+	b[item+kazStateItemSize-2] = 2
+	bad["demoted"] = kazResum(b)
+	b = append([]byte{}, data...)
+	b[item+2*kazStateItemSize-1] = 2
+	bad["read"] = kazResum(b)
+	b = append([]byte{}, data...)
+	b[item+kazStateItemSize-1] = 1
+	bad["read on probation"] = kazResum(b)
 	b = append([]byte{}, data...)
 	b[ghostPrior] = 5
 	bad["prior"] = kazResum(b)
 	b = append([]byte{}, data...)
-	binary.LittleEndian.PutUint32(b[len(kazStateMagic):], 3)
-	bad["version3"] = kazResum(b)
+	binary.LittleEndian.PutUint32(b[len(kazStateMagic):], 4)
+	bad["version4"] = kazResum(b)
 	b = append([]byte{}, data...)
 	binary.LittleEndian.PutUint32(b[len(kazStateMagic):], 0)
 	bad["version0"] = kazResum(b)
@@ -368,10 +415,89 @@ func TestKazCacheStateV2RoundTrip(t *testing.T) {
 	}
 }
 
+// TestKazCacheStateReadsV2 checks that a version 2 file (as written by
+// 57b3de8a, the running production version) is still restored: segments,
+// demoted marks and priors are kept, and the read mark of a protected item is
+// derived from its hit count (>= 1); probation items get no mark. A store that
+// loads it writes version 3 on its next save.
+func TestKazCacheStateReadsV2(t *testing.T) {
+	conf := kazStateTestConf()
+	k1 := cacheKey{id: 1, size: 1024}
+	k2 := cacheKey{id: 2, size: 2048}
+	k3 := cacheKey{id: 3, size: 4096}
+	g1 := cacheKey{id: 7, size: 512}
+	v2 := kazCacheState{savedAt: kazTestStart, items: []kazStateItem{
+		{key: k1, kazSaved: kazSaved{seg: kazProtected, atime: 10, inserted: 11, order: 12, origin: kazOriginFill, hits: 2}},
+		{key: k2, kazSaved: kazSaved{seg: kazProtected, atime: 20, inserted: 21, order: 22, origin: kazOriginCompaction, hits: 0}},
+		{key: k3, kazSaved: kazSaved{seg: kazProbation, atime: 30, inserted: 31, order: 32, origin: kazOriginFill, hits: 5, demoted: true}},
+	}, ghosts: []kazGhost{{key: g1, size: 512, prior: kazPriorDemoted}}}
+	data := encodeKazCacheStateV2(v2)
+	require.Len(t, data, kazStateHeader+4+3*kazStateV2ItemSize+4+kazStateGhostSize+4)
+	got, err := decodeKazCacheState(data)
+	require.NoError(t, err)
+	want := v2
+	want.items = append([]kazStateItem(nil), v2.items...)
+	want.items[0].read = true // protected with hits >= 1
+	require.Equal(t, want, got)
+	_, err = decodeKazCacheState(kazResum(data[:len(data)-1]))
+	require.Error(t, err)
+	b := append([]byte{}, data...)
+	b[kazStateHeader+4+kazStateV2ItemSize-1] = 2 // demoted mark of the first item
+	_, err = decodeKazCacheState(kazResum(b))
+	require.Error(t, err)
+
+	p := newKaz2QIndex(&conf)
+	p.kazSetCapacity(1 << 30)
+	m := newKaz2QMetrics()
+	p.kazSetMetrics(m)
+	p.kazImportState(got)
+	for _, k := range []cacheKey{k1, k2, k3} {
+		p.add(k, cacheItem{size: int32(k.size), atime: 5})
+	}
+	require.True(t, p.keys[k1].read)
+	require.False(t, p.keys[k2].read)
+	require.False(t, p.keys[k3].read)
+	require.True(t, p.keys[k3].demoted)
+	require.Equal(t, int64(2048), p.usedUnread)
+	require.Equal(t, 2048.0, testutil.ToFloat64(m.protectedUnread))
+	require.Equal(t, kazPriorDemoted, kazGhostPriorOf(t, p, g1))
+
+	// a store opened on a directory holding a version 2 file restores it,
+	// and its next save writes version 3
+	dir := kazStateDir(t)
+	s0 := newTestCacheStore(dir, &conf, nil)
+	prot := kazStoreKey(1)
+	old := time.Now().Add(-time.Hour)
+	kazWriteBlock(t, s0, prot)
+	require.NoError(t, os.Chtimes(s0.cachePath(prot), old, old))
+	saved := uint32(time.Now().Unix()) - 60
+	file := kazCacheState{savedAt: saved, items: []kazStateItem{
+		{key: s0.getCacheKey(prot), kazSaved: kazSaved{seg: kazProtected, atime: saved, inserted: saved - 10, order: saved - 10, origin: kazOriginFill, hits: 3}},
+	}}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, kazStateFile), encodeKazCacheStateV2(file), 0600))
+	s := newKazStateStore(t, dir, conf)
+	idx := s.keys.(*kaz2QIndex)
+	s.scanCached(false)
+	require.Zero(t, kazStateEvents(s, "state_load_failed"))
+	require.Equal(t, kazProtected, kazSeg(t, s, idx, prot))
+	s.Lock()
+	require.True(t, idx.keys[s.getCacheKey(prot)].read)
+	s.Unlock()
+	s.kazSaveState()
+	b, err = os.ReadFile(s.kazStatePath())
+	require.NoError(t, err)
+	require.Equal(t, uint32(3), binary.LittleEndian.Uint32(b[len(kazStateMagic):]))
+	st, err := decodeKazCacheState(b)
+	require.NoError(t, err)
+	require.Len(t, st.items, 1)
+	require.True(t, st.items[0].read)
+}
+
 // TestKazCacheStateReadsV1 checks that a version 1 file (as written by the
 // previous binary) is still restored: segments, atime and evicted keys are
 // kept, items have no demoted mark and evicted keys an unknown prior, which a
-// ghost hit counts as ghost_hit_probation.
+// ghost hit counts as ghost_hit_probation; a protected item with hits >= 1
+// gets the read mark.
 func TestKazCacheStateReadsV1(t *testing.T) {
 	conf := kazStateTestConf()
 	k1 := cacheKey{id: 1, size: 1024}
@@ -385,7 +511,10 @@ func TestKazCacheStateReadsV1(t *testing.T) {
 	require.Len(t, data, kazStateHeader+4+2*kazStateV1ItemSize+4+kazStateV1GhostSize+4)
 	got, err := decodeKazCacheState(data)
 	require.NoError(t, err)
-	require.Equal(t, v1, got) // no mark, prior 0
+	want := v1
+	want.items = append([]kazStateItem(nil), v1.items...)
+	want.items[0].read = true   // protected with hits >= 1
+	require.Equal(t, want, got) // no demoted mark, prior 0
 	// robustness checks hold for version 1 too
 	_, err = decodeKazCacheState(kazResum(data[:len(data)-1]))
 	require.Error(t, err)
@@ -402,6 +531,8 @@ func TestKazCacheStateReadsV1(t *testing.T) {
 	require.Equal(t, kazProtected, p.keys[k1].seg)
 	require.Equal(t, uint32(10), p.keys[k1].atime)
 	require.False(t, p.keys[k1].demoted)
+	require.True(t, p.keys[k1].read)
+	require.False(t, p.keys[k2].read)
 	require.Equal(t, kazProbation, p.keys[k2].seg)
 	require.Equal(t, uint32(20), p.keys[k2].atime)
 	require.Equal(t, kazPriorUnknown, kazGhostPriorOf(t, p, g1))
@@ -414,7 +545,7 @@ func TestKazCacheStateReadsV1(t *testing.T) {
 	require.Zero(t, ev("ghost_hit_protected"))
 
 	// a store opened on a directory holding a version 1 file restores it,
-	// and its next save writes version 2
+	// and its next save writes version 3
 	dir := kazStateDir(t)
 	s0 := newTestCacheStore(dir, &conf, nil)
 	prot, prob := kazStoreKey(1), kazStoreKey(2)
@@ -441,5 +572,5 @@ func TestKazCacheStateReadsV1(t *testing.T) {
 	s.kazSaveState()
 	b, err := os.ReadFile(s.kazStatePath())
 	require.NoError(t, err)
-	require.Equal(t, uint32(2), binary.LittleEndian.Uint32(b[len(kazStateMagic):]))
+	require.Equal(t, uint32(3), binary.LittleEndian.Uint32(b[len(kazStateMagic):]))
 }

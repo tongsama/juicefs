@@ -36,6 +36,7 @@ func applyKazCacheFlags(c *cli.Context, conf *chunk.Config) {
 	conf.KazCacheStateInterval = kazCacheDurationFlag("kaz-cache-state-interval", c.String("kaz-cache-state-interval"), 5*time.Minute)
 	conf.KazCacheCompactionPlacement = c.String("kaz-cache-compaction-placement")
 	conf.KazCacheCompactionPlacementShareRatio = c.Float64("kaz-cache-compaction-placement-share-ratio")
+	conf.KazCacheDemoteUnreadFirst = c.Bool("kaz-cache-demote-unread-first")
 }
 
 // kazCacheDurationFlag parses the value s of the kaz-2q duration flag name.

@@ -19,6 +19,8 @@ package chunk
 import (
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestKaz2QConfigSelfCheck verifies that SelfCheck keeps kaz-2q and normalizes
@@ -133,4 +135,27 @@ func TestKazConfigSelfCheckOnlyForKaz2Q(t *testing.T) {
 	if conf.KazCachePromoteDelay != 0 || conf.KazCacheGhostRatio != 0 {
 		t.Fatalf("zero delay/ghost changed: %+v", conf)
 	}
+}
+
+// TestKazDemoteUnreadFirstConfig checks that --kaz-cache-demote-unread-first
+// reaches the protected heap of a kaz-2q index (off by default), survives the
+// self-check and reset, and is ignored by other eviction policies, which do
+// not use a kaz-2q index.
+func TestKazDemoteUnreadFirstConfig(t *testing.T) {
+	conf := Config{CacheDir: "/tmp/x", CacheSize: 1 << 30, CacheEviction: EvictionKaz2Q, KazCacheDemoteUnreadFirst: true}
+	conf.SelfCheck("uuid")
+	require.True(t, conf.KazCacheDemoteUnreadFirst)
+	p := newKaz2QIndex(&conf)
+	require.True(t, p.prot.unreadFirst)
+	require.False(t, p.prob.unreadFirst)
+	p.reset()
+	require.True(t, p.prot.unreadFirst, "reset keeps the option")
+	require.False(t, newKaz2QIndex(&Config{CacheEviction: EvictionKaz2Q}).prot.unreadFirst)
+
+	lru := defaultConf
+	lru.CacheEviction = EvictionLRU
+	lru.KazCacheDemoteUnreadFirst = true
+	s := newTestCacheStore(t.TempDir(), &lru, nil)
+	_, isKaz := s.keys.(*kaz2QIndex)
+	require.False(t, isKaz)
 }

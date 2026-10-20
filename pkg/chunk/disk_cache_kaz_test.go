@@ -554,7 +554,7 @@ func TestKaz2QBytesByOrigin(t *testing.T) {
 			if r.Intn(2) == 0 {
 				seg = kazProtected
 			}
-			x.kazExpect(k, seg, *clock)
+			x.kazExpect(k, seg, *clock, false)
 			x.add(k, cacheItem{size: kazTestBlock, atime: *clock})
 		case 3, 4:
 			x.get(k)
@@ -596,4 +596,91 @@ func TestKaz2QBytesByOrigin(t *testing.T) {
 	// withdrawing one index leaves the share of the other
 	p.kazSetMetrics(nil)
 	kazCheckBytesByOrigin(t, m, q)
+}
+
+// kazUnreadOf returns the bytes of the protected, evictable items of p without
+// the read mark, computed from its key map.
+func kazUnreadOf(p *kaz2QIndex) int64 {
+	var n int64
+	for _, it := range p.keys {
+		if it.size > 0 && it.seg == kazProtected && !it.read {
+			n += int64(it.size)
+		}
+	}
+	return n
+}
+
+// TestKaz2QUnreadGaugeConsistent runs random operations on two indexes (one
+// with --kaz-cache-demote-unread-first) sharing one set of collectors and
+// checks after each one that the heaps and accounting hold (kazVerify), that
+// no probation item has the read mark, and that the protected-unread gauge
+// equals the unread protected bytes of both indexes (add, get, promotion,
+// demotion, eviction, ghost hit, compaction output, reset and re-add,
+// re-attaching the metrics).
+func TestKaz2QUnreadGaugeConsistent(t *testing.T) {
+	m := newKaz2QMetrics()
+	p, pclock := newKazTestIndexB(t, 20, 2, true)
+	q, qclock := newKazTestIndexB(t, 20, 2, false)
+	p.kazSetMetrics(m)
+	q.kazSetMetrics(m)
+	idx := []*kaz2QIndex{p, q}
+	clocks := []*uint32{pclock, qclock}
+	gauge := func() float64 { return testutil.ToFloat64(m.protectedUnread) }
+	r := rand.New(rand.NewSource(3))
+	for i := 0; i < 5000; i++ {
+		n := r.Intn(2)
+		x, clock := idx[n], clocks[n]
+		k := kazKey(uint64(r.Intn(60)))
+		*clock += uint32(r.Intn(240))
+		switch r.Intn(9) {
+		case 0, 1:
+			size := int32(1 + r.Intn(kazTestBlock))
+			if r.Intn(4) == 0 {
+				size = -size
+			}
+			x.add(k, cacheItem{size: size, atime: *clock})
+		case 2:
+			seg := kazProbation
+			if r.Intn(2) == 0 {
+				seg = kazProtected
+			}
+			x.kazExpect(k, seg, *clock, r.Intn(2) == 0)
+			x.add(k, cacheItem{size: kazTestBlock, atime: *clock})
+		case 3, 4:
+			x.get(k)
+		case 5:
+			x.remove(k, r.Intn(2) == 0)
+		case 6:
+			c := r.Intn(4)
+			for range x.evictionIter() {
+				if c--; c < 0 {
+					break
+				}
+			}
+		case 7:
+			if r.Intn(20) == 0 {
+				x.reset()
+			}
+		case 8:
+			if r.Intn(50) == 0 {
+				x.kazSetMetrics(m)
+			}
+		}
+		kazVerify(t, x)
+		for _, it := range x.keys {
+			if it.seg == kazProbation {
+				require.False(t, it.read, "probation item %v has the read mark", it.key)
+			}
+		}
+		require.Equal(t, kazUnreadOf(x), x.usedUnread)
+		require.Equal(t, float64(kazUnreadOf(p)+kazUnreadOf(q)), gauge())
+	}
+	ev := func(name string) float64 { return testutil.ToFloat64(m.events.WithLabelValues(name)) }
+	require.NotZero(t, ev("demote_unread"))
+	require.NotZero(t, ev("demote_read"))
+	require.NotZero(t, ev("ghost_hit"))
+	require.Equal(t, ev("demote"), ev("demote_unread")+ev("demote_read"))
+	// withdrawing one index leaves the share of the other
+	p.kazSetMetrics(nil)
+	require.Equal(t, float64(kazUnreadOf(q)), gauge())
 }

@@ -81,7 +81,12 @@ type kazItem struct {
 	origin    kazOrigin  // how it entered the cache
 	hits      uint8      // user hits, saturating
 	demoted   bool       // demoted from protected and not promoted since (set again on each demotion)
-	pos       int        // index in its segment heap, notInLru when not in a heap
+	// read is the read mark of a protected item: set when it enters protected
+	// by a user read (promotion, ghost hit), by a user read while protected,
+	// or when a compaction output enters protected from a marked protected
+	// source; cleared on demotion. Probation items never have it.
+	read bool
+	pos  int // index in its segment heap, notInLru when not in a heap
 }
 
 // kazSaved is the state of a key kept across reset() (and loaded from the
@@ -94,12 +99,14 @@ type kazSaved struct {
 	origin   kazOrigin
 	hits     uint8
 	demoted  bool
+	read     bool // read mark (kazItem.read)
 }
 
 // kazExpectation is the placement registered for a coming compaction output.
 type kazExpectation struct {
 	seg   kazSegment
 	atime uint32
+	read  bool   // read mark for a protected output: some protected source had it
 	at    uint32 // when it was registered
 }
 
@@ -142,10 +149,13 @@ type kazGhost struct {
 }
 
 // kazHeap is a min-heap of kazItem ordered by order (probation) or atime
-// (protected); ties prefer larger blocks, then lower keys.
+// (protected); ties prefer larger blocks, then lower keys. With unreadFirst
+// (protected under --kaz-cache-demote-unread-first) items without the read
+// mark come before marked ones, each group by atime.
 type kazHeap struct {
-	items   []*kazItem
-	byOrder bool
+	items       []*kazItem
+	byOrder     bool
+	unreadFirst bool
 }
 
 // rank returns the ordering time of an item in this heap.
@@ -162,6 +172,9 @@ func (h *kazHeap) Len() int { return len(h.items) }
 // Less implements heap.Interface (min-heap by rank).
 func (h *kazHeap) Less(i, j int) bool {
 	a, b := h.items[i], h.items[j]
+	if h.unreadFirst && a.read != b.read {
+		return !a.read
+	}
 	if ra, rb := h.rank(a), h.rank(b); ra != rb {
 		return ra < rb
 	}
@@ -199,7 +212,8 @@ func (h *kazHeap) Pop() any {
 }
 
 // kaz2QIndex is the kaz-2q KeyIndex: a 2Q cache with a probation segment
-// (ordered by order), a protected segment (ordered by atime), an evicted-key
+// (ordered by order), a protected segment (ordered by atime; unread items
+// first with --kaz-cache-demote-unread-first), an evicted-key
 // list and state kept across rescans. All methods run under the cacheStore
 // mutex, so it needs no locking of its own.
 type kaz2QIndex struct {
@@ -210,6 +224,8 @@ type kaz2QIndex struct {
 	counts [3]int64
 	// usedByOrigin splits used by the origin of the items (staging excluded).
 	usedByOrigin [3][kazOriginCount]int64
+	// usedUnread is the part of used[kazProtected] without the read mark.
+	usedUnread int64
 
 	capacity       int64   // bytes set by kazSetCapacity; 0 = no protected limit, no ghost list
 	probationRatio float64 // share of probation
@@ -245,6 +261,8 @@ type kaz2QIndex struct {
 	// index has added to the shared ghost gauges.
 	pubGhostBlocks int64
 	pubGhostBytes  int64
+	// pubUsedUnread is the share added to the shared protected_unread gauge.
+	pubUsedUnread int64
 }
 
 // newKaz2QIndex creates an empty kaz 2Q index from the (self-checked) config.
@@ -276,6 +294,7 @@ func newKaz2QIndex(conf *Config) *kaz2QIndex {
 	return &kaz2QIndex{
 		keys:           make(map[cacheKey]*kazItem),
 		prob:           kazHeap{byOrder: true},
+		prot:           kazHeap{unreadFirst: conf.KazCacheDemoteUnreadFirst},
 		probationRatio: ratio,
 		promoteDelay:   uint32(delay / time.Second),
 		ghostRatio:     ghost,
@@ -312,11 +331,13 @@ func (p *kaz2QIndex) kazSetMetrics(m *kaz2QMetrics) {
 		}
 		old.ghostBlocks.Sub(float64(p.pubGhostBlocks))
 		old.ghostBytes.Sub(float64(p.pubGhostBytes))
+		old.protectedUnread.Sub(float64(p.pubUsedUnread))
 	}
 	p.metrics = m
 	p.pubUsed, p.pubCounts = [3]int64{}, [3]int64{}
 	p.pubUsedByOrigin = [3][kazOriginCount]int64{}
 	p.pubGhostBlocks, p.pubGhostBytes = 0, 0
+	p.pubUsedUnread = 0
 	if m != nil { // export both segments from the start, even when empty
 		for _, s := range []kazSegment{kazProbation, kazProtected} {
 			m.blocks.WithLabelValues(s.String()).Add(0)
@@ -332,6 +353,10 @@ func (p *kaz2QIndex) kazSetMetrics(m *kaz2QMetrics) {
 		for g := kazPriorUnknown; g <= kazPriorMax; g++ {
 			m.events.WithLabelValues(g.event()).Add(0)
 		}
+		// the same for demote and its split by the read mark
+		for _, e := range []string{"demote", "demote_unread", "demote_read"} {
+			m.events.WithLabelValues(e).Add(0)
+		}
 	}
 	p.syncGauges()
 }
@@ -344,7 +369,7 @@ func (p *kaz2QIndex) event(name string) {
 }
 
 // syncGauges publishes the per-segment block and byte counts (also split by
-// origin) and the size of the evicted-key list. The gauges are shared by the stores of a cache
+// origin), the unread protected bytes and the size of the evicted-key list. The gauges are shared by the stores of a cache
 // manager, so only the change since the last sync of this index is added; the
 // gauges then hold the sum over all stores.
 func (p *kaz2QIndex) syncGauges() {
@@ -367,6 +392,10 @@ func (p *kaz2QIndex) syncGauges() {
 			}
 		}
 	}
+	if d := p.usedUnread - p.pubUsedUnread; d != 0 {
+		p.metrics.protectedUnread.Add(float64(d))
+		p.pubUsedUnread = p.usedUnread
+	}
 	if d := int64(p.ghost.Len()) - p.pubGhostBlocks; d != 0 {
 		p.metrics.ghostBlocks.Add(float64(d))
 		p.pubGhostBlocks += d
@@ -386,8 +415,9 @@ func (p *kaz2QIndex) heapOf(seg kazSegment) *kazHeap {
 }
 
 // link puts an evictable item into its segment heap and accounts its size
-// (per segment and per segment and origin). Staging items (size<0) stay only
-// in the map. A change of segment, size or origin goes unlink -> change -> link.
+// (per segment, per segment and origin, and unread protected). Staging items
+// (size<0) stay only in the map. A change of segment, size, origin or read
+// mark goes unlink -> change -> link.
 func (p *kaz2QIndex) link(it *kazItem) {
 	if it.size <= 0 {
 		return
@@ -396,6 +426,9 @@ func (p *kaz2QIndex) link(it *kazItem) {
 	p.used[it.seg] += int64(it.size)
 	p.usedByOrigin[it.seg][it.origin] += int64(it.size)
 	p.counts[it.seg]++
+	if it.seg == kazProtected && !it.read {
+		p.usedUnread += int64(it.size)
+	}
 }
 
 // unlink removes an item from its segment heap (if it is in one) and its
@@ -408,6 +441,9 @@ func (p *kaz2QIndex) unlink(it *kazItem) {
 	p.used[it.seg] -= int64(it.size)
 	p.usedByOrigin[it.seg][it.origin] -= int64(it.size)
 	p.counts[it.seg]--
+	if it.seg == kazProtected && !it.read {
+		p.usedUnread -= int64(it.size)
+	}
 }
 
 // name implements KeyIndex.
@@ -422,7 +458,8 @@ func (p *kaz2QIndex) name() string {
 // (inserted and order are now). An existing key only gets its size updated. A ghost
 // hit counts ghost_hit and one of ghost_hit_{probation,demoted,protected,compaction} by
 // the prior segment of the evicted key; it enters protected without the
-// demoted mark.
+// demoted mark and with the read mark. A protected compaction output gets the
+// read mark of its expectation; a restored key gets its saved marks.
 func (p *kaz2QIndex) add(key cacheKey, item cacheItem) {
 	if it, ok := p.keys[key]; ok {
 		p.updateSize(it, item.size)
@@ -439,6 +476,7 @@ func (p *kaz2QIndex) add(key cacheKey, item cacheItem) {
 		it.seg, it.atime, it.origin = e.seg, e.atime, kazOriginCompaction
 		if e.seg == kazProtected {
 			it.inserted, it.order = e.atime, e.atime
+			it.read = e.read
 		} else {
 			// probation: enter the newest end (and start the correlation
 			// period) now, keeping the inherited atime; with the old atime as
@@ -450,6 +488,7 @@ func (p *kaz2QIndex) add(key cacheKey, item cacheItem) {
 		delete(p.restore, key)
 		it.seg, it.atime, it.inserted, it.order = s.seg, s.atime, s.inserted, s.order
 		it.origin, it.hits, it.demoted = s.origin, s.hits, s.demoted
+		it.read = s.read && s.seg == kazProtected
 		if item.atime > it.atime { // the block was read after the state was saved
 			it.atime = item.atime
 		}
@@ -458,6 +497,7 @@ func (p *kaz2QIndex) add(key cacheKey, item cacheItem) {
 		it.seg = kazProtected
 		it.inserted, it.order = item.atime, item.atime
 		it.origin = kazOriginFill
+		it.read = true
 		p.event("ghost_hit")
 		p.event(g.prior.event())
 	} else {
@@ -477,11 +517,12 @@ func (p *kaz2QIndex) add(key cacheKey, item cacheItem) {
 }
 
 // updateSize changes the size of an existing item without changing its
-// segment; an upload completion (negative to positive) enters probation now.
+// segment; an upload completion (negative to positive) enters probation now
+// (without the read mark, which probation items never have).
 func (p *kaz2QIndex) updateSize(it *kazItem, size int32) {
 	if it.size < 0 && size > 0 {
 		now := p.now()
-		it.size, it.seg = size, kazProbation
+		it.size, it.seg, it.read = size, kazProbation, false
 		it.inserted, it.order = now, now
 		p.link(it)
 		return
@@ -509,9 +550,9 @@ func (p *kaz2QIndex) remove(key cacheKey, staging bool) *cacheItem {
 }
 
 // get implements KeyIndex as a user hit: it updates atime and hits, counts
-// the hit by origin, and promotes a probation block read after the
-// correlation period (clearing its demoted mark). It returns a copy of the
-// updated item.
+// the hit by origin, promotes a probation block read after the correlation
+// period (clearing its demoted mark, setting its read mark) and sets the read
+// mark of a protected block. It returns a copy of the updated item.
 func (p *kaz2QIndex) get(key cacheKey) *cacheItem {
 	it, ok := p.keys[key]
 	if !ok {
@@ -532,6 +573,7 @@ func (p *kaz2QIndex) get(key cacheKey) *cacheItem {
 		p.unlink(it)
 		it.seg = kazProtected
 		it.demoted = false
+		it.read = true
 		p.link(it)
 		p.event("promote")
 		p.syncGauges()
@@ -541,7 +583,12 @@ func (p *kaz2QIndex) get(key cacheKey) *cacheItem {
 			heap.Fix(&p.prob, it.pos)
 		}
 	default: // protected
-		if it.pos != notInLru {
+		if !it.read { // the mark changes the unread bytes and, with unreadFirst, the heap order
+			p.unlink(it)
+			it.read = true
+			p.link(it)
+			p.syncGauges()
+		} else if it.pos != notInLru {
 			heap.Fix(&p.prot, it.pos)
 		}
 	}
@@ -568,18 +615,20 @@ func (p *kaz2QIndex) kazSegmentOf(key cacheKey) (kazSegment, bool) {
 
 // kazPlacement decides where a compaction output goes from its source keys:
 // protected if any source is protected, probation if they are only in
-// probation (or staging), with the newest atime among them; ok is false when
-// no source is cached. A key not in the index but kept in restore (moved there
+// probation (or staging), with the newest atime among them; read reports
+// whether a protected source has the read mark; ok is false when no source is
+// cached. A key not in the index but kept in restore (moved there
 // by reset() during a rescan, or loaded from the state file) counts with its
 // saved segment and atime, so that a rescan window does not lose placements.
-func (p *kaz2QIndex) kazPlacement(keys []cacheKey) (seg kazSegment, atime uint32, ok bool) {
+func (p *kaz2QIndex) kazPlacement(keys []cacheKey) (seg kazSegment, atime uint32, read bool, ok bool) {
 	for _, k := range keys {
 		var kseg kazSegment
 		var katime uint32
+		var kread bool
 		if it, found := p.keys[k]; found {
-			kseg, katime = it.seg, it.atime
+			kseg, katime, kread = it.seg, it.atime, it.read
 		} else if s, found := p.restore[k]; found {
-			kseg, katime = s.seg, s.atime
+			kseg, katime, kread = s.seg, s.atime, s.read
 		} else {
 			continue
 		}
@@ -588,6 +637,7 @@ func (p *kaz2QIndex) kazPlacement(keys []cacheKey) (seg kazSegment, atime uint32
 		}
 		if kseg == kazProtected {
 			seg = kazProtected
+			read = read || kread
 		}
 		ok = true
 		if katime > atime {
@@ -597,15 +647,15 @@ func (p *kaz2QIndex) kazPlacement(keys []cacheKey) (seg kazSegment, atime uint32
 	return
 }
 
-// kazExpect registers the segment and atime the next add of key should use
-// (a compaction output). Expectations whose output never arrived are dropped
+// kazExpect registers the segment, atime and read mark (used only for
+// protected) the next add of key should use (a compaction output). Expectations whose output never arrived are dropped
 // here as well as on reset(): when the map outgrows expectPruneAt, entries
 // older than kazExpectTTL are removed and the threshold is set to twice the
 // remaining size (at least kazExpectPruneMin), so the scan cost is amortized
 // and the map stays bounded without rescans.
-func (p *kaz2QIndex) kazExpect(key cacheKey, seg kazSegment, atime uint32) {
+func (p *kaz2QIndex) kazExpect(key cacheKey, seg kazSegment, atime uint32, read bool) {
 	now := p.now()
-	p.expect[key] = kazExpectation{seg: seg, atime: atime, at: now}
+	p.expect[key] = kazExpectation{seg: seg, atime: atime, read: read, at: now}
 	if len(p.expect) > p.expectPruneAt {
 		p.pruneExpect(now)
 		p.expectPruneAt = max(2*len(p.expect), kazExpectPruneMin)
@@ -648,15 +698,16 @@ func (p *kaz2QIndex) reset() KeyIndex {
 	}
 	for k, it := range p.keys {
 		restore[k] = kazSaved{seg: it.seg, atime: it.atime, inserted: it.inserted,
-			order: it.order, origin: it.origin, hits: it.hits, demoted: it.demoted}
+			order: it.order, origin: it.origin, hits: it.hits, demoted: it.demoted, read: it.read}
 	}
 	p.restore, p.restoreFromFile = restore, false
 	p.pruneExpect(p.now())
 	p.keys = make(map[cacheKey]*kazItem, len(snap.keys))
 	p.prob = kazHeap{byOrder: true}
-	p.prot = kazHeap{}
+	p.prot = kazHeap{unreadFirst: p.prot.unreadFirst}
 	p.used, p.counts = [3]int64{}, [3]int64{}
 	p.usedByOrigin = [3][kazOriginCount]int64{}
+	p.usedUnread = 0
 	p.syncGauges()
 	return snap
 }
@@ -694,7 +745,7 @@ func (p *kaz2QIndex) evictionIter() func(yield func(key cacheKey, item cacheItem
 				} else if it.origin == kazOriginCompaction {
 					prior = kazPriorCompaction
 				}
-			} else if p.prot.Len() > 0 {
+			} else if p.prot.Len() > 0 { // in demotion order (unread first under unreadFirst)
 				it, ev, prior = p.prot.items[0], "evict_protected", kazPriorProtected
 			} else {
 				return
@@ -711,9 +762,12 @@ func (p *kaz2QIndex) evictionIter() func(yield func(key cacheKey, item cacheItem
 	}
 }
 
-// demoteOverflow moves the least recently read protected blocks to the newest
-// end of probation while protected is over its limit (no limit without a
-// capacity), marking them as demoted.
+// demoteOverflow moves protected blocks to the newest end of probation while
+// protected is over its limit (no limit without a capacity), marking them as
+// demoted and clearing their read mark. The order is the protected heap's:
+// least recently read first, or with --kaz-cache-demote-unread-first the
+// unmarked ones (least recently read first) before the marked ones. Each
+// demotion counts demote and demote_unread or demote_read.
 func (p *kaz2QIndex) demoteOverflow() {
 	if p.capacity <= 0 {
 		return
@@ -726,6 +780,12 @@ func (p *kaz2QIndex) demoteOverflow() {
 		it.seg = kazProbation
 		it.inserted, it.order = now, now
 		it.demoted = true
+		if it.read {
+			p.event("demote_read")
+		} else {
+			p.event("demote_unread")
+		}
+		it.read = false
 		p.link(it)
 		p.event("demote")
 	}

@@ -537,3 +537,55 @@ func TestKazCompactionPlacementShare(t *testing.T) {
 		})
 	}
 }
+
+// TestKaz2QReadMarkCompaction checks that kazCompactionPlacement carries the
+// read mark into a compaction output placed in protected only when a protected
+// source has it, and never into an output placed in probation. The outputs
+// are added to the index directly (not written through the disk cache).
+func TestKaz2QReadMarkCompaction(t *testing.T) {
+	f := newKazCompFixture(t, EvictionKaz2Q, "", true, 1, 2, 3)
+	cs := f.cs
+	m := f.store.bcache.(*cacheManager)
+	idx := cs.keys.(*kaz2QIndex)
+	f.read(t, context.Background(), 1, 0, 100) // user read: promote slice 1 with the mark
+	cs.Lock()
+	k1, k3 := cs.getCacheKey(f.keys[1]), cs.getCacheKey(f.keys[3])
+	require.Equal(t, kazProtected, idx.keys[k1].seg)
+	require.True(t, idx.keys[k1].read)
+	it := idx.keys[k3] // slice 3: protected without the mark
+	idx.unlink(it)
+	it.seg = kazProtected
+	idx.link(it)
+	cs.Unlock()
+
+	// place registers the output of id from srcs (under placement mode) and adds it.
+	place := func(id uint64, mode string, srcs ...uint64) kazItem {
+		cs.Lock()
+		idx.placement = mode
+		cs.Unlock()
+		out := kazCompKey(f.store.conf, id, kazCompSize)
+		var ps []kazPlacementSource
+		for _, s := range srcs {
+			ps = append(ps, kazPlacementSource{key: f.keys[s], whole: true, bytes: kazCompSize})
+		}
+		require.True(t, m.kazCompactionPlacement(out, kazCompSize, ps))
+		cs.Lock()
+		defer cs.Unlock()
+		k := cs.getCacheKey(out)
+		idx.add(k, cacheItem{size: kazCompSize, atime: idx.now()})
+		kazVerify(t, idx)
+		return *idx.keys[k]
+	}
+	o := place(101, KazPlacementInherit, 3, 1, 2)
+	require.Equal(t, kazProtected, o.seg)
+	require.True(t, o.read, "a protected source has the mark")
+	o = place(102, KazPlacementInherit, 3, 2)
+	require.Equal(t, kazProtected, o.seg)
+	require.False(t, o.read, "the protected source has no mark")
+	o = place(103, KazPlacementProbation, 1, 3)
+	require.Equal(t, kazProbation, o.seg)
+	require.False(t, o.read, "a probation output has no mark")
+	o = place(104, KazPlacementShare, 1)
+	require.Equal(t, kazProtected, o.seg)
+	require.True(t, o.read)
+}

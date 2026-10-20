@@ -33,26 +33,31 @@ import (
 // never see it. The file name keeps its ".v1" suffix; the layout version is
 // the field after the magic. Layout (little endian):
 //
-//	magic "KAZ2QST1" | version u32 (1 or 2) | savedAt u32
+//	magic "KAZ2QST1" | version u32 (1, 2 or 3) | savedAt u32
 //	items count u32, then per item:
 //	  id u64 | indx u32 | size i32 | seg u8 | origin u8 | hits u8 | atime u32 | inserted u32 | order u32
-//	  | demoted u8 (0 or 1; version 2 only)
+//	  | demoted u8 (0 or 1; version 2 and later)
+//	  | read u8 (0 or 1, the read mark; 1 only for protected; version 3 only)
 //	ghosts count u32, then per evicted key, oldest first:
-//	  id u64 | indx u32 | size u32 | prior u8 (0..4, kazGhostPrior; version 2 only)
+//	  id u64 | indx u32 | size u32 | prior u8 (0..4, kazGhostPrior; version 2 and later)
 //	CRC32 (IEEE) of everything before it, u32
 //
-// Version 2 is always written. Version 1 (written by bf9efe73) is still read:
-// its items have no demoted mark and its evicted keys an unknown prior (0).
-// Any other version is rejected, so the file is ignored.
+// Version 3 is always written. Version 2 (written by 57b3de8a) and version 1
+// (written by bf9efe73) are still read; their items have no read mark, so a
+// protected item gets it when its hit count is at least 1 (probation items
+// never have it). Version 1 items have no demoted mark and its evicted keys an
+// unknown prior (0). Any other version is rejected, so the file is ignored;
+// binaries before version 3 ignore a version 3 file the same way.
 const (
 	kazStateFile        = "kaz-cache-state.v1"
 	kazStateMagic       = "KAZ2QST1"
-	kazStateVersion     = uint32(2)
+	kazStateVersion     = uint32(3)
 	kazStateHeader      = len(kazStateMagic) + 4 + 4
 	kazStateV1ItemSize  = 8 + 4 + 4 + 1 + 1 + 1 + 4 + 4 + 4
 	kazStateV1GhostSize = 8 + 4 + 4
-	kazStateItemSize    = kazStateV1ItemSize + 1  // + demoted
-	kazStateGhostSize   = kazStateV1GhostSize + 1 // + prior
+	kazStateV2ItemSize  = kazStateV1ItemSize + 1  // + demoted
+	kazStateItemSize    = kazStateV2ItemSize + 1  // + read (version 3)
+	kazStateGhostSize   = kazStateV1GhostSize + 1 // + prior (versions 2 and 3)
 	kazFlushTimeout     = 30 * time.Second        // bound of the state flush at umount
 )
 
@@ -88,7 +93,7 @@ func (p *kaz2QIndex) kazExport(withRestore bool) kazCacheState {
 			continue
 		}
 		st.items = append(st.items, kazStateItem{key: k, kazSaved: kazSaved{seg: it.seg, atime: it.atime,
-			inserted: it.inserted, order: it.order, origin: it.origin, hits: it.hits, demoted: it.demoted}})
+			inserted: it.inserted, order: it.order, origin: it.origin, hits: it.hits, demoted: it.demoted, read: it.read}})
 	}
 	if withRestore {
 		for k, s := range p.restore {
@@ -131,7 +136,7 @@ func (p *kaz2QIndex) kazImportState(st kazCacheState) {
 	}
 }
 
-// encodeKazCacheState serializes a state in the file layout, version 2.
+// encodeKazCacheState serializes a state in the file layout, version 3.
 func encodeKazCacheState(st kazCacheState) []byte {
 	n := kazStateHeader + 4 + len(st.items)*kazStateItemSize + 4 + len(st.ghosts)*kazStateGhostSize + 4
 	b := make([]byte, 0, n)
@@ -148,11 +153,7 @@ func encodeKazCacheState(st kazCacheState) []byte {
 		b = le.AppendUint32(b, it.atime)
 		b = le.AppendUint32(b, it.inserted)
 		b = le.AppendUint32(b, it.order)
-		var mark byte
-		if it.demoted {
-			mark = 1
-		}
-		b = append(b, mark)
+		b = append(b, kazBoolByte(it.demoted), kazBoolByte(it.read))
 	}
 	b = le.AppendUint32(b, uint32(len(st.ghosts)))
 	for _, g := range st.ghosts {
@@ -164,9 +165,19 @@ func encodeKazCacheState(st kazCacheState) []byte {
 	return le.AppendUint32(b, crc32.ChecksumIEEE(b))
 }
 
-// decodeKazCacheState parses the file layout, version 1 or 2 (the per-item and
-// per-ghost sizes follow the version); any mismatch of magic, version,
-// length, CRC or field range is an error.
+// kazBoolByte encodes a mark of the state file as 0 or 1.
+func kazBoolByte(v bool) byte {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+// decodeKazCacheState parses the file layout, version 1, 2 or 3 (the per-item
+// and per-ghost sizes follow the version); any mismatch of magic, version,
+// length, CRC or field range (including a read mark on a probation item) is
+// an error. Items of versions 1 and 2 get the read mark when they are
+// protected with at least one hit.
 func decodeKazCacheState(b []byte) (kazCacheState, error) {
 	var st kazCacheState
 	le := binary.LittleEndian
@@ -186,6 +197,8 @@ func decodeKazCacheState(b []byte) (kazCacheState, error) {
 	switch version {
 	case 1:
 		itemSize, ghostSize = kazStateV1ItemSize, kazStateV1GhostSize
+	case 2:
+		itemSize = kazStateV2ItemSize
 	case kazStateVersion:
 	default:
 		return st, fmt.Errorf("unsupported version %d", version)
@@ -212,10 +225,17 @@ func decodeKazCacheState(b []byte) (kazCacheState, error) {
 			}
 			demoted = e[31] == 1
 		}
+		read := seg == kazProtected && e[18] >= 1 // versions 1 and 2: hits stand in
+		if version >= 3 {
+			if e[32] > 1 || (e[32] == 1 && seg != kazProtected) {
+				return st, fmt.Errorf("bad item %d", i)
+			}
+			read = e[32] == 1
+		}
 		st.items = append(st.items, kazStateItem{
 			key: cacheKey{id: le.Uint64(e), indx: le.Uint32(e[8:]), size: uint32(size)},
 			kazSaved: kazSaved{seg: seg, origin: kazOrigin(e[17]), hits: e[18],
-				atime: le.Uint32(e[19:]), inserted: le.Uint32(e[23:]), order: le.Uint32(e[27:]), demoted: demoted},
+				atime: le.Uint32(e[19:]), inserted: le.Uint32(e[23:]), order: le.Uint32(e[27:]), demoted: demoted, read: read},
 		})
 		off += itemSize
 	}

@@ -97,3 +97,26 @@ func TestKazCacheCompactionPlacementShareRatioFlag(t *testing.T) {
 		require.Equal(t, tc.want, conf.KazCacheCompactionPlacementShareRatio, "%v", tc.args)
 	}
 }
+
+// TestKazCacheDemoteUnreadFirstFlag checks that --kaz-cache-demote-unread-first
+// defaults to off and is copied into the chunk config (it only takes effect
+// under --cache-eviction kaz-2q, where the kaz-2q index reads it).
+func TestKazCacheDemoteUnreadFirstFlag(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{nil, false},
+		{[]string{"--kaz-cache-demote-unread-first"}, true},
+		{[]string{"--kaz-cache-demote-unread-first=false"}, false},
+	} {
+		set := flag.NewFlagSet("kaz-demote-unread-first-test", flag.ContinueOnError)
+		for _, f := range dataCacheFlags() {
+			require.NoError(t, f.Apply(set))
+		}
+		require.NoError(t, set.Parse(tc.args))
+		conf := &chunk.Config{}
+		applyKazCacheFlags(cli.NewContext(nil, set, nil), conf)
+		require.Equal(t, tc.want, conf.KazCacheDemoteUnreadFirst, "%v", tc.args)
+	}
+}
