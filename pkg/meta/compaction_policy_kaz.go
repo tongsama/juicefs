@@ -80,7 +80,7 @@ func newKazCompactionMetrics() *kazCompactionMetrics {
 		}, []string{"kind"}),
 		events: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "kaz_compaction_policy_events_total",
-			Help: "Decisions of the kaz compaction policy on read-triggered requests: read_below_min, pass.",
+			Help: "Decisions of the kaz compaction policy on read-triggered requests: read_below_min, pass, delta_below_trigger.",
 		}, []string{"event"}),
 		queueWait: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "kaz_compaction_queue_wait_seconds",
@@ -167,7 +167,26 @@ func (m *baseMeta) stopCompactionPolicy() {
 }
 
 // requestCompactionFromRead routes a read-triggered request through the policy, if any.
+//
+// In delta mode, for a chunk whose base count this client remembers, the request
+// is dropped (event delta_below_trigger) unless at least kazDeltaTrigger records
+// were added since the last plan; the count passed on is that number. Such a
+// request replaces the read-min check, which is meant for chunks that hold few
+// records. The event is counted even when no policy is attached.
 func (m *baseMeta) requestCompactionFromRead(inode Ino, chunk uint32, count, tier int) {
+	if n, ok := m.kazDeltaReadCount(inode, chunk, count); ok {
+		if n < kazDeltaTrigger {
+			if m.kazCompactMetrics != nil {
+				m.kazCompactMetrics.events.WithLabelValues("delta_below_trigger").Inc()
+			}
+			return
+		}
+		if p := m.kazCompact.Load(); p != nil {
+			p.event("pass")
+		}
+		m.requestBackgroundCompaction(inode, chunk, n, tier)
+		return
+	}
 	if p := m.kazCompact.Load(); p != nil {
 		p.requestFromRead(inode, chunk, count, tier)
 		return

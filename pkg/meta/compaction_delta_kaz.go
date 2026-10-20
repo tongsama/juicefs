@@ -153,3 +153,42 @@ func kazDeltaStats(ss []*slice, bs uint32, p *kazBlockPlan) kazDeltaPlanStats {
 func kazDeltaLogMode(event string) string {
 	return strings.ReplaceAll(event, "_", "-")
 }
+
+// kazCompactionWanted decides whether a write that grew chunk (inode, indx)
+// from prev to now records should request compaction, and returns the count to
+// give the priority scheduler hint. Without delta mode it is compactionWanted
+// (and now). In delta mode a chunk always holds hundreds of records, so it asks
+// once the records added since this client last planned the chunk reach
+// kazDeltaTrigger, and the hint is that number; at maxSlices it always asks so
+// the synchronous rewrite stays; with no usable base count (unknown, or larger
+// than now after a truncate or delete) it forgets the entry and falls back to
+// compactionWanted (spec §5.3).
+func (m *baseMeta) kazCompactionWanted(inode Ino, indx uint32, prev, now int) (bool, int) {
+	if !m.kazDeltaActive() {
+		return compactionWanted(prev, now), now
+	}
+	if now >= maxSlices {
+		return true, now
+	}
+	if b, ok := m.kazDeltaBases.get(inode, indx); ok {
+		if now >= b {
+			return now-b >= kazDeltaTrigger, now - b
+		}
+		m.kazDeltaBases.forget(inode, indx)
+	}
+	return compactionWanted(prev, now), now
+}
+
+// kazDeltaReadCount converts the record count of a read-triggered request into
+// the records added since the last plan, when delta mode is active and this
+// client remembers a base count not above count. ok is false otherwise and the
+// count is returned unchanged.
+func (m *baseMeta) kazDeltaReadCount(inode Ino, indx uint32, count int) (n int, ok bool) {
+	if !m.kazDeltaActive() {
+		return count, false
+	}
+	if b, found := m.kazDeltaBases.get(inode, indx); found && count >= b {
+		return count - b, true
+	}
+	return count, false
+}
