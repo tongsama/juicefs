@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -733,4 +734,100 @@ func TestKazCompactionHotAge(t *testing.T) {
 	require.Equal(t, kazProtected, o.seg, "hot-age reached")
 	require.True(t, o.read)
 	require.Equal(t, 6.0, hot())
+}
+
+// kazGetCount is an object storage wrapper that records the (off, limit) of every Get.
+type kazGetCount struct {
+	object.ObjectStorage
+	mu   sync.Mutex
+	gets [][2]int64
+}
+
+// Get records the range and forwards the request.
+func (s *kazGetCount) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
+	s.mu.Lock()
+	s.gets = append(s.gets, [2]int64{off, limit})
+	s.mu.Unlock()
+	return s.ObjectStorage.Get(ctx, key, off, limit, getters...)
+}
+
+// take returns the recorded Gets and clears the record.
+func (s *kazGetCount) take() [][2]int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g := s.gets
+	s.gets = nil
+	return g
+}
+
+// kazWholeReadRun writes one slice of size bytes to a counting storage, starts
+// a cached store with KazWholeReadMax=max (a 1 MiB memory cache, which avoids
+// the upstream rawFull race of the disk cache under -race, or no cache when
+// cacheOff), and returns the store, the counter and the data.
+func kazWholeReadRun(t *testing.T, size, max int, cacheOff bool) (*cachedStore, *kazGetCount, []byte) {
+	t.Helper()
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	cnt := &kazGetCount{ObjectStorage: mem}
+	conf := defaultConf
+	conf.CacheDir = "memory"
+	conf.CacheSize = 8 << 20
+	if cacheOff {
+		conf.CacheSize = 0
+	}
+	conf.FreeSpace = 0
+	conf.Prefetch = 0
+	conf.KazWholeReadMax = max
+	conf.BlockSize = 4 << 20 // the production block size; a 4 MiB slice is one block above the limit
+	data := make([]byte, size)
+	for i := range data {
+		data[i] = byte(i*7 + i/251)
+	}
+	// the object is written directly so that nothing is cached before the read
+	key := kazCompKey(conf, 77, size)
+	require.NoError(t, mem.Put(context.Background(), key, bytes.NewReader(data)))
+	store := NewCachedStore(cnt, conf, nil).(*cachedStore)
+	return store, cnt, data
+}
+
+// kazWholeReadAt reads n bytes at off of slice 77 and checks them against data.
+func kazWholeReadAt(t *testing.T, store *cachedStore, size int, data []byte, off, n int) {
+	t.Helper()
+	p := NewOffPage(n)
+	defer p.Release()
+	got, err := store.NewReader(77, size).ReadAt(context.Background(), p, off)
+	require.NoError(t, err)
+	require.Equal(t, n, got)
+	require.Equal(t, data[off:off+n], p.Data[:n])
+}
+
+// TestKazWholeReadSmallObject fetches a small object whole on the first small
+// read and serves later reads from the cache.
+func TestKazWholeReadSmallObject(t *testing.T) {
+	store, cnt, data := kazWholeReadRun(t, kazCompSize, 1<<20, false)
+	kazWholeReadAt(t, store, kazCompSize, data, 8<<10, 4<<10)
+	require.Equal(t, [][2]int64{{0, -1}}, cnt.take())
+	kazWholeReadAt(t, store, kazCompSize, data, 40<<10, 4<<10)
+	require.Empty(t, cnt.take())
+}
+
+// TestKazWholeReadDisabled keeps the range GET when KazWholeReadMax is 0.
+func TestKazWholeReadDisabled(t *testing.T) {
+	store, cnt, data := kazWholeReadRun(t, kazCompSize, 0, false)
+	kazWholeReadAt(t, store, kazCompSize, data, 8<<10, 4<<10)
+	require.Equal(t, [][2]int64{{8 << 10, 4 << 10}}, cnt.take())
+}
+
+// TestKazWholeReadLargeObject keeps the range GET for a block above the limit.
+func TestKazWholeReadLargeObject(t *testing.T) {
+	size := 4 << 20
+	store, cnt, data := kazWholeReadRun(t, size, 1<<20, false)
+	kazWholeReadAt(t, store, size, data, 8<<10, 4<<10)
+	require.Equal(t, [][2]int64{{8 << 10, 4 << 10}}, cnt.take())
+}
+
+// TestKazWholeReadCacheDisabled keeps the range GET when the cache is off.
+func TestKazWholeReadCacheDisabled(t *testing.T) {
+	store, cnt, data := kazWholeReadRun(t, kazCompSize, 1<<20, true)
+	kazWholeReadAt(t, store, kazCompSize, data, 8<<10, 4<<10)
+	require.Equal(t, [][2]int64{{8 << 10, 4 << 10}}, cnt.take())
 }

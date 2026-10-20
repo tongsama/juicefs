@@ -19,6 +19,7 @@ package cmd
 import (
 	"testing"
 
+	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli/v2"
@@ -118,4 +119,20 @@ func TestKazDeltaFlags(t *testing.T) {
 	// --kaz-compaction-delta-gap 0 means no joining, not the default.
 	z := metaConfFromArgs(t, "--kaz-compaction-mode", "delta", "--kaz-compaction-delta-gap", "0")
 	require.Equal(t, -1, z.KazCompactionDeltaGap)
+}
+
+// TestKazDeltaChunkConf enables whole-object reads of small objects only in delta mode.
+func TestKazDeltaChunkConf(t *testing.T) {
+	get := func(args ...string) *chunk.Config {
+		var conf *chunk.Config
+		app := &cli.App{Flags: cmdMount().Flags, Action: func(c *cli.Context) error {
+			conf = getChunkConf(c, &meta.Format{BlockSize: 4096})
+			return nil
+		}}
+		require.NoError(t, app.Run(append([]string{"juicefs"}, args...)))
+		return conf
+	}
+	require.Equal(t, 1<<20, get("--kaz-compaction-mode", "delta").KazWholeReadMax)
+	require.Equal(t, 0, get("--kaz-compaction-mode", "block").KazWholeReadMax)
+	require.Equal(t, 0, get().KazWholeReadMax)
 }

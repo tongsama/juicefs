@@ -38,6 +38,10 @@ func applyKazCacheFlags(c *cli.Context, conf *chunk.Config) {
 	conf.KazCacheCompactionPlacementShareRatio = c.Float64("kaz-cache-compaction-placement-share-ratio")
 	conf.KazCacheDemoteUnreadFirst = c.Bool("kaz-cache-demote-unread-first")
 	conf.KazCacheCompactionHotAge = kazCacheDurationFlag("kaz-cache-compaction-hot-age", c.String("kaz-cache-compaction-hot-age"), 0)
+	// delta compaction mode makes many small objects (delta slices): fetch them whole so later small reads hit the cache
+	if c.String("kaz-compaction-mode") == "delta" {
+		conf.KazWholeReadMax = 1 << 20
+	}
 }
 
 // kazCacheDurationFlag parses the value s of the kaz-2q duration flag name.
