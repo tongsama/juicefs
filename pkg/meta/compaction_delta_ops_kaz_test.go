@@ -226,5 +226,51 @@ func TestKazDeltaChunkOps(t *testing.T) {
 			require.Equal(t, 1, d.deletedIDs()[c.tier])
 			require.Zero(t, d.deletedIDs()[c.base])
 		})
+
+		// (g) Fallocate: a hole punched into part of the tier's range and then
+		// a zero range plus a punch over the rest. Each further compaction keeps
+		// the view, the tier slice stays while a record still points to it and
+		// is freed exactly once when the last one goes.
+		t.Run(backend+"/fallocate", func(t *testing.T) {
+			e := newKazDeltaEnv(t, backend)
+			c := kazDeltaOpsSetup(t, e)
+			zero := func(want []byte, lo, hi uint32) {
+				for i := lo; i < hi; i++ {
+					want[i] = 0
+				}
+			}
+			want := append([]byte(nil), c.view...)
+			tierRecs := len(kazTierRecords(e.records(t, c.inode), c.tier))
+
+			// Punch the first half of block 2: the tier records there are hidden.
+			require.Zero(t, e.Fallocate(Background(), c.inode, fallocPunchHole|fallocKeepSize, uint64(2*kazEB), uint64(kazEB/2), nil))
+			zero(want, 2*kazEB, 2*kazEB+kazEB/2)
+			require.Equal(t, want, e.store.view(e.records(t, c.inode), 16*kazEB))
+			after := kazRun(t, e, c.inode)
+			require.Equal(t, want, e.store.view(after, 16*kazEB))
+			left := len(kazTierRecords(after, c.tier))
+			require.Greater(t, left, 0)
+			require.Less(t, left, tierRecs)
+			require.NoError(t, e.en.doCleanupSlices(Background(), nil))
+			kazRequireAlive(t, e, c.base, c.tier)
+
+			// Punch the rest of block 2 and zero blocks 5 to 11 (inside the file,
+			// so the length stays): no tier record is visible any more.
+			require.Zero(t, e.Fallocate(Background(), c.inode, fallocPunchHole|fallocKeepSize, uint64(2*kazEB+kazEB/2), uint64(kazEB/2), nil))
+			require.Zero(t, e.Fallocate(Background(), c.inode, fallocZeroRange, uint64(5*kazEB), uint64(7*kazEB), nil))
+			zero(want, 2*kazEB+kazEB/2, 3*kazEB)
+			zero(want, 5*kazEB, 12*kazEB)
+			require.Equal(t, want, e.store.view(e.records(t, c.inode), 16*kazEB))
+			after = kazRun(t, e, c.inode)
+			require.Equal(t, want, e.store.view(after, 16*kazEB))
+			require.Empty(t, kazTierRecords(after, c.tier))
+			require.NoError(t, e.en.doCleanupSlices(Background(), nil))
+			require.Equal(t, 1, e.deletedIDs()[c.tier])
+			kazRequireAlive(t, e, c.base)
+
+			ids := append(append([]uint64(nil), c.ids...), e.store.callIDs()[1:]...)
+			kazDeltaUnlink(t, e, c.name)
+			kazRequireDeletedOnce(t, e, ids)
+		})
 	}
 }
