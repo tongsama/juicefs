@@ -23,6 +23,9 @@ type kazBlockOut struct {
 	length uint32  // bytes the record covers
 	mask   bool    // zero record (id 0) hiding kept data; no object is written
 	pieces []Slice // visible pieces copied into a new slice when mask is false
+	// delta marks a range of the plan's one new delta tier: every delta out of a
+	// plan shares one slice holding their pieces concatenated in plan order.
+	delta bool
 }
 
 // kazBlockPlan is the outcome of planning one block compaction of a chunk.
@@ -33,6 +36,7 @@ type kazBlockPlan struct {
 	removed []*slice      // records dropped from the chunk
 	outs    []kazBlockOut // new records in ascending chunk order
 	hidden  float64       // share of kept data hidden in the partial result
+	event   string        // delta plan kind (delta_tier, ...); empty for block plans
 }
 
 // kazBlockGeom answers block questions for one chunk: block size and data extent.

@@ -98,18 +98,39 @@ func (f *kazFakeStore) callIDs() []uint64 {
 }
 
 // applyKazPlan returns the records a chunk holds after plan p, writing each
-// data output into f under a fresh id taken from next.
+// data output into f under a fresh id taken from next. Delta outputs share one
+// tier slice (the first fresh id): their pieces are concatenated in plan order
+// and each gets a record into that slice at the cumulative offset.
 func applyKazPlan(t *testing.T, f *kazFakeStore, p *kazBlockPlan, next *uint64) []*slice {
 	t.Helper()
 	out := append([]*slice(nil), p.kept...)
+	var tier uint64
+	var tierPieces []Slice
+	var tierSize uint32
 	for _, o := range p.outs {
-		if o.mask {
-			out = append(out, &slice{pos: o.pos, len: o.length})
-			continue
+		if o.delta {
+			tierPieces = append(tierPieces, o.pieces...)
+			tierSize += o.length
 		}
+	}
+	if tierSize > 0 {
 		*next++
-		require.NoError(t, f.compact(o.pieces, *next, uint8(0)))
-		out = append(out, &slice{pos: o.pos, id: *next, size: o.length, len: o.length})
+		tier = *next
+		require.NoError(t, f.compact(tierPieces, tier, uint8(0)))
+	}
+	var off uint32
+	for _, o := range p.outs {
+		switch {
+		case o.mask:
+			out = append(out, &slice{pos: o.pos, len: o.length})
+		case o.delta:
+			out = append(out, &slice{pos: o.pos, id: tier, size: tierSize, off: off, len: o.length})
+			off += o.length
+		default:
+			*next++
+			require.NoError(t, f.compact(o.pieces, *next, uint8(0)))
+			out = append(out, &slice{pos: o.pos, id: *next, size: o.length, len: o.length})
+		}
 	}
 	return out
 }
