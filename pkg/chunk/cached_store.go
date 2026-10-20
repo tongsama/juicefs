@@ -131,7 +131,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	key := s.key(indx)
 	if s.store.conf.CacheEnabled() {
 		start := time.Now()
-		r, err := s.store.bcache.load(key)
+		r, err := s.store.kazLoadForRead(ctx, key)
 		if err == nil {
 			n, err = r.ReadAt(p, int64(boff))
 			if !s.store.conf.OSCache {
@@ -160,7 +160,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		}
 	}
 
-	if s.store.conf.FinishCanceledGet && s.store.conf.CacheEnabled() && s.store.shouldCache(blockSize) {
+	if s.store.conf.FinishCanceledGet && s.store.conf.CacheEnabled() && s.store.shouldCache(blockSize) && !s.store.kazCompactionRead(ctx) {
 		return s.readBlockDetached(ctx, p, key, boff, blockSize)
 	}
 
@@ -171,7 +171,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		} else {
 			tmp.Acquire()
 		}
-		err = s.store.load(ctx, key, tmp, s.store.shouldCache(blockSize), false)
+		err = s.store.load(ctx, key, tmp, s.store.shouldCache(blockSize) && !s.store.kazCompactionRead(ctx), false)
 		return tmp, err
 	})
 	defer block.Release()
@@ -238,6 +238,7 @@ type wSlice struct {
 	pendings    int
 	writeback   bool
 	tierID      uint8
+	kazSources  func(indx int) []KazBlockRef // kaz-2q: source blocks of a compaction output (cached_store_kaz.go)
 }
 
 func sliceForWrite(id uint64, store *cachedStore, tierID uint8) *wSlice {
@@ -364,7 +365,9 @@ func (store *cachedStore) upload(ctx context.Context, key string, block *Page, s
 		buf.Acquire()
 	}
 	defer buf.Release()
-	if sync && (blen < store.conf.BlockSize || store.conf.CacheLargeWrite) {
+	if sync && s.kazSources != nil {
+		store.kazCacheCompactionOutput(key, block, s.kazSources)
+	} else if sync && (blen < store.conf.BlockSize || store.conf.CacheLargeWrite) {
 		// block will be freed after written into disk
 		store.bcache.cache(key, block, false, false)
 	}
@@ -586,6 +589,24 @@ type Config struct {
 	// GetHeaderTimeout bounds only the wait for the response headers of a full-block GET
 	// (0 disables it). GetTimeout still bounds the whole GET, headers and body together.
 	GetHeaderTimeout time.Duration
+
+	// kaz-2q cache eviction options (used only when CacheEviction is kaz-2q).
+	// KazCacheProbationRatio is the share of the cache capacity for newly cached blocks (0 < x < 1).
+	KazCacheProbationRatio float64
+	// KazCachePromoteDelay is the correlated-reference period before a block can be promoted.
+	KazCachePromoteDelay time.Duration
+	// KazCacheGhostRatio is the evicted-key list capacity as a multiple of the cache capacity (0 disables).
+	KazCacheGhostRatio float64
+	// KazCacheStateInterval is the save interval of the kaz-cache-state.v1 file.
+	KazCacheStateInterval time.Duration
+	// KazCacheCompactionPlacement selects the segment of a compaction output (inherit, probation, replace, share).
+	KazCacheCompactionPlacement string
+	// KazCacheCompactionPlacementShareRatio is the protected share threshold of the share placement (0 < x <= 1).
+	KazCacheCompactionPlacementShareRatio float64
+	// KazCacheDemoteUnreadFirst demotes protected blocks without the read mark before those with it.
+	KazCacheDemoteUnreadFirst bool
+	// KazCacheCompactionHotAge keeps protected compaction outputs younger than this out of protected placement (0 disables).
+	KazCacheCompactionHotAge time.Duration
 }
 
 func (c *Config) SelfCheck(uuid string) {
@@ -649,13 +670,20 @@ func (c *Config) SelfCheck(uuid string) {
 	}
 	if c.CacheEviction == "" {
 		c.CacheEviction = Eviction2Random
-	} else if c.CacheEviction != Eviction2Random && c.CacheEviction != EvictionNone && c.CacheEviction != EvictionLRU {
-		logger.Warnf("cache-eviction should be one of [%s, %s, %s]", EvictionNone, Eviction2Random, EvictionLRU)
+	} else if c.CacheEviction != Eviction2Random && c.CacheEviction != EvictionNone && c.CacheEviction != EvictionLRU && c.CacheEviction != EvictionKaz2Q {
+		logger.Warnf("cache-eviction should be one of [%s, %s, %s, %s]", EvictionNone, Eviction2Random, EvictionLRU, EvictionKaz2Q)
 		c.CacheEviction = Eviction2Random
 	}
 	if c.CacheDir == "memory" && c.CacheEviction == EvictionLRU {
 		logger.Warnf("LRU eviction is not supported in memory cache mode yet, setting it to 2-random")
 		c.CacheEviction = Eviction2Random
+	}
+	if c.CacheDir == "memory" && c.CacheEviction == EvictionKaz2Q {
+		logger.Warnf("kaz-2q eviction is not supported in memory cache mode, setting it to 2-random")
+		c.CacheEviction = Eviction2Random
+	}
+	if c.CacheEviction == EvictionKaz2Q {
+		c.kazCacheSelfCheck()
 	}
 	if c.CacheExpire > 0 && c.CacheExpire < time.Second {
 		logger.Warnf("cache-expire it too short, setting it to 1 second")
@@ -836,7 +864,9 @@ func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page,
 	store.objectDataBytes.WithLabelValues("GET", sc).Add(float64(n))
 	store.objectReqsHistogram.WithLabelValues("GET", sc).Observe(used.Seconds())
 	if err == nil {
-		store.fetcher.fetch(key)
+		if !store.kazCompactionRead(ctx) {
+			store.fetcher.fetch(key)
+		}
 		return n, nil
 	}
 	store.objectReqErrors.Add(1)

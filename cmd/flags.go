@@ -368,7 +368,46 @@ func dataCacheFlags() []cli.Flag {
 		&cli.StringFlag{
 			Name:  "cache-eviction",
 			Value: chunk.Eviction2Random,
-			Usage: fmt.Sprintf("cache eviction policy [%s, %s, %s]", chunk.EvictionNone, chunk.Eviction2Random, chunk.EvictionLRU),
+			Usage: fmt.Sprintf("cache eviction policy [%s, %s, %s, %s]", chunk.EvictionNone, chunk.Eviction2Random, chunk.EvictionLRU, chunk.EvictionKaz2Q),
+		},
+		&cli.Float64Flag{
+			Name:  "kaz-cache-probation-ratio",
+			Value: 0.4,
+			Usage: "[kaz] share of the cache capacity for newly cached blocks under --cache-eviction kaz-2q (0 < x < 1)",
+		},
+		&cli.StringFlag{
+			Name:  "kaz-cache-promote-delay",
+			Value: "10m",
+			Usage: "[kaz] correlated-reference period before a cached block can be promoted under --cache-eviction kaz-2q",
+		},
+		&cli.Float64Flag{
+			Name:  "kaz-cache-ghost-ratio",
+			Value: 4,
+			Usage: "[kaz] capacity of the evicted-key list as a multiple of the cache capacity under --cache-eviction kaz-2q (0 disables)",
+		},
+		&cli.StringFlag{
+			Name:  "kaz-cache-state-interval",
+			Value: "5m",
+			Usage: "[kaz] save interval of the kaz-cache-state.v1 file under --cache-eviction kaz-2q",
+		},
+		&cli.StringFlag{
+			Name:  "kaz-cache-compaction-placement",
+			Value: "inherit",
+			Usage: "[kaz] segment of a cached compaction output block under --cache-eviction kaz-2q: inherit (protected if any source block is protected), probation (always probation), replace (protected only if a protected source block was copied whole into it), share (protected if the bytes copied from protected source blocks are at least --kaz-cache-compaction-placement-share-ratio of its non-hole bytes); an output is cached only when a source block is cached",
+		},
+		&cli.Float64Flag{
+			Name:  "kaz-cache-compaction-placement-share-ratio",
+			Value: 0.5,
+			Usage: "[kaz] threshold of --kaz-cache-compaction-placement share: the share of an output block's non-hole bytes copied from protected source blocks needed to cache it in protected (0 < x <= 1; used only with share)",
+		},
+		&cli.BoolFlag{
+			Name:  "kaz-cache-demote-unread-first",
+			Usage: "[kaz] under --cache-eviction kaz-2q, when the protected segment overflows, demote the protected blocks not read since they entered it (e.g. compaction outputs) first, oldest read first, and the read ones only after them; the same order applies to direct eviction from protected when probation is empty; off orders both by last read time only",
+		},
+		&cli.StringFlag{
+			Name:  "kaz-cache-compaction-hot-age",
+			Value: "0",
+			Usage: "[kaz] under --cache-eviction kaz-2q, a source block that is itself a compaction output cached less than this ago does not count as a protected source when placing a compaction output (no share bytes, no read mark); an output left without another protected source goes to probation (0 disables)",
 		},
 		&cli.StringFlag{
 			Name:  "cache-scan-interval",

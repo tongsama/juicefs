@@ -160,6 +160,7 @@ func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64
 		c.dir, humanize.FtoaWithDigits(float64((1-usage.br)*100), 1), humanize.FtoaWithDigits(float64((1-usage.fr)*100), 1))
 
 	c.setLimitByFreeRatio(usage, c.freeRatio)
+	c.kazAttach(c.capacity)
 
 	c.createLockFile()
 	go c.checkLockFile()
@@ -461,7 +462,7 @@ func (cache *cacheStore) cache(key string, p *Page, force, dropCache bool) {
 		return
 	}
 	k := cache.getCacheKey(key)
-	if cache.keys.get(k) != nil {
+	if kazLookupNoTouch(cache.keys, k) != nil {
 		return
 	}
 	p.Acquire()
@@ -773,7 +774,7 @@ func (cache *cacheStore) exist(key string) (bool, error) {
 		return true, nil
 	}
 	k := cache.getCacheKey(key)
-	if cache.scanned && cache.keys.get(k) == nil {
+	if cache.scanned && kazLookupNoTouch(cache.keys, k) == nil {
 		return false, errNotCached
 	}
 	cache.Unlock()
@@ -831,7 +832,7 @@ func (cache *cacheStore) add(key string, size int32, atime uint32) {
 	k := cache.getCacheKey(key)
 	cache.Lock()
 	defer cache.Unlock()
-	iter := cache.keys.get(k)
+	iter := kazLookupNoTouch(cache.keys, k)
 	if iter == nil {
 		iter = &cacheItem{size: size, atime: atime}
 	} else {

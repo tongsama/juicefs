@@ -469,6 +469,7 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 	if chunkConf.DownloadLimit == 0 {
 		chunkConf.DownloadLimit = format.DownloadLimit * 1e6 / 8
 	}
+	applyKazCacheFlags(c, chunkConf)
 	chunkConf.SelfCheck(format.UUID)
 	return chunkConf
 }
@@ -740,6 +741,9 @@ func mount(c *cli.Context) error {
 	mountMain(v, c)
 	if err := v.FlushAll(""); err != nil {
 		logger.Errorf("flush all delayed data: %s", err)
+	}
+	if s, ok := store.(interface{ KazFlushCacheState() }); ok {
+		s.KazFlushCacheState()
 	}
 	err = metaCli.CloseSession()
 	object.Shutdown(blob)
