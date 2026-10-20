@@ -178,7 +178,7 @@ func storageFlags() []cli.Flag {
 		&cli.StringFlag{
 			Name:  "kaz-compaction-mode",
 			Value: "upstream",
-			Usage: "[kaz] how compaction rewrites a chunk: upstream (the whole merged range as one new slice), block (only the blocks changed since the last compaction, one new slice per block; juicefs compact and gc --compact leave every chunk as one slice per block with no hidden data) or delta (like block, but scattered small changes over existing blocks are packed into one small slice per compaction; see --kaz-compaction-delta-*); the synchronous compaction at 2500 slices stays upstream",
+			Usage: "[kaz] how compaction rewrites a chunk: upstream (the whole merged range as one new slice), block (only the blocks changed since the last compaction, one new slice per block; juicefs compact and gc --compact leave every chunk as one slice per block with no hidden data) or delta (like block, but scattered small changes over existing blocks are packed into one small slice per compaction; see --kaz-compaction-delta-*; on TKV engines (TiKV, etcd, BadgerDB, FoundationDB) delta falls back to block; do not run reflink copies (copy_file_range, cp --reflink) from unmodified clients while compaction runs); the synchronous compaction at 2500 slices stays upstream",
 		},
 		&cli.Float64Flag{
 			Name:  "kaz-compaction-block-hidden-ratio",
