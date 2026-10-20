@@ -37,6 +37,9 @@ type kazBlockPlan struct {
 	outs    []kazBlockOut // new records in ascending chunk order
 	hidden  float64       // share of kept data hidden in the partial result
 	event   string        // delta plan kind (delta_tier, ...); empty for block plans
+	// foldBlocks counts the blocks a delta plan rewrites to stay under the
+	// record limit (all data blocks when the fold ends in a whole rewrite).
+	foldBlocks int
 }
 
 // kazBlockGeom answers block questions for one chunk: block size and data extent.

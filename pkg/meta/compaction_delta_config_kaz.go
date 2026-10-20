@@ -37,7 +37,7 @@ const (
 	kazDeltaTrigger = 99
 	// kazDeltaFoldMargin is the headroom kept below the record limit before folding.
 	kazDeltaFoldMargin = 50
-	// kazDeltaBaseCap is the largest base slice size a delta tier may reference.
+	// kazDeltaBaseCap bounds the per-chunk base counts remembered by kazDeltaBaseTable.
 	kazDeltaBaseCap = 65536
 )
 

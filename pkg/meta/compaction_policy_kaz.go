@@ -72,11 +72,11 @@ func newKazCompactionMetrics() *kazCompactionMetrics {
 	return &kazCompactionMetrics{
 		block: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "kaz_compaction_block_events_total",
-			Help: "Kaz block compaction outcomes: noop, partial, full, wasted, error, fallback_upstream.",
+			Help: "Kaz block compaction outcomes: noop, partial, full, wasted, error, fallback_upstream, fallback_block, delta_noop, delta_tier, delta_merge, delta_fold, delta_prune, delta_block_fallback, delta_hidden_full.",
 		}, []string{"event"}),
 		amount: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "kaz_compaction_block_amount_total",
-			Help: "Kaz block compaction amounts: blocks_written, masks, removed (records dropped).",
+			Help: "Kaz block compaction amounts: blocks_written, masks, removed (records dropped), delta_bytes, delta_records, delta_fold_blocks.",
 		}, []string{"kind"}),
 		events: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "kaz_compaction_policy_events_total",

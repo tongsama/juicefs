@@ -34,7 +34,8 @@ const (
 	kazDeltaEventMerge    = "delta_merge"          // every earlier tier packed again with the new records
 	kazDeltaEventFold     = "delta_fold"           // blocks rewritten to stay under the record limit
 	kazDeltaEventPrune    = "delta_prune"          // only hidden records dropped, nothing uploaded
-	kazDeltaEventFallback = "delta_block_fallback" // block plan used instead (PUT bound or hidden base)
+	kazDeltaEventFallback = "delta_block_fallback" // block plan used instead (PUT bound, spec §5.4-6)
+	kazDeltaEventHidden   = "delta_hidden_full"    // whole rewrite: too much base data hidden (§5.4-7)
 )
 
 // kazClassify returns the kind of every record of a chunk (spec §5.2 of the kaz
@@ -303,20 +304,28 @@ func planKazDelta(ss []*slice, blockSize uint32, c kazDeltaConf) (*kazBlockPlan,
 	// Steps 6-8: build, folding blocks while over the record limit.
 	drop, t := d.build()
 	p := d.outs(drop, t)
-	folded := false
+	folded, foldBlocks := false, 0
 	if len(p.kept)+len(p.outs) > c.maxRecords {
 		folded = true
 		target := c.maxRecords - kazDeltaFoldMargin
 		for len(p.kept)+len(p.outs) > target {
 			b, ok := d.foldCandidate(drop, t)
 			if !ok {
-				return kazDeltaWhole(ss, blockSize, c, kazDeltaEventFold)
+				wp, wn := kazDeltaWhole(ss, blockSize, c, kazDeltaEventFold)
+				for _, o := range wp.outs {
+					if !o.mask {
+						wp.foldBlocks++
+					}
+				}
+				return wp, wn
 			}
 			d.fset[b] = true
+			foldBlocks++
 			drop, t = d.build()
 			p = d.outs(drop, t)
 		}
 	}
+	p.foldBlocks = foldBlocks
 
 	// Step 9: never upload more than block mode's partial rewrite would.
 	if kazPlanPutBytes(p) > d.smallTouchedBytes() {
@@ -331,7 +340,7 @@ func planKazDelta(ss []*slice, blockSize uint32, c kazDeltaConf) (*kazBlockPlan,
 	// Step 10: too much of the base hidden: rewrite the chunk whole.
 	p.hidden = d.baseHiddenShare(p, drop)
 	if p.hidden > c.hiddenRatio {
-		return kazDeltaWhole(ss, blockSize, c, kazDeltaEventFallback)
+		return kazDeltaWhole(ss, blockSize, c, kazDeltaEventHidden)
 	}
 	if len(p.removed) == 0 && len(p.outs) == 0 {
 		return nil, noopBase

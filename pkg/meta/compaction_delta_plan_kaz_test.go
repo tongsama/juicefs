@@ -549,3 +549,24 @@ func TestPlanKazDeltaPatternsVsBlock(t *testing.T) {
 		require.LessOrEqual(t, d*c.factor, b, c.name)
 	}
 }
+
+// TestPlanKazDeltaHiddenFull rewrites the chunk whole, as event delta_hidden_full,
+// when more than hidden-ratio of the kept base data is hidden (step 10); the
+// event delta_block_fallback stays for the PUT-bound fallback.
+func TestPlanKazDeltaHiddenFull(t *testing.T) {
+	ss := []*slice{
+		kazRec(0, 1, 16*kazEB), // three stacked large base records: 2/3 hidden
+		kazRec(1, 2, 16*kazEB-1),
+		kazRec(2, 3, 16*kazEB-2),
+		kazRec(5*kazEB+10, 4, 8),
+		kazRec(9*kazEB+10, 5, 8),
+	}
+	p, n := planKazDelta(ss, kazEB, kazDC(2, 16))
+	require.NotNil(t, p)
+	require.Equal(t, "delta_hidden_full", p.event)
+	require.True(t, p.full)
+	require.Equal(t, len(p.kept)+len(p.outs), n)
+	f := newKazFakeStore()
+	next := uint64(1000)
+	kazApplyDelta(t, f, ss, p, &next, 16*kazEB)
+}

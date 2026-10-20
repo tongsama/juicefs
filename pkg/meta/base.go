@@ -300,6 +300,7 @@ type baseMeta struct {
 	compactionGC      atomic.Pointer[compactionGC]
 	priorityCompactor atomic.Pointer[compactionScheduler]
 	kazCompact        atomic.Pointer[compactionPolicy]
+	kazDeltaBases     kazDeltaBaseTable // kaz: per-chunk base counts of delta compaction
 
 	dirStatsLock sync.RWMutex
 	dirStats     map[Ino]dirStat

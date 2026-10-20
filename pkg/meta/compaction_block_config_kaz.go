@@ -43,9 +43,11 @@ func (c *Config) ValidateKazBlockCompaction() error {
 	return c.validateKazDelta()
 }
 
-// kazBlockCompactionEnabled reports whether background compaction should use the block mode.
+// kazBlockCompactionEnabled reports whether background compaction should go
+// through the kaz block replacer: block mode, or delta mode (which plans delta
+// or block compaction inside runKazBlockCompaction).
 func (c *Config) kazBlockCompactionEnabled() bool {
-	return c.KazCompactionMode == KazCompactionModeBlock
+	return c.KazCompactionMode == KazCompactionModeBlock || c.KazCompactionMode == KazCompactionModeDelta
 }
 
 // kazBlockHiddenRatio returns the hidden-data share above which a chunk is rewritten whole.
