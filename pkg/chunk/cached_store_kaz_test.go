@@ -766,6 +766,14 @@ func (s *kazGetCount) take() [][2]int64 {
 // cacheOff), and returns the store, the counter and the data.
 func kazWholeReadRun(t *testing.T, size, max int, cacheOff bool) (*cachedStore, *kazGetCount, []byte) {
 	t.Helper()
+	return kazWholeReadRunConf(t, size, max, cacheOff, nil)
+}
+
+// kazWholeReadRunConf is kazWholeReadRun with a hook that adjusts the
+// configuration (eviction policy, block size, CacheFullBlock) before the store
+// is created.
+func kazWholeReadRunConf(t *testing.T, size, max int, cacheOff bool, adjust func(*Config)) (*cachedStore, *kazGetCount, []byte) {
+	t.Helper()
 	mem, _ := object.CreateStorage("mem", "", "", "", "")
 	cnt := &kazGetCount{ObjectStorage: mem}
 	conf := defaultConf
@@ -778,6 +786,9 @@ func kazWholeReadRun(t *testing.T, size, max int, cacheOff bool) (*cachedStore, 
 	conf.Prefetch = 0
 	conf.KazWholeReadMax = max
 	conf.BlockSize = 4 << 20 // the production block size; a 4 MiB slice is one block above the limit
+	if adjust != nil {
+		adjust(&conf)
+	}
 	data := make([]byte, size)
 	for i := range data {
 		data[i] = byte(i*7 + i/251)
@@ -792,9 +803,16 @@ func kazWholeReadRun(t *testing.T, size, max int, cacheOff bool) (*cachedStore, 
 // kazWholeReadAt reads n bytes at off of slice 77 and checks them against data.
 func kazWholeReadAt(t *testing.T, store *cachedStore, size int, data []byte, off, n int) {
 	t.Helper()
+	kazWholeReadAtCtx(t, context.Background(), store, size, data, off, n)
+}
+
+// kazWholeReadAtCtx is kazWholeReadAt with the read context given (for
+// compaction reads).
+func kazWholeReadAtCtx(t *testing.T, ctx context.Context, store *cachedStore, size int, data []byte, off, n int) {
+	t.Helper()
 	p := NewOffPage(n)
 	defer p.Release()
-	got, err := store.NewReader(77, size).ReadAt(context.Background(), p, off)
+	got, err := store.NewReader(77, size).ReadAt(ctx, p, off)
 	require.NoError(t, err)
 	require.Equal(t, n, got)
 	require.Equal(t, data[off:off+n], p.Data[:n])
@@ -830,4 +848,32 @@ func TestKazWholeReadCacheDisabled(t *testing.T) {
 	store, cnt, data := kazWholeReadRun(t, kazCompSize, 1<<20, true)
 	kazWholeReadAt(t, store, kazCompSize, data, 8<<10, 4<<10)
 	require.Equal(t, [][2]int64{{8 << 10, 4 << 10}}, cnt.take())
+}
+
+// TestKazWholeReadCompaction keeps the range GET for a compaction read under
+// kaz-2q (it is not cached, so a whole GET per piece would multiply traffic),
+// while a normal read of the same object still fetches it whole.
+func TestKazWholeReadCompaction(t *testing.T) {
+	store, cnt, data := kazWholeReadRunConf(t, kazCompSize, 1<<20, false, func(c *Config) {
+		c.CacheEviction = EvictionKaz2Q
+	})
+	cctx := KazCompactionReadContext(context.Background())
+	kazWholeReadAtCtx(t, cctx, store, kazCompSize, data, 8<<10, 4<<10)
+	kazWholeReadAtCtx(t, cctx, store, kazCompSize, data, 40<<10, 4<<10)
+	require.Equal(t, [][2]int64{{8 << 10, 4 << 10}, {40 << 10, 4 << 10}}, cnt.take())
+	kazWholeReadAt(t, store, kazCompSize, data, 8<<10, 4<<10)
+	require.Equal(t, [][2]int64{{0, -1}}, cnt.take())
+}
+
+// TestKazWholeReadNotCacheable keeps the range GET for a block that would not
+// be cached (CacheFullBlock=false and a full-size block), since a whole GET
+// that is not kept would repeat on every small read.
+func TestKazWholeReadNotCacheable(t *testing.T) {
+	store, cnt, data := kazWholeReadRunConf(t, kazCompSize, 1<<20, false, func(c *Config) {
+		c.CacheFullBlock = false
+		c.BlockSize = kazCompSize
+	})
+	kazWholeReadAt(t, store, kazCompSize, data, 8<<10, 4<<10)
+	kazWholeReadAt(t, store, kazCompSize, data, 8<<10, 4<<10)
+	require.Equal(t, [][2]int64{{8 << 10, 4 << 10}, {8 << 10, 4 << 10}}, cnt.take())
 }
