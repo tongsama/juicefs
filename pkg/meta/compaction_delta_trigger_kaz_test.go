@@ -175,3 +175,38 @@ func TestKazDeltaSchedulerCount(t *testing.T) {
 func testutilEvent(e *kazBlockEnv, event string) float64 {
 	return testutil.ToFloat64(e.kazCompactMetrics.events.WithLabelValues(event))
 }
+
+// kazDeltaRuns sums the block compaction events that count one run of a chunk.
+func kazDeltaRuns(e *kazBlockEnv) float64 {
+	var n float64
+	for _, ev := range []string{"delta_noop", "noop", "partial", "full", "delta_tier", "delta_merge", "delta_fold", "delta_prune", "delta_block_fallback", "delta_hidden_full"} {
+		n += kazBlockEventCount(e, ev)
+	}
+	return n
+}
+
+// TestKazDeltaNoopDoesNotRepeat checks that after a noop compaction of a chunk
+// with many records, later writes below 99 new records request nothing and the
+// 99th asks again: one compaction per 99 records, not one per write. (The noop
+// here has no new records; the give-up with new records is covered by
+// TestKazDeltaGivenUpBase.)
+func TestKazDeltaNoopDoesNotRepeat(t *testing.T) {
+	e := newKazDeltaEnv(t, "sqlite")
+	inode := e.file(t)
+	e.write(t, inode, 0, 400*kazEB)
+	for i := 0; i < kazDeltaTrigger; i++ { // each record crosses a block boundary
+		e.write(t, inode, uint32(i)*3*kazEB+2*kazEB+1874, 5668)
+	}
+	kazRun(t, e, inode)
+	require.Equal(t, float64(1), kazBlockEventCount(e, "delta_noop"))
+	n, ok := e.kazDeltaBases.get(inode, 0)
+	require.True(t, ok)
+	require.Equal(t, kazDeltaTrigger+1, n)
+	for i := 0; i < kazDeltaTrigger-1; i++ {
+		kazDeltaTriggerWrite(t, e, inode, i)
+	}
+	time.Sleep(300 * time.Millisecond)
+	require.Equal(t, float64(1), kazDeltaRuns(e))
+	kazDeltaTriggerWrite(t, e, inode, kazDeltaTrigger-1)
+	require.Eventually(t, func() bool { return kazDeltaRuns(e) > 1 }, 5*time.Second, 10*time.Millisecond)
+}

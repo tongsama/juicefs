@@ -219,14 +219,28 @@ func (d *kazDeltaPlanner) baseHiddenShare(p *kazBlockPlan, drop []bool) float64 
 	return 1 - float64(visible)/float64(total)
 }
 
+// kazDeltaGivenUpBase returns the base count to remember when the planner returns
+// a noop after step 2. If the new records reach the trigger they are remembered
+// as base too (total), or the level-triggered hook (now-base >= trigger) would
+// request a compaction on every later write and read (Ruling 6); otherwise only
+// the non-new records count.
+func kazDeltaGivenUpBase(total, news, trigger int) int {
+	if news >= trigger {
+		return total
+	}
+	return total - news
+}
+
 // planKazDelta plans one delta compaction of a chunk (records ss in chunk order):
 // new small records (and, past the tier limit, every earlier tier) go into one
 // new delta slice shared by several records, and blocks changed by half or more,
 // or with no base data below, are rewritten whole as in block mode. The reader's
 // view never changes: outs copy the current view and are placed above the kept
 // records. plan is nil when nothing is to be done; base is the record count the
-// caller remembers as not new (len(ss) minus the new records for nil, otherwise
-// the records left once the plan commits). The rules are in
+// caller remembers as not new (for nil: len(ss) minus the new records, or len(ss)
+// when the planner gives up although the new records reach the trigger, so the
+// trigger does not fire again at once; otherwise the records left once the plan
+// commits). The rules are in
 // docs/superpowers/specs/2026-10-20-kaz-delta-compaction-design.md §5.4.
 func planKazDelta(ss []*slice, blockSize uint32, c kazDeltaConf) (*kazBlockPlan, int) {
 	if len(ss) == 0 || blockSize == 0 {
@@ -253,6 +267,7 @@ func planKazDelta(ss []*slice, blockSize uint32, c kazDeltaConf) (*kazBlockPlan,
 		}
 	}
 	noopBase := len(ss) - news
+	givenUpBase := kazDeltaGivenUpBase(len(ss), news, c.trigger)
 
 	// Step 2: noop.
 	if news < c.trigger && prunable == 0 && len(ss) <= c.maxRecords && len(tierIDs) <= c.tiers {
@@ -331,7 +346,7 @@ func planKazDelta(ss []*slice, blockSize uint32, c kazDeltaConf) (*kazBlockPlan,
 	if kazPlanPutBytes(p) > d.smallTouchedBytes() {
 		bp := planKazBlocks(ss, blockSize, c.hiddenRatio, c.maxRecords, false)
 		if bp == nil {
-			return nil, noopBase
+			return nil, givenUpBase
 		}
 		bp.event = kazDeltaEventFallback
 		return bp, len(bp.kept) + len(bp.outs)
@@ -343,7 +358,7 @@ func planKazDelta(ss []*slice, blockSize uint32, c kazDeltaConf) (*kazBlockPlan,
 		return kazDeltaWhole(ss, blockSize, c, kazDeltaEventHidden)
 	}
 	if len(p.removed) == 0 && len(p.outs) == 0 {
-		return nil, noopBase
+		return nil, givenUpBase
 	}
 
 	// Steps 11-12: event and base count.

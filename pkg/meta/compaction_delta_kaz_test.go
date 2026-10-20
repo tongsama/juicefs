@@ -286,7 +286,7 @@ func TestKazDeltaCompactionConcurrentCommit(t *testing.T) {
 	}
 }
 
-// TestKazDeltaBaseUpdated remembers len(ss) minus the new records on a noop and
+// TestKazDeltaBaseUpdated remembers len(ss) minus the new records on a normal noop and
 // the records left (kept + outs) after a commit.
 func TestKazDeltaBaseUpdated(t *testing.T) {
 	for _, backend := range kazDeltaBackends {

@@ -570,3 +570,14 @@ func TestPlanKazDeltaHiddenFull(t *testing.T) {
 	next := uint64(1000)
 	kazApplyDelta(t, f, ss, p, &next, 16*kazEB)
 }
+
+// TestKazDeltaGivenUpBase checks the base remembered by a noop after step 2: new
+// records at or above the trigger count as base (Ruling 6), fewer do not. (The
+// planner's give-up paths with news >= trigger could not be reached with random
+// chunks, so the rule is tested directly.)
+func TestKazDeltaGivenUpBase(t *testing.T) {
+	require.Equal(t, 120, kazDeltaGivenUpBase(120, kazDeltaTrigger, kazDeltaTrigger))
+	require.Equal(t, 120, kazDeltaGivenUpBase(120, 150, kazDeltaTrigger))
+	require.Equal(t, 22, kazDeltaGivenUpBase(120, kazDeltaTrigger-1, kazDeltaTrigger))
+	require.Equal(t, 120, kazDeltaGivenUpBase(120, 0, kazDeltaTrigger))
+}
