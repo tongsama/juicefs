@@ -56,7 +56,8 @@ func (c *Config) kazDeltaEnabled() bool {
 	return c.KazCompactionMode == KazCompactionModeDelta
 }
 
-// kazDeltaConf returns the delta settings with 0 replaced by the defaults.
+// kazDeltaConf returns the delta settings with 0 replaced by the defaults;
+// a gap of -1 means no joining (effective gap 0).
 func (c *Config) kazDeltaConf() kazDeltaConf {
 	d := kazDeltaConf{
 		tiers:       c.KazCompactionDeltaTiers,
@@ -72,8 +73,11 @@ func (c *Config) kazDeltaConf() kazDeltaConf {
 	if d.maxRecords == 0 {
 		d.maxRecords = kazDeltaDefaultMaxRecords
 	}
-	if c.KazCompactionDeltaGap == 0 {
+	switch c.KazCompactionDeltaGap {
+	case 0:
 		d.gap = kazDeltaDefaultGap
+	case -1: // explicit "no joining"
+		d.gap = 0
 	}
 	return d
 }
@@ -90,8 +94,8 @@ func (c *Config) validateKazDelta() error {
 	if r := c.KazCompactionDeltaMaxRecords; r != 0 && (r < kazDeltaMinMaxRecords || r > kazDeltaMaxMaxRecords) {
 		return fmt.Errorf("invalid kaz-compaction-delta-max-records %d (want %d..%d)", r, kazDeltaMinMaxRecords, kazDeltaMaxMaxRecords)
 	}
-	if g := c.KazCompactionDeltaGap; g < 0 || g > kazDeltaMaxGap {
-		return fmt.Errorf("invalid kaz-compaction-delta-gap %d (want 0..%d)", g, kazDeltaMaxGap)
+	if g := c.KazCompactionDeltaGap; g < -1 || g > kazDeltaMaxGap {
+		return fmt.Errorf("invalid kaz-compaction-delta-gap %d (want -1 (no joining), 0 (default) or 1..%d)", g, kazDeltaMaxGap)
 	}
 	return nil
 }

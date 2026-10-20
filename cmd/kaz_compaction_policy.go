@@ -39,7 +39,7 @@ func kazCompactionReadMinFromFlag(readMin int) (int, error) {
 
 // kazBlockCompactionFromFlags checks the block and delta compaction flags.
 // Unlike the Go config, a hidden ratio, delta tiers or delta max records of 0
-// on the command line is out of range. gap and minFileSize are in bytes.
+// on the command line is out of range. gap and minFileSize are in bytes; gap 0 becomes Config -1 (no joining).
 func kazBlockCompactionFromFlags(mode string, ratio float64, maxSlices, deltaTiers, deltaMaxRecords int, deltaGap, deltaMinFileSize uint64) (meta.Config, error) {
 	if ratio == 0 {
 		return meta.Config{}, fmt.Errorf("invalid kaz-compaction-block-hidden-ratio 0 (want 0 < ratio <= 1)")
@@ -53,9 +53,14 @@ func kazBlockCompactionFromFlags(mode string, ratio float64, maxSlices, deltaTie
 	if deltaGap > 1<<20 {
 		return meta.Config{}, fmt.Errorf("invalid kaz-compaction-delta-gap %d (want 0..%d)", deltaGap, 1<<20)
 	}
+	// 0 on the command line means "no joining"; the Go config spells that -1.
+	gapCfg := int(deltaGap)
+	if deltaGap == 0 {
+		gapCfg = -1
+	}
 	conf := meta.Config{KazCompactionMode: mode, KazCompactionBlockHiddenRatio: ratio, KazCompactionBlockMaxSlices: maxSlices,
 		KazCompactionDeltaTiers: deltaTiers, KazCompactionDeltaMaxRecords: deltaMaxRecords,
-		KazCompactionDeltaGap: int(deltaGap), KazCompactionDeltaMinFileSize: deltaMinFileSize}
+		KazCompactionDeltaGap: gapCfg, KazCompactionDeltaMinFileSize: deltaMinFileSize}
 	if err := conf.ValidateKazBlockCompaction(); err != nil {
 		return meta.Config{}, err
 	}

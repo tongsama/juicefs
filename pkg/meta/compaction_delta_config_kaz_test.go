@@ -48,7 +48,8 @@ func TestKazDeltaConfigValidate(t *testing.T) {
 		{"gap 0", Config{KazCompactionMode: "delta", KazCompactionDeltaGap: 0}, true},
 		{"gap 1M", Config{KazCompactionMode: "delta", KazCompactionDeltaGap: 1 << 20}, true},
 		{"gap 1M+1", Config{KazCompactionMode: "delta", KazCompactionDeltaGap: 1<<20 + 1}, false},
-		{"gap -1", Config{KazCompactionMode: "delta", KazCompactionDeltaGap: -1}, false},
+		{"gap -1 (no joining)", Config{KazCompactionMode: "delta", KazCompactionDeltaGap: -1}, true},
+		{"gap -2", Config{KazCompactionMode: "delta", KazCompactionDeltaGap: -2}, false},
 		{"mode Delta", Config{KazCompactionMode: "Delta"}, false},
 		{"block ignores delta knobs", Config{KazCompactionMode: "block", KazCompactionDeltaTiers: 99}, true},
 	} {
@@ -70,4 +71,11 @@ func TestKazDeltaConfigSelfCheckResets(t *testing.T) {
 	require.Zero(t, c.KazCompactionDeltaMaxRecords)
 	require.Zero(t, c.KazCompactionDeltaGap)
 	require.Zero(t, c.KazCompactionDeltaMinFileSize)
+}
+
+// TestKazDeltaConfigGapNoJoin checks that Config gap -1 resolves to an effective gap of 0 and 0 to the default.
+func TestKazDeltaConfigGapNoJoin(t *testing.T) {
+	require.Equal(t, uint32(0), (&Config{KazCompactionMode: "delta", KazCompactionDeltaGap: -1}).kazDeltaConf().gap)
+	require.Equal(t, uint32(16384), (&Config{KazCompactionMode: "delta"}).kazDeltaConf().gap)
+	require.Equal(t, uint32(4096), (&Config{KazCompactionMode: "delta", KazCompactionDeltaGap: 4096}).kazDeltaConf().gap)
 }

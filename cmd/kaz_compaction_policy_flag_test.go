@@ -113,4 +113,9 @@ func TestKazDeltaFlags(t *testing.T) {
 	got, err := kazBlockCompactionFromFlags("delta", 0.5, 0, 4, 300, 0, 1<<30)
 	require.NoError(t, err)
 	require.Equal(t, 4, got.KazCompactionDeltaTiers)
+	require.Equal(t, -1, got.KazCompactionDeltaGap)
+
+	// --kaz-compaction-delta-gap 0 means no joining, not the default.
+	z := metaConfFromArgs(t, "--kaz-compaction-mode", "delta", "--kaz-compaction-delta-gap", "0")
+	require.Equal(t, -1, z.KazCompactionDeltaGap)
 }

@@ -72,7 +72,7 @@ type Config struct {
 	KazCompactionBlockMaxSlices   int
 	// [kaz] delta compaction knobs, used with KazCompactionMode "delta"; 0 means the default.
 	// Tiers: max delta tiers (default 8); MaxRecords: chunk record limit before
-	// folding (default 500); Gap: bytes, gaps up to this are joined (default 16 KiB);
+	// folding (default 500); Gap: bytes, gaps up to this are joined (0 = default 16 KiB, -1 = no joining, other negatives invalid);
 	// MinFileSize: bytes, shorter files use block mode (default 0, no limit).
 	KazCompactionDeltaTiers       int
 	KazCompactionDeltaMaxRecords  int
