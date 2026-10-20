@@ -70,6 +70,14 @@ type Config struct {
 	KazCompactionMode             string
 	KazCompactionBlockHiddenRatio float64
 	KazCompactionBlockMaxSlices   int
+	// [kaz] delta compaction knobs, used with KazCompactionMode "delta"; 0 means the default.
+	// Tiers: max delta tiers (default 8); MaxRecords: chunk record limit before
+	// folding (default 500); Gap: bytes, gaps up to this are joined (default 16 KiB);
+	// MinFileSize: bytes, shorter files use block mode (default 0, no limit).
+	KazCompactionDeltaTiers       int
+	KazCompactionDeltaMaxRecords  int
+	KazCompactionDeltaGap         int
+	KazCompactionDeltaMinFileSize uint64
 }
 
 func DefaultConf() *Config {
@@ -93,6 +101,7 @@ func (c *Config) SelfCheck() {
 	if err := c.ValidateKazBlockCompaction(); err != nil {
 		logger.Warnf("%s; falling back to upstream compaction", err)
 		c.KazCompactionMode, c.KazCompactionBlockHiddenRatio, c.KazCompactionBlockMaxSlices = "", 0, 0
+		c.KazCompactionDeltaTiers, c.KazCompactionDeltaMaxRecords, c.KazCompactionDeltaGap, c.KazCompactionDeltaMinFileSize = 0, 0, 0, 0
 	}
 	if c.MaxDeletes < 0 {
 		logger.Warnf("max-deletes=%d means synchronous object deletion in the caller, not unlimited deletion concurrency; this can delay compaction and writes. Use a positive max-deletes value for background deletion workers", c.MaxDeletes)

@@ -75,14 +75,42 @@ func TestKazBlockCompactionFlags(t *testing.T) {
 
 // TestKazBlockCompactionFromFlags rejects values that would silently mean the default or nothing.
 func TestKazBlockCompactionFromFlags(t *testing.T) {
-	_, err := kazBlockCompactionFromFlags("block", 0.5, 0)
+	_, err := kazBlockCompactionFromFlags("block", 0.5, 0, 8, 500, 16384, 0)
 	require.NoError(t, err)
 	for _, tc := range []struct {
 		mode  string
 		ratio float64
 		max   int
 	}{{"blocks", 0.5, 0}, {"block", 0, 0}, {"block", 1.1, 0}, {"block", 0.5, -1}} {
-		_, err := kazBlockCompactionFromFlags(tc.mode, tc.ratio, tc.max)
+		_, err := kazBlockCompactionFromFlags(tc.mode, tc.ratio, tc.max, 8, 500, 16384, 0)
 		require.Error(t, err, "%+v", tc)
 	}
+}
+
+// TestKazDeltaFlags parses the delta mode knobs, including byte sizes, and rejects 0 tiers.
+func TestKazDeltaFlags(t *testing.T) {
+	def := metaConfFromArgs(t)
+	require.Equal(t, 8, def.KazCompactionDeltaTiers)
+	require.Equal(t, 500, def.KazCompactionDeltaMaxRecords)
+	require.Equal(t, 16384, def.KazCompactionDeltaGap)
+	require.Equal(t, uint64(0), def.KazCompactionDeltaMinFileSize)
+	c := metaConfFromArgs(t, "--kaz-compaction-mode", "delta", "--kaz-compaction-delta-tiers", "4",
+		"--kaz-compaction-delta-max-records", "300", "--kaz-compaction-delta-gap", "4K", "--kaz-compaction-delta-min-file-size", "1G")
+	require.Equal(t, meta.KazCompactionModeDelta, c.KazCompactionMode)
+	require.Equal(t, 4, c.KazCompactionDeltaTiers)
+	require.Equal(t, 300, c.KazCompactionDeltaMaxRecords)
+	require.Equal(t, 4096, c.KazCompactionDeltaGap)
+	require.Equal(t, uint64(1<<30), c.KazCompactionDeltaMinFileSize)
+
+	_, err := kazBlockCompactionFromFlags("delta", 0.5, 0, 0, 500, 16384, 0)
+	require.Error(t, err)
+	_, err = kazBlockCompactionFromFlags("delta", 0.5, 0, 8, 0, 16384, 0)
+	require.Error(t, err)
+	_, err = kazBlockCompactionFromFlags("delta", 0.5, 0, 17, 500, 16384, 0)
+	require.Error(t, err)
+	_, err = kazBlockCompactionFromFlags("delta", 0.5, 0, 8, 500, 1<<20+1, 0)
+	require.Error(t, err)
+	got, err := kazBlockCompactionFromFlags("delta", 0.5, 0, 4, 300, 0, 1<<30)
+	require.NoError(t, err)
+	require.Equal(t, 4, got.KazCompactionDeltaTiers)
 }
