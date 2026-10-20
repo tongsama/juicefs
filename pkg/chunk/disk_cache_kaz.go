@@ -121,26 +121,28 @@ type kazPlacementSource struct {
 
 // kazCompactionPlacement decides whether the compaction output block outKey
 // is cached under kaz-2q, from its source blocks srcs: each source store is
-// asked separately (one store lock at a time) with kazPlacement, and when any
-// source is cached the placement is registered with kazExpect in the output
-// store, to be consumed by the add after cache() flushes the block. The
+// asked separately (one store lock at a time) with kazPlacementHot, and when
+// any source is cached the placement is registered with kazExpect in the
+// output store, to be consumed by the add after cache() flushes the block. The
 // segment follows the output store's placement mode (from
-// Config.KazCacheCompactionPlacement): inherit = protected if any cached
-// source is protected; probation = always probation; replace = protected
-// only if a protected source has whole set; share = protected if the bytes of
-// the protected sources are at least the share ratio of outBytes (the
-// non-hole bytes of the output block; 0 gives probation). In every mode the
-// atime is the newest among the cached sources, and an output placed in
+// Config.KazCacheCompactionPlacement, see kazPlacementSegment). In every mode
+// the atime is the newest among the cached sources, and an output placed in
 // protected gets the read mark when a protected source has it (an output in
-// probation never does). It returns whether the caller should
+// probation never does). With --kaz-cache-compaction-hot-age a young
+// protected source (a compaction output cached less than hot-age ago) is not
+// a protected source: it adds no protected bytes, no whole protected copy and
+// no read mark; when that turns the decision from protected into probation,
+// compaction_output_hot is counted. It returns whether the caller should
 // cache the output and counts compaction_output_cached or
 // compaction_output_skipped. Sources that are only pending in memory, or
 // only in a legacy store, are not considered.
 func (m *cacheManager) kazCompactionPlacement(outKey string, outBytes uint32, srcs []kazPlacementSource) bool {
 	var atime uint32
-	var protectedBytes uint64 // bytes copied from protected sources (share)
-	found, anyProtected, wholeProtected := false, false, false
-	protectedRead := false // some protected source has the read mark
+	// prot counts the protected sources; all also counts the young ones, to
+	// tell whether excluding them changed the decision.
+	var prot, all kazProtectedSources
+	found := false
+	protectedRead := false // some (not young) protected source has the read mark
 	for _, src := range srcs {
 		s := m.getStore(src.key)
 		if s == nil {
@@ -148,12 +150,13 @@ func (m *cacheManager) kazCompactionPlacement(outKey string, outBytes uint32, sr
 		}
 		s.Lock()
 		if idx, ok := s.keys.(*kaz2QIndex); ok {
-			if sg, at, read, ok := idx.kazPlacement([]cacheKey{s.getCacheKey(src.key)}); ok {
+			if sg, at, read, hot, ok := idx.kazPlacementHot([]cacheKey{s.getCacheKey(src.key)}); ok {
 				if sg == kazProtected {
-					anyProtected = true
+					prot.add(src)
+					all.add(src)
 					protectedRead = protectedRead || read
-					wholeProtected = wholeProtected || src.whole
-					protectedBytes += uint64(src.bytes)
+				} else if hot {
+					all.add(src)
 				}
 				atime = max(atime, at)
 				found = true
@@ -162,26 +165,12 @@ func (m *cacheManager) kazCompactionPlacement(outKey string, outBytes uint32, sr
 		s.Unlock()
 	}
 	out := m.getStore(outKey)
-	placed := false
+	placed, hot := false, false
 	if found && out != nil {
 		out.Lock()
 		if idx, ok := out.keys.(*kaz2QIndex); ok {
-			seg := kazProbation
-			switch idx.placement {
-			case KazPlacementProbation:
-			case KazPlacementReplace:
-				if wholeProtected {
-					seg = kazProtected
-				}
-			case KazPlacementShare:
-				if kazShareProtected(protectedBytes, outBytes, idx.shareRatio) {
-					seg = kazProtected
-				}
-			default: // inherit
-				if anyProtected {
-					seg = kazProtected
-				}
-			}
+			seg := kazPlacementSegment(idx.placement, prot, outBytes, idx.shareRatio)
+			hot = seg == kazProbation && kazPlacementSegment(idx.placement, all, outBytes, idx.shareRatio) == kazProtected
 			idx.kazExpect(out.getCacheKey(outKey), seg, atime, seg == kazProtected && protectedRead)
 			placed = true
 		}
@@ -193,8 +182,49 @@ func (m *cacheManager) kazCompactionPlacement(outKey string, outBytes uint32, sr
 		} else {
 			km.events.WithLabelValues("compaction_output_skipped").Inc()
 		}
+		if hot {
+			km.events.WithLabelValues("compaction_output_hot").Inc()
+		}
 	}
 	return placed
+}
+
+// kazProtectedSources sums the protected source blocks of a compaction output
+// for kazPlacementSegment.
+type kazProtectedSources struct {
+	any   bool   // some source is protected
+	whole bool   // some protected source was copied whole
+	bytes uint64 // bytes copied from protected sources (share)
+}
+
+// add counts src as a protected source.
+func (p *kazProtectedSources) add(src kazPlacementSource) {
+	p.any = true
+	p.whole = p.whole || src.whole
+	p.bytes += uint64(src.bytes)
+}
+
+// kazPlacementSegment returns the segment of a compaction output under the
+// placement mode from its protected sources prot: inherit = protected if any
+// source is protected; probation = always probation; replace = protected only
+// if a protected source was copied whole; share = protected if the protected
+// bytes are at least ratio of outBytes (the non-hole bytes of the output
+// block; 0 gives probation).
+func kazPlacementSegment(mode string, prot kazProtectedSources, outBytes uint32, ratio float64) kazSegment {
+	var protected bool
+	switch mode {
+	case KazPlacementProbation:
+	case KazPlacementReplace:
+		protected = prot.whole
+	case KazPlacementShare:
+		protected = kazShareProtected(prot.bytes, outBytes, ratio)
+	default: // inherit
+		protected = prot.any
+	}
+	if protected {
+		return kazProtected
+	}
+	return kazProbation
 }
 
 // kazShareProtected reports whether the share placement puts an output block

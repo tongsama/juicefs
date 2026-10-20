@@ -159,3 +159,30 @@ func TestKazDemoteUnreadFirstConfig(t *testing.T) {
 	_, isKaz := s.keys.(*kaz2QIndex)
 	require.False(t, isKaz)
 }
+
+// TestKazCompactionHotAgeConfig checks --kaz-cache-compaction-hot-age in the
+// chunk self-check and the kaz-2q index: under kaz-2q a negative value warns
+// and becomes 0 (disabled) while 0 and positive values are kept; other
+// eviction policies leave the value untouched; the index stores it in seconds
+// and treats a negative value as 0 even without the self-check.
+func TestKazCompactionHotAgeConfig(t *testing.T) {
+	for _, c := range []struct {
+		evict    string
+		in, want time.Duration
+	}{
+		{EvictionKaz2Q, 0, 0},
+		{EvictionKaz2Q, 30 * time.Minute, 30 * time.Minute},
+		{EvictionKaz2Q, -time.Second, 0},
+		{EvictionLRU, -time.Second, -time.Second},
+		{Eviction2Random, -time.Second, -time.Second},
+	} {
+		conf := Config{CacheDir: "/tmp/x", CacheSize: 1 << 30, CacheEviction: c.evict,
+			KazCacheProbationRatio: 0.4, KazCacheStateInterval: time.Minute,
+			KazCacheCompactionHotAge: c.in}
+		conf.SelfCheck("uuid")
+		require.Equal(t, c.want, conf.KazCacheCompactionHotAge, "%s %v", c.evict, c.in)
+	}
+	require.Equal(t, uint32(1800), newKaz2QIndex(&Config{KazCacheCompactionHotAge: 30 * time.Minute}).hotAge)
+	require.Equal(t, uint32(0), newKaz2QIndex(&Config{KazCacheCompactionHotAge: -time.Minute}).hotAge)
+	require.Equal(t, uint32(0), newKaz2QIndex(&Config{}).hotAge)
+}

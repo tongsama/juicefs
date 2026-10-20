@@ -120,3 +120,34 @@ func TestKazCacheDemoteUnreadFirstFlag(t *testing.T) {
 		require.Equal(t, tc.want, conf.KazCacheDemoteUnreadFirst, "%v", tc.args)
 	}
 }
+
+// TestKazCacheCompactionHotAgeFlag checks that --kaz-cache-compaction-hot-age
+// defaults to 0 (disabled), keeps a valid duration, and turns an unparsable
+// value into 0 with a warning (not the upstream silent 0 of some other
+// meaning: 0 is this flag's default); a negative value is passed on for the
+// chunk self-check, which makes it 0.
+func TestKazCacheCompactionHotAgeFlag(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want time.Duration
+	}{
+		{nil, 0},
+		{[]string{"--kaz-cache-compaction-hot-age", "30m"}, 30 * time.Minute},
+		{[]string{"--kaz-cache-compaction-hot-age", "90"}, 90 * time.Second},
+		{[]string{"--kaz-cache-compaction-hot-age", "abc"}, 0},
+		{[]string{"--kaz-cache-compaction-hot-age", "-5m"}, -5 * time.Minute},
+	} {
+		set := flag.NewFlagSet("kaz-hot-age-test", flag.ContinueOnError)
+		for _, f := range dataCacheFlags() {
+			require.NoError(t, f.Apply(set))
+		}
+		require.NoError(t, set.Parse(tc.args))
+		conf := &chunk.Config{}
+		applyKazCacheFlags(cli.NewContext(nil, set, nil), conf)
+		require.Equal(t, tc.want, conf.KazCacheCompactionHotAge, "%v", tc.args)
+	}
+	conf := chunk.Config{CacheDir: "/tmp/x", CacheSize: 1 << 30, CacheEviction: chunk.EvictionKaz2Q,
+		KazCacheProbationRatio: 0.4, KazCacheStateInterval: time.Minute, KazCacheCompactionHotAge: -5 * time.Minute}
+	conf.SelfCheck("uuid")
+	require.Equal(t, time.Duration(0), conf.KazCacheCompactionHotAge, "negative must become 0 under kaz-2q")
+}

@@ -405,6 +405,11 @@ func dataCacheFlags() []cli.Flag {
 			Usage: "[kaz] under --cache-eviction kaz-2q, when the protected segment overflows, demote the protected blocks not read since they entered it (e.g. compaction outputs) first, oldest read first, and the read ones only after them; the same order applies to direct eviction from protected when probation is empty; off orders both by last read time only",
 		},
 		&cli.StringFlag{
+			Name:  "kaz-cache-compaction-hot-age",
+			Value: "0",
+			Usage: "[kaz] under --cache-eviction kaz-2q, a source block that is itself a compaction output cached less than this ago does not count as a protected source when placing a compaction output (no share bytes, no read mark); an output left without another protected source goes to probation (0 disables)",
+		},
+		&cli.StringFlag{
 			Name:  "cache-scan-interval",
 			Value: "1h",
 			Usage: "interval to scan cache-dir to rebuild in-memory index",

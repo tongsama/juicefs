@@ -669,7 +669,8 @@ func TestKaz2QCompactionProbationPlacedNewest(t *testing.T) {
 }
 
 // TestKaz2QCompactionProtectedKeepsOrder checks that a compaction output placed
-// in protected keeps the inherited atime as its times (unchanged behavior).
+// in protected keeps the inherited atime as its times (unchanged behavior),
+// except that with --kaz-cache-compaction-hot-age inserted is the add time.
 func TestKaz2QCompactionProtectedKeepsOrder(t *testing.T) {
 	p, clock := newKazTestIndex(t, 10, 4)
 	*clock += 100
@@ -679,6 +680,15 @@ func TestKaz2QCompactionProtectedKeepsOrder(t *testing.T) {
 	require.Equal(t, kazProtected, it.seg)
 	require.Equal(t, kazTestStart+5, it.atime)
 	require.Equal(t, kazTestStart+5, it.inserted)
+	require.Equal(t, kazTestStart+5, it.order)
+
+	// with --kaz-cache-compaction-hot-age, inserted is when it entered
+	p.hotAge = 1800
+	p.kazExpect(kazKey(21), kazProtected, kazTestStart+5, false)
+	p.add(kazKey(21), cacheItem{size: kazTestBlock, atime: *clock})
+	it = p.keys[kazKey(21)]
+	require.Equal(t, kazTestStart+5, it.atime)
+	require.Equal(t, *clock, it.inserted)
 	require.Equal(t, kazTestStart+5, it.order)
 }
 
@@ -726,7 +736,7 @@ func TestKaz2QGhostPriorCompaction(t *testing.T) {
 // again or from a second store does not change them.
 func TestKaz2QGhostHitEventsExportedAtZero(t *testing.T) {
 	names := []string{"ghost_hit", "ghost_hit_demoted", "ghost_hit_probation", "ghost_hit_protected", "ghost_hit_compaction",
-		"demote", "demote_unread", "demote_read"}
+		"demote", "demote_unread", "demote_read", "compaction_output_hot"}
 	m := newKaz2QMetrics()
 	require.Equal(t, 0, testutil.CollectAndCount(m.events))
 	p, _ := newKazTestIndex(t, 10, 4)

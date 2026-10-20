@@ -244,6 +244,10 @@ type kaz2QIndex struct {
 	stateInterval time.Duration // save interval of the state file
 	placement     string        // compaction output placement (KazPlacement*), fixed at creation
 	shareRatio    float64       // protected share threshold of the share placement, in (0, 1]
+	// hotAge (seconds, 0 disables) is --kaz-cache-compaction-hot-age: a
+	// compaction output cached less than this ago is a young output, which
+	// kazPlacement does not count as a protected source.
+	hotAge uint32
 	// saveMu serializes writers of the state file (periodic saver and the
 	// flush at umount); it is not the store mutex and guards no index field.
 	saveMu sync.Mutex
@@ -291,6 +295,10 @@ func newKaz2QIndex(conf *Config) *kaz2QIndex {
 	if !kazShareRatioValid(shareRatio) {
 		shareRatio = kazDefaultShareRatio
 	}
+	var hotAge uint32
+	if conf.KazCacheCompactionHotAge > 0 {
+		hotAge = uint32(conf.KazCacheCompactionHotAge / time.Second)
+	}
 	return &kaz2QIndex{
 		keys:           make(map[cacheKey]*kazItem),
 		prob:           kazHeap{byOrder: true},
@@ -305,6 +313,7 @@ func newKaz2QIndex(conf *Config) *kaz2QIndex {
 		stateInterval:  interval,
 		placement:      placement,
 		shareRatio:     shareRatio,
+		hotAge:         hotAge,
 		now:            func() uint32 { return uint32(time.Now().Unix()) },
 	}
 }
@@ -354,7 +363,8 @@ func (p *kaz2QIndex) kazSetMetrics(m *kaz2QMetrics) {
 			m.events.WithLabelValues(g.event()).Add(0)
 		}
 		// the same for demote and its split by the read mark
-		for _, e := range []string{"demote", "demote_unread", "demote_read"} {
+		// and compaction_output_hot (--kaz-cache-compaction-hot-age)
+		for _, e := range []string{"demote", "demote_unread", "demote_read", "compaction_output_hot"} {
 			m.events.WithLabelValues(e).Add(0)
 		}
 	}
@@ -476,6 +486,14 @@ func (p *kaz2QIndex) add(key cacheKey, item cacheItem) {
 		it.seg, it.atime, it.origin = e.seg, e.atime, kazOriginCompaction
 		if e.seg == kazProtected {
 			it.inserted, it.order = e.atime, e.atime
+			if p.hotAge > 0 {
+				// with --kaz-cache-compaction-hot-age, inserted records when
+				// the output entered the cache (the age kazYoung checks; the
+				// inherited atime may be old). Protected is ordered by atime
+				// and probation resets inserted on demotion, so this changes
+				// no eviction; without the option the times stay as before.
+				it.inserted = now
+			}
 			it.read = e.read
 		} else {
 			// probation: enter the newest end (and start the correlation
@@ -620,15 +638,29 @@ func (p *kaz2QIndex) kazSegmentOf(key cacheKey) (kazSegment, bool) {
 // cached. A key not in the index but kept in restore (moved there
 // by reset() during a rescan, or loaded from the state file) counts with its
 // saved segment and atime, so that a rescan window does not lose placements.
+// A young protected source (see kazYoung) counts as probation; use
+// kazPlacementHot to learn whether one was found.
 func (p *kaz2QIndex) kazPlacement(keys []cacheKey) (seg kazSegment, atime uint32, read bool, ok bool) {
+	seg, atime, read, _, ok = p.kazPlacementHot(keys)
+	return
+}
+
+// kazPlacementHot is kazPlacement that also reports hot: some source was
+// protected but counted as probation because it is a young compaction output
+// (kazYoung, --kaz-cache-compaction-hot-age). A young source still gives its
+// atime and makes ok true, but never protected nor its read mark. With
+// hotAge 0 hot is always false and the result is the original kazPlacement.
+func (p *kaz2QIndex) kazPlacementHot(keys []cacheKey) (seg kazSegment, atime uint32, read, hot, ok bool) {
+	now := p.now()
 	for _, k := range keys {
 		var kseg kazSegment
-		var katime uint32
+		var katime, kinserted uint32
 		var kread bool
+		var korigin kazOrigin
 		if it, found := p.keys[k]; found {
-			kseg, katime, kread = it.seg, it.atime, it.read
+			kseg, katime, kread, korigin, kinserted = it.seg, it.atime, it.read, it.origin, it.inserted
 		} else if s, found := p.restore[k]; found {
-			kseg, katime, kread = s.seg, s.atime, s.read
+			kseg, katime, kread, korigin, kinserted = s.seg, s.atime, s.read, s.origin, s.inserted
 		} else {
 			continue
 		}
@@ -636,8 +668,12 @@ func (p *kaz2QIndex) kazPlacement(keys []cacheKey) (seg kazSegment, atime uint32
 			seg = kazProbation
 		}
 		if kseg == kazProtected {
-			seg = kazProtected
-			read = read || kread
+			if p.kazYoung(korigin, kinserted, now) {
+				hot = true
+			} else {
+				seg = kazProtected
+				read = read || kread
+			}
 		}
 		ok = true
 		if katime > atime {
@@ -645,6 +681,18 @@ func (p *kaz2QIndex) kazPlacement(keys []cacheKey) (seg kazSegment, atime uint32
 		}
 	}
 	return
+}
+
+// kazYoung reports whether an item of origin that entered the cache at
+// inserted is a young compaction output at now: a compaction output cached
+// less than hotAge seconds ago (an inserted time after now counts as just
+// cached). Fill, legacy and write items are never young, and hotAge 0 makes
+// nothing young.
+func (p *kaz2QIndex) kazYoung(origin kazOrigin, inserted, now uint32) bool {
+	if p.hotAge == 0 || origin != kazOriginCompaction {
+		return false
+	}
+	return now < inserted || now-inserted < p.hotAge
 }
 
 // kazExpect registers the segment, atime and read mark (used only for

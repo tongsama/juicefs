@@ -605,6 +605,8 @@ type Config struct {
 	KazCacheCompactionPlacementShareRatio float64
 	// KazCacheDemoteUnreadFirst demotes protected blocks without the read mark before those with it.
 	KazCacheDemoteUnreadFirst bool
+	// KazCacheCompactionHotAge keeps protected compaction outputs younger than this out of protected placement (0 disables).
+	KazCacheCompactionHotAge time.Duration
 }
 
 func (c *Config) SelfCheck(uuid string) {

@@ -589,3 +589,148 @@ func TestKaz2QReadMarkCompaction(t *testing.T) {
 	require.Equal(t, kazProtected, o.seg)
 	require.True(t, o.read)
 }
+
+// TestKazCompactionHotAge checks --kaz-cache-compaction-hot-age: a protected
+// source that is itself a compaction output cached less than hot-age ago (a
+// young output) is not counted as a protected source by inherit, replace or
+// share, and does not pass on its read mark; an output left without another
+// protected source goes to the newest end of probation and counts
+// compaction_output_hot (only when the exclusion changed protected into
+// probation). Old compaction outputs and fill / legacy sources are not
+// affected by their age, hot-age 0 keeps the old placement, and sources kept
+// only in restore (after reset) are judged by their saved origin and inserted.
+// The outputs are added to the index directly (not written through cache()).
+func TestKazCompactionHotAge(t *testing.T) {
+	const mib = 1 << 20
+	const T = uint32(2_000_000_000) // fixed clock
+	f := newKazCompFixture(t, EvictionKaz2Q, "", true, 1, 2, 3, 4, 5)
+	cs := f.cs
+	m := f.store.bcache.(*cacheManager)
+	idx := cs.keys.(*kaz2QIndex)
+	require.Equal(t, 0.0, f.kazEvents("compaction_output_hot"))
+
+	// set gives slice id the segment, origin, inserted time and read mark.
+	set := func(id uint64, seg kazSegment, origin kazOrigin, inserted uint32, read bool) {
+		it := idx.keys[cs.getCacheKey(f.keys[id])]
+		idx.unlink(it)
+		it.seg, it.origin, it.inserted, it.read = seg, origin, inserted, read
+		idx.link(it)
+	}
+	cs.Lock()
+	idx.now = func() uint32 { return T }
+	idx.hotAge = 1800
+	set(1, kazProtected, kazOriginCompaction, T-60, true)    // young output, marked
+	set(2, kazProtected, kazOriginCompaction, T-3600, false) // old output
+	set(3, kazProtected, kazOriginFill, T-60, false)         // fill: age does not matter
+	set(4, kazProtected, kazOriginLegacy, T-60, false)       // legacy: age does not matter
+	set(5, kazProbation, kazOriginFill, T-60, false)         // probation
+	kazVerify(t, idx)
+	cs.Unlock()
+
+	type src struct {
+		id    uint64
+		whole bool
+		bytes uint32
+	}
+	next := uint64(100)
+	// place registers the output of srcs (under placement mode, with outBytes
+	// non-hole bytes) and adds it; it returns the added item.
+	place := func(mode string, outBytes uint32, srcs ...src) kazItem {
+		cs.Lock()
+		idx.placement = mode
+		cs.Unlock()
+		next++
+		out := kazCompKey(f.store.conf, next, kazCompSize)
+		var ps []kazPlacementSource
+		for _, s := range srcs {
+			ps = append(ps, kazPlacementSource{key: f.keys[s.id], whole: s.whole, bytes: s.bytes})
+		}
+		require.True(t, m.kazCompactionPlacement(out, outBytes, ps))
+		cs.Lock()
+		defer cs.Unlock()
+		k := cs.getCacheKey(out)
+		idx.add(k, cacheItem{size: kazCompSize, atime: T})
+		kazVerify(t, idx)
+		return *idx.keys[k]
+	}
+	all := func(id uint64) src { return src{id, true, 4 * mib} }
+	hot := func() float64 { return f.kazEvents("compaction_output_hot") }
+
+	// inherit
+	o := place(KazPlacementInherit, 4*mib, all(1))
+	require.Equal(t, kazProbation, o.seg, "young protected source only")
+	require.False(t, o.read)
+	require.Equal(t, T, o.order, "probation output enters the newest end")
+	require.Equal(t, T, o.inserted)
+	require.Equal(t, 1.0, hot())
+	o = place(KazPlacementInherit, 4*mib, all(1), all(5))
+	require.Equal(t, kazProbation, o.seg, "young protected + probation source")
+	require.Equal(t, 2.0, hot())
+	o = place(KazPlacementInherit, 4*mib, all(2))
+	require.Equal(t, kazProtected, o.seg, "old compaction output stays protected")
+	require.Equal(t, T, o.inserted, "a protected output records when it entered")
+	o = place(KazPlacementInherit, 4*mib, all(3))
+	require.Equal(t, kazProtected, o.seg, "fill source is not judged by age")
+	o = place(KazPlacementInherit, 4*mib, all(4))
+	require.Equal(t, kazProtected, o.seg, "legacy source is not judged by age")
+	o = place(KazPlacementInherit, 4*mib, all(1), all(2))
+	require.Equal(t, kazProtected, o.seg, "an old protected source remains")
+	require.False(t, o.read, "the young source's read mark is not inherited")
+	require.Equal(t, 2.0, hot(), "protected decision unchanged")
+	o = place(KazPlacementProbation, 4*mib, all(1))
+	require.Equal(t, kazProbation, o.seg)
+	require.Equal(t, 2.0, hot(), "probation mode is probation regardless of age")
+
+	// replace
+	o = place(KazPlacementReplace, 4*mib, all(1))
+	require.Equal(t, kazProbation, o.seg, "young whole source")
+	require.Equal(t, 3.0, hot())
+	o = place(KazPlacementReplace, 4*mib, all(1), src{2, false, mib})
+	require.Equal(t, kazProbation, o.seg, "young whole + old partial")
+	require.Equal(t, 4.0, hot())
+	o = place(KazPlacementReplace, 4*mib, all(2))
+	require.Equal(t, kazProtected, o.seg, "old whole source")
+	require.Equal(t, 4.0, hot())
+
+	// share (ratio 0.5): only the old protected bytes count
+	o = place(KazPlacementShare, 4*mib, src{1, false, 3 * mib}, src{2, false, mib})
+	require.Equal(t, kazProbation, o.seg, "1 of 4 MiB from an old protected source")
+	require.Equal(t, 5.0, hot())
+	o = place(KazPlacementShare, 4*mib, src{1, false, mib}, src{2, false, 3 * mib})
+	require.Equal(t, kazProtected, o.seg, "3 of 4 MiB from an old protected source")
+	require.False(t, o.read, "the young source's read mark is not inherited")
+	o = place(KazPlacementShare, 4*mib, src{1, false, mib}, src{5, false, 3 * mib})
+	require.Equal(t, kazProbation, o.seg, "probation without the exclusion as well")
+	require.Equal(t, 5.0, hot(), "not counted: protected was never the decision")
+
+	// hot-age 0: the old placement, with the young source's mark
+	cs.Lock()
+	idx.hotAge = 0
+	cs.Unlock()
+	o = place(KazPlacementInherit, 4*mib, all(1))
+	require.Equal(t, kazProtected, o.seg)
+	require.True(t, o.read)
+	require.Equal(t, 5.0, hot())
+
+	// sources only in restore after reset keep their saved origin and inserted
+	cs.Lock()
+	idx.hotAge = 1800
+	idx.reset()
+	_, inIndex := idx.keys[cs.getCacheKey(f.keys[1])]
+	require.False(t, inIndex)
+	cs.Unlock()
+	o = place(KazPlacementInherit, 4*mib, all(1))
+	require.Equal(t, kazProbation, o.seg, "young source from restore")
+	require.Equal(t, 6.0, hot())
+	o = place(KazPlacementInherit, 4*mib, all(2))
+	require.Equal(t, kazProtected, o.seg, "old source from restore")
+	require.Equal(t, 6.0, hot())
+	// the source becomes old as time passes
+	cs.Lock()
+	idx.now = func() uint32 { return T + 1800 }
+	cs.Unlock()
+	o = place(KazPlacementInherit, 4*mib, all(1))
+	require.Equal(t, kazProtected, o.seg, "hot-age reached")
+	require.True(t, o.read)
+	require.Equal(t, 6.0, hot())
+}

@@ -43,7 +43,8 @@ const kazDefaultShareRatio = 0.5
 // kazCacheSelfCheck normalizes the kaz-2q options, warning and falling back to
 // defaults for out-of-range values (an empty compaction placement silently
 // becomes inherit, an unknown one warns and becomes inherit; the share ratio
-// is checked only for the share placement, which is the only one using it).
+// is checked only for the share placement, which is the only one using it;
+// a negative compaction hot age warns and becomes 0, disabled).
 // It never changes other eviction settings.
 func (c *Config) kazCacheSelfCheck() {
 	if c.KazCacheProbationRatio <= 0 || c.KazCacheProbationRatio >= 1 {
@@ -74,6 +75,10 @@ func (c *Config) kazCacheSelfCheck() {
 	if c.KazCacheCompactionPlacement == KazPlacementShare && !kazShareRatioValid(c.KazCacheCompactionPlacementShareRatio) {
 		logger.Warnf("kaz-cache-compaction-placement-share-ratio should be in (0, 1], setting it to %v", kazDefaultShareRatio)
 		c.KazCacheCompactionPlacementShareRatio = kazDefaultShareRatio
+	}
+	if c.KazCacheCompactionHotAge < 0 {
+		logger.Warnf("kaz-cache-compaction-hot-age should not be negative, setting it to 0 (disabled)")
+		c.KazCacheCompactionHotAge = 0
 	}
 }
 
