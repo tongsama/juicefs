@@ -393,7 +393,12 @@ func dataCacheFlags() []cli.Flag {
 		&cli.StringFlag{
 			Name:  "kaz-cache-compaction-placement",
 			Value: "inherit",
-			Usage: "[kaz] segment of a cached compaction output block under --cache-eviction kaz-2q: inherit (protected if any source block is protected), probation (always probation), replace (protected only if a protected source block was copied whole into it); an output is cached only when a source block is cached",
+			Usage: "[kaz] segment of a cached compaction output block under --cache-eviction kaz-2q: inherit (protected if any source block is protected), probation (always probation), replace (protected only if a protected source block was copied whole into it), share (protected if the bytes copied from protected source blocks are at least --kaz-cache-compaction-placement-share-ratio of its non-hole bytes); an output is cached only when a source block is cached",
+		},
+		&cli.Float64Flag{
+			Name:  "kaz-cache-compaction-placement-share-ratio",
+			Value: 0.5,
+			Usage: "[kaz] threshold of --kaz-cache-compaction-placement share: the share of an output block's non-hole bytes copied from protected source blocks needed to cache it in protected (0 < x <= 1; used only with share)",
 		},
 		&cli.StringFlag{
 			Name:  "cache-scan-interval",

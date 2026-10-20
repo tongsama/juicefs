@@ -37,8 +37,15 @@ type kazCompactionWriter interface {
 // starting at Off plus the offset of the overlap inside the piece). Blocks
 // are listed in piece order without duplicates. Whole is set on a block when
 // the union of its byte ranges copied into this output block, across all
-// pieces, covers the block entirely ([0, min(bs, SliceSize-Indx*bs))). The
-// kaz-2q cache uses it to place each output block like its sources.
+// pieces, covers the block entirely ([0, min(bs, SliceSize-Indx*bs))). Bytes
+// is the size of that union (bytes of the block copied twice by overlapping
+// pieces count once), and OutBytes is the number of non-hole bytes of output
+// block indx, set in every ref of it. OutBytes is the sum of the overlaps of
+// the non-hole pieces with the output range: pieces are laid out back to back
+// and never overlap in output coordinates, so each output byte is counted
+// once. It is not the sum of Bytes, which is smaller when overlapping pieces
+// copy the same source bytes twice. The kaz-2q cache uses it to place each
+// output block like its sources.
 func kazCompactionSources(slices []meta.Slice, blockSize int) func(indx int) []chunk.KazBlockRef {
 	pieces := append([]meta.Slice(nil), slices...)
 	return func(indx int) []chunk.KazBlockRef {
@@ -46,7 +53,7 @@ func kazCompactionSources(slices []meta.Slice, blockSize int) func(indx int) []c
 		var refs []chunk.KazBlockRef
 		pos := make(map[chunk.KazBlockRef]int)         // ref (Whole false) -> index in refs
 		copied := make(map[chunk.KazBlockRef][][2]int) // ref -> copied ranges inside the block
-		var off int
+		var off, outBytes int
 		for _, s := range pieces {
 			start, end := off, off+int(s.Len)
 			off = end
@@ -55,6 +62,7 @@ func kazCompactionSources(slices []meta.Slice, blockSize int) func(indx int) []c
 			}
 			from := int(s.Off) + max(start, lo) - start
 			to := from + min(end, hi) - max(start, lo)
+			outBytes += to - from
 			for b := from / blockSize; b <= (to-1)/blockSize; b++ {
 				ref := chunk.KazBlockRef{ID: s.Id, SliceSize: s.Size, Indx: uint32(b)}
 				if _, ok := pos[ref]; !ok {
@@ -68,6 +76,10 @@ func kazCompactionSources(slices []meta.Slice, blockSize int) func(indx int) []c
 		for ref, i := range pos {
 			blockLen := min(blockSize, int(ref.SliceSize)-int(ref.Indx)*blockSize)
 			refs[i].Whole = kazRangesCover(copied[ref], blockLen)
+			refs[i].Bytes = uint32(kazRangesLen(copied[ref]))
+		}
+		for i := range refs {
+			refs[i].OutBytes = uint32(outBytes)
 		}
 		return refs
 	}
@@ -91,4 +103,19 @@ func kazRangesCover(ranges [][2]int, n int) bool {
 		}
 	}
 	return false
+}
+
+// kazRangesLen returns the length of the union of the half-open ranges.
+// Ranges may overlap and come in any order; ranges is reordered.
+func kazRangesLen(ranges [][2]int) int {
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i][0] < ranges[j][0] })
+	total, end := 0, 0 // end: the union so far ends at end
+	for _, r := range ranges {
+		if r[1] <= end {
+			continue
+		}
+		total += r[1] - max(r[0], end)
+		end = r[1]
+	}
+	return total
 }

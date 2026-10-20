@@ -29,11 +29,22 @@ const (
 	// KazPlacementReplace puts the output in protected only when a protected
 	// source block was copied whole into it, else in probation.
 	KazPlacementReplace = "replace"
+	// KazPlacementShare puts the output in protected when the bytes copied
+	// from protected source blocks are at least
+	// Config.KazCacheCompactionPlacementShareRatio of its non-hole bytes,
+	// else in probation.
+	KazPlacementShare = "share"
 )
+
+// kazDefaultShareRatio is the default (and fallback) of
+// Config.KazCacheCompactionPlacementShareRatio.
+const kazDefaultShareRatio = 0.5
 
 // kazCacheSelfCheck normalizes the kaz-2q options, warning and falling back to
 // defaults for out-of-range values (an empty compaction placement silently
-// becomes inherit, an unknown one warns and becomes inherit). It never changes other eviction settings.
+// becomes inherit, an unknown one warns and becomes inherit; the share ratio
+// is checked only for the share placement, which is the only one using it).
+// It never changes other eviction settings.
 func (c *Config) kazCacheSelfCheck() {
 	if c.KazCacheProbationRatio <= 0 || c.KazCacheProbationRatio >= 1 {
 		logger.Warnf("kaz-cache-probation-ratio should be in (0, 1), setting it to 0.4")
@@ -52,12 +63,21 @@ func (c *Config) kazCacheSelfCheck() {
 		c.KazCacheStateInterval = 5 * time.Minute
 	}
 	switch c.KazCacheCompactionPlacement {
-	case KazPlacementInherit, KazPlacementProbation, KazPlacementReplace:
+	case KazPlacementInherit, KazPlacementProbation, KazPlacementReplace, KazPlacementShare:
 	case "":
 		c.KazCacheCompactionPlacement = KazPlacementInherit
 	default:
-		logger.Warnf("kaz-cache-compaction-placement should be one of [%s, %s, %s], setting it to %s",
-			KazPlacementInherit, KazPlacementProbation, KazPlacementReplace, KazPlacementInherit)
+		logger.Warnf("kaz-cache-compaction-placement should be one of [%s, %s, %s, %s], setting it to %s",
+			KazPlacementInherit, KazPlacementProbation, KazPlacementReplace, KazPlacementShare, KazPlacementInherit)
 		c.KazCacheCompactionPlacement = KazPlacementInherit
 	}
+	if c.KazCacheCompactionPlacement == KazPlacementShare && !kazShareRatioValid(c.KazCacheCompactionPlacementShareRatio) {
+		logger.Warnf("kaz-cache-compaction-placement-share-ratio should be in (0, 1], setting it to %v", kazDefaultShareRatio)
+		c.KazCacheCompactionPlacementShareRatio = kazDefaultShareRatio
+	}
+}
+
+// kazShareRatioValid reports whether r is a valid share ratio, in (0, 1].
+func kazShareRatioValid(r float64) bool {
+	return r > 0 && r <= 1
 }

@@ -46,8 +46,8 @@ func TestKazCompactionSourcesMapping(t *testing.T) {
 		{Id: 0, Len: mib},
 		{Id: 20, Size: mib, Off: 0, Len: mib},
 	}, bs)
-	require.Equal(t, []chunk.KazBlockRef{ref(10, 8*mib, 0), ref(10, 8*mib, 1)}, f(0))
-	require.Equal(t, []chunk.KazBlockRef{ref(10, 8*mib, 1), whole(ref(20, mib, 0))}, f(1))
+	require.Equal(t, []chunk.KazBlockRef{ref(10, 8*mib, 0), ref(10, 8*mib, 1)}, kazRefsNoBytes(f(0)))
+	require.Equal(t, []chunk.KazBlockRef{ref(10, 8*mib, 1), whole(ref(20, mib, 0))}, kazRefsNoBytes(f(1)))
 	require.Empty(t, f(2))
 
 	// A covers only the first output block [0, 4MiB) from [2MiB, 6MiB).
@@ -56,8 +56,8 @@ func TestKazCompactionSourcesMapping(t *testing.T) {
 		{Id: 0, Len: mib},
 		{Id: 20, Size: mib, Off: 0, Len: mib},
 	}, bs)
-	require.Equal(t, []chunk.KazBlockRef{ref(10, 8*mib, 0), ref(10, 8*mib, 1)}, f(0))
-	require.Equal(t, []chunk.KazBlockRef{whole(ref(20, mib, 0))}, f(1))
+	require.Equal(t, []chunk.KazBlockRef{ref(10, 8*mib, 0), ref(10, 8*mib, 1)}, kazRefsNoBytes(f(0)))
+	require.Equal(t, []chunk.KazBlockRef{whole(ref(20, mib, 0))}, kazRefsNoBytes(f(1)))
 
 	// Two pieces of the same source block are listed once.
 	f = kazCompactionSources([]meta.Slice{
@@ -65,7 +65,7 @@ func TestKazCompactionSourcesMapping(t *testing.T) {
 		{Id: 31, Size: 100, Off: 0, Len: 100},
 		{Id: 30, Size: mib, Off: 1100, Len: 1000},
 	}, bs)
-	require.Equal(t, []chunk.KazBlockRef{ref(30, mib, 0), whole(ref(31, 100, 0))}, f(0))
+	require.Equal(t, []chunk.KazBlockRef{ref(30, mib, 0), whole(ref(31, 100, 0))}, kazRefsNoBytes(f(0)))
 }
 
 // TestKazCompactionSourcesWhole checks Whole: a source block is whole in an
@@ -79,14 +79,14 @@ func TestKazCompactionSourcesWhole(t *testing.T) {
 	}
 	// One piece copies a whole source block.
 	f := kazCompactionSources([]meta.Slice{{Id: 10, Size: 8 * mib, Off: 0, Len: 4 * mib}}, bs)
-	require.Equal(t, []chunk.KazBlockRef{ref(10, 8*mib, 0, true)}, f(0))
+	require.Equal(t, []chunk.KazBlockRef{ref(10, 8*mib, 0, true)}, kazRefsNoBytes(f(0)))
 
 	// Two pieces of the same source block cover it together.
 	f = kazCompactionSources([]meta.Slice{
 		{Id: 10, Size: 4 * mib, Off: mib, Len: 3 * mib},
 		{Id: 10, Size: 4 * mib, Off: 0, Len: mib},
 	}, bs)
-	require.Equal(t, []chunk.KazBlockRef{ref(10, 4*mib, 0, true)}, f(0))
+	require.Equal(t, []chunk.KazBlockRef{ref(10, 4*mib, 0, true)}, kazRefsNoBytes(f(0)))
 
 	// Only one of the two pieces lands in this output block: not whole.
 	f = kazCompactionSources([]meta.Slice{
@@ -94,23 +94,85 @@ func TestKazCompactionSourcesWhole(t *testing.T) {
 		{Id: 0, Len: mib},
 		{Id: 10, Size: 4 * mib, Off: 0, Len: mib},
 	}, bs)
-	require.Equal(t, []chunk.KazBlockRef{ref(10, 4*mib, 0, false)}, f(0))
-	require.Equal(t, []chunk.KazBlockRef{ref(10, 4*mib, 0, false)}, f(1))
+	require.Equal(t, []chunk.KazBlockRef{ref(10, 4*mib, 0, false)}, kazRefsNoBytes(f(0)))
+	require.Equal(t, []chunk.KazBlockRef{ref(10, 4*mib, 0, false)}, kazRefsNoBytes(f(1)))
 
 	// A piece straddling source blocks 0 and 1 covers neither fully.
 	f = kazCompactionSources([]meta.Slice{{Id: 10, Size: 8 * mib, Off: 2 * mib, Len: 4 * mib}}, bs)
-	require.Equal(t, []chunk.KazBlockRef{ref(10, 8*mib, 0, false), ref(10, 8*mib, 1, false)}, f(0))
+	require.Equal(t, []chunk.KazBlockRef{ref(10, 8*mib, 0, false), ref(10, 8*mib, 1, false)}, kazRefsNoBytes(f(0)))
 
 	// The short last block of a slice is whole when all of its 1 MiB is copied.
 	f = kazCompactionSources([]meta.Slice{{Id: 10, Size: 5 * mib, Off: 4 * mib, Len: mib}}, bs)
-	require.Equal(t, []chunk.KazBlockRef{ref(10, 5*mib, 1, true)}, f(0))
+	require.Equal(t, []chunk.KazBlockRef{ref(10, 5*mib, 1, true)}, kazRefsNoBytes(f(0)))
 
 	// Overlapping pieces are merged as a union, not summed: [0,3)+[1,3) is not whole.
 	f = kazCompactionSources([]meta.Slice{
 		{Id: 10, Size: 4 * mib, Off: 0, Len: 3 * mib},
 		{Id: 10, Size: 4 * mib, Off: mib, Len: mib},
 	}, bs)
-	require.Equal(t, []chunk.KazBlockRef{ref(10, 4*mib, 0, false)}, f(0))
+	require.Equal(t, []chunk.KazBlockRef{ref(10, 4*mib, 0, false)}, kazRefsNoBytes(f(0)))
+}
+
+// kazRefsNoBytes clears Bytes and OutBytes of refs so that the mapping and
+// Whole tests compare only the block identity and Whole (Bytes and OutBytes
+// are checked by TestKazCompactionSourcesBytes).
+func kazRefsNoBytes(refs []chunk.KazBlockRef) []chunk.KazBlockRef {
+	out := make([]chunk.KazBlockRef, len(refs))
+	for i, r := range refs {
+		r.Bytes, r.OutBytes = 0, 0
+		out[i] = r
+	}
+	return out
+}
+
+// TestKazCompactionSourcesBytes checks Bytes (the union, across pieces, of the
+// bytes of a source block copied into one output block) and OutBytes (the
+// non-hole bytes of that output block, the same in every ref of the block).
+func TestKazCompactionSourcesBytes(t *testing.T) {
+	const mib = 1 << 20
+	const bs = 4 * mib
+	// bytesOf returns (ID, Indx, Bytes, OutBytes) of every ref of f(indx).
+	bytesOf := func(f func(int) []chunk.KazBlockRef, indx int) [][4]uint64 {
+		var out [][4]uint64
+		for _, r := range f(indx) {
+			out = append(out, [4]uint64{r.ID, uint64(r.Indx), uint64(r.Bytes), uint64(r.OutBytes)})
+		}
+		return out
+	}
+
+	// Overlapping pieces of one source block count once as a union ([0,3)+[1,2)
+	// = 3 MiB), while the output block holds 4 MiB of non-hole bytes.
+	f := kazCompactionSources([]meta.Slice{
+		{Id: 10, Size: 4 * mib, Off: 0, Len: 3 * mib},
+		{Id: 10, Size: 4 * mib, Off: mib, Len: mib},
+	}, bs)
+	require.Equal(t, [][4]uint64{{10, 0, 3 * mib, 4 * mib}}, bytesOf(f, 0))
+
+	// A source slice spanning two output blocks (and two source blocks), a hole
+	// and a second slice: the hole is excluded from OutBytes.
+	f = kazCompactionSources([]meta.Slice{
+		{Id: 10, Size: 8 * mib, Off: 2 * mib, Len: 5 * mib},
+		{Id: 0, Len: mib},
+		{Id: 20, Size: mib, Off: 0, Len: mib},
+	}, bs)
+	require.Equal(t, [][4]uint64{{10, 0, 2 * mib, 4 * mib}, {10, 1, 2 * mib, 4 * mib}}, bytesOf(f, 0))
+	require.Equal(t, [][4]uint64{{10, 1, mib, 2 * mib}, {20, 0, mib, 2 * mib}}, bytesOf(f, 1))
+
+	// The short last block of a slice (1 MiB) copied after a hole.
+	f = kazCompactionSources([]meta.Slice{
+		{Id: 0, Len: mib},
+		{Id: 10, Size: 5 * mib, Off: 4 * mib, Len: mib},
+	}, bs)
+	require.Equal(t, [][4]uint64{{10, 1, mib, mib}}, bytesOf(f, 0))
+
+	// Pieces of the same block split by another slice: union of two disjoint
+	// ranges of block 30, plus slice 31.
+	f = kazCompactionSources([]meta.Slice{
+		{Id: 30, Size: mib, Off: 0, Len: 1000},
+		{Id: 31, Size: 100, Off: 0, Len: 100},
+		{Id: 30, Size: mib, Off: 1100, Len: 1000},
+	}, bs)
+	require.Equal(t, [][4]uint64{{30, 0, 2000, 2100}, {31, 0, 100, 2100}}, bytesOf(f, 0))
 }
 
 // kazCacheStater is the diagnostic interface of the chunk store under test.

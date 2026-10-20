@@ -110,11 +110,13 @@ func (m *cacheManager) kazLoadNoTouch(key string) (ReadCloser, error) {
 }
 
 // kazPlacementSource is one source block of a compaction output block given
-// to kazCompactionPlacement: its block key and whether its full range was
-// copied into the output block (KazBlockRef.Whole).
+// to kazCompactionPlacement: its block key, whether its full range was copied
+// into the output block (KazBlockRef.Whole) and how many of its bytes were
+// copied into it (KazBlockRef.Bytes, a union across pieces).
 type kazPlacementSource struct {
 	key   string
 	whole bool
+	bytes uint32
 }
 
 // kazCompactionPlacement decides whether the compaction output block outKey
@@ -125,13 +127,16 @@ type kazPlacementSource struct {
 // segment follows the output store's placement mode (from
 // Config.KazCacheCompactionPlacement): inherit = protected if any cached
 // source is protected; probation = always probation; replace = protected
-// only if a protected source has whole set. In every mode the atime is the
-// newest among the cached sources. It returns whether the caller should
+// only if a protected source has whole set; share = protected if the bytes of
+// the protected sources are at least the share ratio of outBytes (the
+// non-hole bytes of the output block; 0 gives probation). In every mode the
+// atime is the newest among the cached sources. It returns whether the caller should
 // cache the output and counts compaction_output_cached or
 // compaction_output_skipped. Sources that are only pending in memory, or
 // only in a legacy store, are not considered.
-func (m *cacheManager) kazCompactionPlacement(outKey string, srcs []kazPlacementSource) bool {
+func (m *cacheManager) kazCompactionPlacement(outKey string, outBytes uint32, srcs []kazPlacementSource) bool {
 	var atime uint32
+	var protectedBytes uint64 // bytes copied from protected sources (share)
 	found, anyProtected, wholeProtected := false, false, false
 	for _, src := range srcs {
 		s := m.getStore(src.key)
@@ -144,6 +149,7 @@ func (m *cacheManager) kazCompactionPlacement(outKey string, srcs []kazPlacement
 				if sg == kazProtected {
 					anyProtected = true
 					wholeProtected = wholeProtected || src.whole
+					protectedBytes += uint64(src.bytes)
 				}
 				atime = max(atime, at)
 				found = true
@@ -161,6 +167,10 @@ func (m *cacheManager) kazCompactionPlacement(outKey string, srcs []kazPlacement
 			case KazPlacementProbation:
 			case KazPlacementReplace:
 				if wholeProtected {
+					seg = kazProtected
+				}
+			case KazPlacementShare:
+				if kazShareProtected(protectedBytes, outBytes, idx.shareRatio) {
 					seg = kazProtected
 				}
 			default: // inherit
@@ -181,6 +191,17 @@ func (m *cacheManager) kazCompactionPlacement(outKey string, srcs []kazPlacement
 		}
 	}
 	return placed
+}
+
+// kazShareProtected reports whether the share placement puts an output block
+// in protected: protectedBytes (copied from protected sources) is at least
+// ratio of outBytes (its non-hole bytes). A zero outBytes gives false
+// (probation), since there is no source data to weigh.
+func kazShareProtected(protectedBytes uint64, outBytes uint32, ratio float64) bool {
+	if outBytes == 0 {
+		return false
+	}
+	return float64(protectedBytes) >= ratio*float64(outBytes)
 }
 
 // kazCacheState reports whether key is cached in its store and its kaz-2q

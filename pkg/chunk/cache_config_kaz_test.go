@@ -71,6 +71,7 @@ func TestKaz2QConfigSelfCheck(t *testing.T) {
 		{EvictionKaz2Q, "/tmp/x", KazPlacementInherit, KazPlacementInherit},
 		{EvictionKaz2Q, "/tmp/x", KazPlacementProbation, KazPlacementProbation},
 		{EvictionKaz2Q, "/tmp/x", KazPlacementReplace, KazPlacementReplace},
+		{EvictionKaz2Q, "/tmp/x", KazPlacementShare, KazPlacementShare},
 		{EvictionLRU, "/tmp/x", "bogus", "bogus"},
 		{Eviction2Random, "/tmp/x", "", ""},
 		{EvictionKaz2Q, "memory", "bogus", "bogus"},
@@ -82,6 +83,31 @@ func TestKaz2QConfigSelfCheck(t *testing.T) {
 		if conf.KazCacheCompactionPlacement != c.want {
 			t.Fatalf("%s/%s placement %q: got %q, want %q", c.evict, c.dir, c.in,
 				conf.KazCacheCompactionPlacement, c.want)
+		}
+	}
+
+	// Share ratio: under kaz-2q with share, values outside (0, 1] warn and
+	// become 0.5; other placements and other eviction policies leave it alone.
+	for _, c := range []struct {
+		evict, placement string
+		in, want         float64
+	}{
+		{EvictionKaz2Q, KazPlacementShare, 0, 0.5},
+		{EvictionKaz2Q, KazPlacementShare, -0.1, 0.5},
+		{EvictionKaz2Q, KazPlacementShare, 1.5, 0.5},
+		{EvictionKaz2Q, KazPlacementShare, 1, 1},
+		{EvictionKaz2Q, KazPlacementShare, 0.3, 0.3},
+		{EvictionKaz2Q, KazPlacementInherit, 0, 0},
+		{EvictionLRU, KazPlacementShare, 0, 0},
+		{Eviction2Random, KazPlacementShare, 1.5, 1.5},
+	} {
+		conf := Config{CacheDir: "/tmp/x", CacheSize: 1 << 30, CacheEviction: c.evict,
+			KazCacheProbationRatio: 0.4, KazCacheStateInterval: time.Minute,
+			KazCacheCompactionPlacement: c.placement, KazCacheCompactionPlacementShareRatio: c.in}
+		conf.SelfCheck("uuid")
+		if conf.KazCacheCompactionPlacementShareRatio != c.want {
+			t.Fatalf("%s/%s share ratio %v: got %v, want %v", c.evict, c.placement, c.in,
+				conf.KazCacheCompactionPlacementShareRatio, c.want)
 		}
 	}
 }

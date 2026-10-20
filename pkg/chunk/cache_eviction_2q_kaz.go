@@ -227,6 +227,7 @@ type kaz2QIndex struct {
 
 	stateInterval time.Duration // save interval of the state file
 	placement     string        // compaction output placement (KazPlacement*), fixed at creation
+	shareRatio    float64       // protected share threshold of the share placement, in (0, 1]
 	// saveMu serializes writers of the state file (periodic saver and the
 	// flush at umount); it is not the store mutex and guards no index field.
 	saveMu sync.Mutex
@@ -265,8 +266,12 @@ func newKaz2QIndex(conf *Config) *kaz2QIndex {
 		interval = 5 * time.Minute
 	}
 	placement := conf.KazCacheCompactionPlacement
-	if placement != KazPlacementProbation && placement != KazPlacementReplace {
+	if placement != KazPlacementProbation && placement != KazPlacementReplace && placement != KazPlacementShare {
 		placement = KazPlacementInherit
+	}
+	shareRatio := conf.KazCacheCompactionPlacementShareRatio
+	if !kazShareRatioValid(shareRatio) {
+		shareRatio = kazDefaultShareRatio
 	}
 	return &kaz2QIndex{
 		keys:           make(map[cacheKey]*kazItem),
@@ -280,6 +285,7 @@ func newKaz2QIndex(conf *Config) *kaz2QIndex {
 		expect:         make(map[cacheKey]kazExpectation),
 		stateInterval:  interval,
 		placement:      placement,
+		shareRatio:     shareRatio,
 		now:            func() uint32 { return uint32(time.Now().Unix()) },
 	}
 }

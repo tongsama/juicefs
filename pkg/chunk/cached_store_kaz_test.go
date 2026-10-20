@@ -19,6 +19,7 @@ package chunk
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -452,6 +453,86 @@ func TestKazCompactionPlacementModes(t *testing.T) {
 			_, cached := f.store.KazCacheState(key)
 			require.False(t, cached, "output without a cached source must not be cached")
 			require.Equal(t, 3.0, f.kazEvents("compaction_output_cached"))
+			require.Equal(t, 1.0, f.kazEvents("compaction_output_skipped"))
+		})
+	}
+}
+
+// TestKazCompactionPlacementShare checks --kaz-cache-compaction-placement share:
+// an output block goes to protected when the bytes copied from protected
+// source blocks reach the share ratio of its non-hole bytes, else to the
+// newest end of probation; no protected source or a zero denominator (holes
+// only) gives probation, no cached source skips caching, and the output
+// takes the newest atime of its sources.
+func TestKazCompactionPlacementShare(t *testing.T) {
+	const mib = 1 << 20
+	for _, tc := range []struct {
+		ratio   float64
+		mixed   string // 3 MiB from a protected source + 1 MiB from a probation source
+		protAll string // 4 MiB from a protected source
+	}{
+		{0.5, "protected", "protected"},
+		{0.8, "probation", "protected"},
+		{1, "probation", "protected"},
+	} {
+		t.Run(fmt.Sprint(tc.ratio), func(t *testing.T) {
+			f := newKazCompFixtureConf(t, EvictionKaz2Q, "", true, func(c *Config) {
+				c.KazCacheCompactionPlacement = KazPlacementShare
+				c.KazCacheCompactionPlacementShareRatio = tc.ratio
+			}, 1, 2)
+			cs := f.cs
+			idx := cs.keys.(*kaz2QIndex)
+			future := uint32(time.Now().Unix()) + 100000
+			cs.Lock()
+			orig := idx.now
+			idx.now = func() uint32 { return future }
+			cs.Unlock()
+			f.read(t, context.Background(), 1, 0, 100) // user read: promote slice 1, atime = future
+			cs.Lock()
+			idx.now = orig
+			seg1, _ := idx.kazSegmentOf(cs.getCacheKey(f.keys[1]))
+			seg2, _ := idx.kazSegmentOf(cs.getCacheKey(f.keys[2]))
+			atime2 := idx.peekAtime(cs.getCacheKey(f.keys[2]))
+			cs.Unlock()
+			require.Equal(t, kazProtected, seg1)
+			require.Equal(t, kazProbation, seg2)
+			// ref builds a source ref copying n bytes into an output block of out non-hole bytes.
+			ref := func(id uint64, n, out uint32) KazBlockRef {
+				return KazBlockRef{ID: id, SliceSize: kazCompSize, Indx: 0, Bytes: n, OutBytes: out}
+			}
+			data := bytes.Repeat([]byte{0xEF}, kazCompSize)
+			// itemOf returns the index item of the cached output key.
+			itemOf := func(key string) kazItem {
+				cs.Lock()
+				defer cs.Unlock()
+				return *idx.keys[cs.getCacheKey(key)]
+			}
+
+			before := uint32(time.Now().Unix())
+			key := f.kazWriteCompactionOutput(t, 101, data, []KazBlockRef{ref(1, 3*mib, 4*mib), ref(2, mib, 4*mib)})
+			require.Equal(t, tc.mixed, f.waitState(t, key), "3 of 4 MiB from protected")
+			it := itemOf(key)
+			require.Equal(t, future, it.atime, "output must inherit the newest source atime")
+			if tc.mixed == "probation" {
+				require.GreaterOrEqual(t, it.order, before, "probation output must enter the newest end")
+			}
+
+			key = f.kazWriteCompactionOutput(t, 102, data, []KazBlockRef{ref(1, 4*mib, 4*mib)})
+			require.Equal(t, tc.protAll, f.waitState(t, key), "4 of 4 MiB from protected")
+			require.Equal(t, future, itemOf(key).atime)
+
+			key = f.kazWriteCompactionOutput(t, 103, data, []KazBlockRef{ref(2, 4*mib, 4*mib)})
+			require.Equal(t, "probation", f.waitState(t, key), "no protected source")
+			require.Equal(t, atime2, itemOf(key).atime)
+
+			key = f.kazWriteCompactionOutput(t, 104, data, []KazBlockRef{ref(1, 0, 0)})
+			require.Equal(t, "probation", f.waitState(t, key), "zero denominator (holes only)")
+
+			key = f.kazWriteCompactionOutput(t, 105, data, []KazBlockRef{ref(9, 4*mib, 4*mib)})
+			time.Sleep(100 * time.Millisecond)
+			_, cached := f.store.KazCacheState(key)
+			require.False(t, cached, "output without a cached source must not be cached")
+			require.Equal(t, 4.0, f.kazEvents("compaction_output_cached"))
 			require.Equal(t, 1.0, f.kazEvents("compaction_output_skipped"))
 		})
 	}

@@ -66,12 +66,18 @@ func (store *cachedStore) kazLoadForRead(ctx context.Context, key string) (ReadC
 // KazBlockRef names one block of a source slice of a compaction: the slice id,
 // its full size (to build the block key) and the block index. Whole reports
 // whether the full range of that source block was copied into the output
-// block it is listed for (used by the replace placement).
+// block it is listed for (used by the replace placement). Bytes is the size
+// of the union of the byte ranges of that source block copied into the output
+// block, and OutBytes the non-hole bytes of the output block (the same in
+// every ref of one output block); the share placement compares the Bytes of
+// protected sources with OutBytes.
 type KazBlockRef struct {
 	ID        uint64
 	SliceSize uint32
 	Indx      uint32
 	Whole     bool
+	Bytes     uint32
+	OutBytes  uint32
 }
 
 // KazSetCompactionSources marks the slice as a compaction output whose block
@@ -96,7 +102,7 @@ func (s *wSlice) KazSetCompactionSources(f func(indx int) []KazBlockRef) {
 // cache without kaz placement (memory cache) keeps the upstream rule.
 func (store *cachedStore) kazCacheCompactionOutput(key string, block *Page, sources func(int) []KazBlockRef) {
 	placer, ok := store.bcache.(interface {
-		kazCompactionPlacement(outKey string, srcs []kazPlacementSource) bool
+		kazCompactionPlacement(outKey string, outBytes uint32, srcs []kazPlacementSource) bool
 	})
 	if !ok {
 		if len(block.Data) < store.conf.BlockSize || store.conf.CacheLargeWrite {
@@ -108,13 +114,16 @@ func (store *cachedStore) kazCacheCompactionOutput(key string, block *Page, sour
 	indx := (*cacheStore)(nil).getCacheKey(key).indx
 	refs := sources(int(indx))
 	srcs := make([]kazPlacementSource, 0, len(refs))
+	var outBytes uint32 // the same in every ref; max guards hand-made refs
 	for _, ref := range refs {
 		srcs = append(srcs, kazPlacementSource{
 			key:   sliceForRead(ref.ID, int(ref.SliceSize), store).key(int(ref.Indx)),
 			whole: ref.Whole,
+			bytes: ref.Bytes,
 		})
+		outBytes = max(outBytes, ref.OutBytes)
 	}
-	if placer.kazCompactionPlacement(key, srcs) {
+	if placer.kazCompactionPlacement(key, outBytes, srcs) {
 		store.bcache.cache(key, block, false, false)
 	}
 }

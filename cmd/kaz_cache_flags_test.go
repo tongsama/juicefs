@@ -61,6 +61,7 @@ func TestKazCacheCompactionPlacementFlag(t *testing.T) {
 		{nil, chunk.KazPlacementInherit},
 		{[]string{"--kaz-cache-compaction-placement", "probation"}, chunk.KazPlacementProbation},
 		{[]string{"--kaz-cache-compaction-placement", "replace"}, chunk.KazPlacementReplace},
+		{[]string{"--kaz-cache-compaction-placement", "share"}, chunk.KazPlacementShare},
 		{[]string{"--kaz-cache-compaction-placement", "bogus"}, "bogus"},
 	} {
 		set := flag.NewFlagSet("kaz-placement-test", flag.ContinueOnError)
@@ -71,5 +72,28 @@ func TestKazCacheCompactionPlacementFlag(t *testing.T) {
 		conf := &chunk.Config{}
 		applyKazCacheFlags(cli.NewContext(nil, set, nil), conf)
 		require.Equal(t, tc.want, conf.KazCacheCompactionPlacement, "%v", tc.args)
+	}
+}
+
+// TestKazCacheCompactionPlacementShareRatioFlag checks that
+// --kaz-cache-compaction-placement-share-ratio defaults to 0.5 and is copied
+// as given into the chunk config (the range is checked by the chunk self-check).
+func TestKazCacheCompactionPlacementShareRatioFlag(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want float64
+	}{
+		{nil, 0.5},
+		{[]string{"--kaz-cache-compaction-placement-share-ratio", "0.8"}, 0.8},
+		{[]string{"--kaz-cache-compaction-placement-share-ratio", "1.5"}, 1.5},
+	} {
+		set := flag.NewFlagSet("kaz-share-ratio-test", flag.ContinueOnError)
+		for _, f := range dataCacheFlags() {
+			require.NoError(t, f.Apply(set))
+		}
+		require.NoError(t, set.Parse(tc.args))
+		conf := &chunk.Config{}
+		applyKazCacheFlags(cli.NewContext(nil, set, nil), conf)
+		require.Equal(t, tc.want, conf.KazCacheCompactionPlacementShareRatio, "%v", tc.args)
 	}
 }
