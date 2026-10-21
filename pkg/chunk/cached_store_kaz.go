@@ -143,3 +143,14 @@ func (store *cachedStore) KazCacheState(key string) (segment string, cached bool
 	_, cached = store.bcache.exist(key)
 	return "", cached
 }
+
+// kazWholeRead reports whether a read under ctx of a block of bs bytes should
+// fetch the whole object (and cache it) instead of a range, as configured by
+// Config.KazWholeReadMax (delta compaction mode; 0 disables). It holds only
+// when the fetched block is kept: not when the block is not cacheable
+// (shouldCache) and not for a compaction read under kaz-2q, which is not
+// cached; otherwise each small read would GET the whole object again.
+func (store *cachedStore) kazWholeRead(ctx context.Context, bs int) bool {
+	return store.conf.KazWholeReadMax > 0 && bs <= store.conf.KazWholeReadMax &&
+		store.shouldCache(bs) && !store.kazCompactionRead(ctx)
+}

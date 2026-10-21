@@ -30,9 +30,9 @@ const (
 // Zero thresholds mean "use the default", so Go callers that never set them keep defaults.
 func (c *Config) ValidateKazBlockCompaction() error {
 	switch c.KazCompactionMode {
-	case "", KazCompactionModeUpstream, KazCompactionModeBlock:
+	case "", KazCompactionModeUpstream, KazCompactionModeBlock, KazCompactionModeDelta:
 	default:
-		return fmt.Errorf("invalid kaz-compaction-mode %q (want upstream or block)", c.KazCompactionMode)
+		return fmt.Errorf("invalid kaz-compaction-mode %q (want upstream, block or delta)", c.KazCompactionMode)
 	}
 	if r := c.KazCompactionBlockHiddenRatio; r != 0 && !(r > 0 && r <= 1) {
 		return fmt.Errorf("invalid kaz-compaction-block-hidden-ratio %v (want 0 < ratio <= 1)", r)
@@ -40,12 +40,14 @@ func (c *Config) ValidateKazBlockCompaction() error {
 	if c.KazCompactionBlockMaxSlices < 0 {
 		return fmt.Errorf("invalid kaz-compaction-block-max-slices %d (want >= 0)", c.KazCompactionBlockMaxSlices)
 	}
-	return nil
+	return c.validateKazDelta()
 }
 
-// kazBlockCompactionEnabled reports whether background compaction should use the block mode.
+// kazBlockCompactionEnabled reports whether background compaction should go
+// through the kaz block replacer: block mode, or delta mode (which plans delta
+// or block compaction inside runKazBlockCompaction).
 func (c *Config) kazBlockCompactionEnabled() bool {
-	return c.KazCompactionMode == KazCompactionModeBlock
+	return c.KazCompactionMode == KazCompactionModeBlock || c.KazCompactionMode == KazCompactionModeDelta
 }
 
 // kazBlockHiddenRatio returns the hidden-data share above which a chunk is rewritten whole.

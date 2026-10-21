@@ -23,7 +23,7 @@ import (
 )
 
 // doKazReplaceChunk follows kvMeta.doCompactChunk with a list of new records.
-func (m *kvMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []Slice, delayed []byte, delayedKey uint64) syscall.Errno {
+func (m *kvMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []kazCreated, delayed []byte, delayedKey uint64) syscall.Errno {
 	st := errno(m.txn(Background(), func(tx *kvTxn) error {
 		buf2 := tx.get(m.chunkKey(inode, indx))
 		if len(buf2) < len(origin) || !bytes.Equal(origin, buf2[:len(origin)]) {
@@ -37,7 +37,7 @@ func (m *kvMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []by
 			tx.set(m.chunkKey(inode, indx), buf2)
 		}
 		for _, c := range created {
-			tx.set(m.sliceKey(c.Id, c.Size), make([]byte, 8)) // create the key to tracking it
+			tx.set(m.sliceKey(c.Id, c.Size), packCounter(int64(c.Refs-1))) // create the key to tracking it, holding Refs-1
 		}
 		if delayed != nil {
 			if len(delayed) > 0 {
@@ -75,14 +75,15 @@ func (m *kvMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []by
 			m.cleanupZeroRef(c.Id, c.Size)
 		}
 		if delayed == nil {
-			var refs int64
-			for _, s := range removed {
-				if s.id > 0 && m.client.txn(Background(), func(tx *kvTxn) error {
+			// a slice referenced by several removed records is announced once
+			for _, s := range kazDedupDeletes(removed, func(s *slice) bool {
+				var refs int64
+				return m.client.txn(Background(), func(tx *kvTxn) error {
 					refs = tx.incrBy(m.sliceKey(s.id, s.size), 0)
 					return nil
-				}, 0) == nil && refs < 0 {
-					m.enqueueCompactionDelete(s.id, s.size)
-				}
+				}, 0) == nil && refs < 0
+			}) {
+				m.enqueueCompactionDelete(s.id, s.size)
 			}
 		}
 	}

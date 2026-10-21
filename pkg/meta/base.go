@@ -300,6 +300,7 @@ type baseMeta struct {
 	compactionGC      atomic.Pointer[compactionGC]
 	priorityCompactor atomic.Pointer[compactionScheduler]
 	kazCompact        atomic.Pointer[compactionPolicy]
+	kazDeltaBases     kazDeltaBaseTable // kaz: per-chunk base counts of delta compaction
 
 	dirStatsLock sync.RWMutex
 	dirStats     map[Ino]dirStat
@@ -2260,9 +2261,9 @@ func (m *baseMeta) afterWrite(ctx Context, inode Ino, indx uint32, attr *Attr, d
 	m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
 	m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
 	ph.stat = time.Since(phaseStart)
-	if compactionWanted(prevSlices, ph.numSlices) {
+	if want, count := m.kazCompactionWanted(inode, indx, prevSlices, ph.numSlices); want {
 		if ph.numSlices < maxSlices {
-			m.requestBackgroundCompaction(inode, indx, ph.numSlices, int(attr.Tier))
+			m.requestBackgroundCompaction(inode, indx, count, int(attr.Tier))
 		} else {
 			logger.Debugf("metadata write inode=%d chunk=%d phase=compact slices=%d", inode, indx, ph.numSlices)
 			phaseStart = time.Now()

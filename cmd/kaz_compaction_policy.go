@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/urfave/cli/v2"
 )
 
@@ -36,13 +37,39 @@ func kazCompactionReadMinFromFlag(readMin int) (int, error) {
 	return readMin, nil
 }
 
-// kazBlockCompactionFromFlags checks the block compaction flags. Unlike the Go
-// config, a hidden ratio of 0 on the command line is out of range.
-func kazBlockCompactionFromFlags(mode string, ratio float64, maxSlices int) (meta.Config, error) {
+// kazBlockCompactionFromFlags checks the block and delta compaction flags.
+// Unlike the Go config, a hidden ratio, delta tiers, delta max records, delta
+// trigger or delta block ratio of 0 on the command line is out of range. gap and
+// minFileSize are in bytes; gap 0 becomes Config -1 (no joining).
+func kazBlockCompactionFromFlags(mode string, ratio float64, maxSlices, deltaTiers, deltaMaxRecords int, deltaGap, deltaMinFileSize uint64,
+	deltaTrigger int, deltaBlockRatio float64) (meta.Config, error) {
 	if ratio == 0 {
 		return meta.Config{}, fmt.Errorf("invalid kaz-compaction-block-hidden-ratio 0 (want 0 < ratio <= 1)")
 	}
-	conf := meta.Config{KazCompactionMode: mode, KazCompactionBlockHiddenRatio: ratio, KazCompactionBlockMaxSlices: maxSlices}
+	if deltaTiers == 0 {
+		return meta.Config{}, fmt.Errorf("invalid kaz-compaction-delta-tiers 0 (want 1..16)")
+	}
+	if deltaMaxRecords == 0 {
+		return meta.Config{}, fmt.Errorf("invalid kaz-compaction-delta-max-records 0 (want 50..800)")
+	}
+	if deltaTrigger == 0 {
+		return meta.Config{}, fmt.Errorf("invalid kaz-compaction-delta-trigger 0 (want 10..400)")
+	}
+	if deltaBlockRatio == 0 {
+		return meta.Config{}, fmt.Errorf("invalid kaz-compaction-delta-block-ratio 0 (want 0 < ratio <= 1)")
+	}
+	if deltaGap > 1<<20 {
+		return meta.Config{}, fmt.Errorf("invalid kaz-compaction-delta-gap %d (want 0..%d)", deltaGap, 1<<20)
+	}
+	// 0 on the command line means "no joining"; the Go config spells that -1.
+	gapCfg := int(deltaGap)
+	if deltaGap == 0 {
+		gapCfg = -1
+	}
+	conf := meta.Config{KazCompactionMode: mode, KazCompactionBlockHiddenRatio: ratio, KazCompactionBlockMaxSlices: maxSlices,
+		KazCompactionDeltaTiers: deltaTiers, KazCompactionDeltaMaxRecords: deltaMaxRecords,
+		KazCompactionDeltaGap: gapCfg, KazCompactionDeltaMinFileSize: deltaMinFileSize,
+		KazCompactionDeltaTrigger: deltaTrigger, KazCompactionDeltaBlockRatio: deltaBlockRatio}
 	if err := conf.ValidateKazBlockCompaction(); err != nil {
 		return meta.Config{}, err
 	}
@@ -57,11 +84,20 @@ func applyKazCompactionPolicyFlags(c *cli.Context, conf *meta.Config) {
 		logger.Fatalf("%s", err)
 	}
 	conf.KazCompactionReadMin = readMin
-	block, err := kazBlockCompactionFromFlags(c.String("kaz-compaction-mode"), c.Float64("kaz-compaction-block-hidden-ratio"), c.Int("kaz-compaction-block-max-slices"))
+	block, err := kazBlockCompactionFromFlags(c.String("kaz-compaction-mode"), c.Float64("kaz-compaction-block-hidden-ratio"), c.Int("kaz-compaction-block-max-slices"),
+		c.Int("kaz-compaction-delta-tiers"), c.Int("kaz-compaction-delta-max-records"),
+		utils.ParseBytes(c, "kaz-compaction-delta-gap", 'B'), utils.ParseBytes(c, "kaz-compaction-delta-min-file-size", 'B'),
+		c.Int("kaz-compaction-delta-trigger"), c.Float64("kaz-compaction-delta-block-ratio"))
 	if err != nil {
 		logger.Fatalf("%s", err)
 	}
 	conf.KazCompactionMode = block.KazCompactionMode
 	conf.KazCompactionBlockHiddenRatio = block.KazCompactionBlockHiddenRatio
 	conf.KazCompactionBlockMaxSlices = block.KazCompactionBlockMaxSlices
+	conf.KazCompactionDeltaTiers = block.KazCompactionDeltaTiers
+	conf.KazCompactionDeltaMaxRecords = block.KazCompactionDeltaMaxRecords
+	conf.KazCompactionDeltaGap = block.KazCompactionDeltaGap
+	conf.KazCompactionDeltaMinFileSize = block.KazCompactionDeltaMinFileSize
+	conf.KazCompactionDeltaTrigger = block.KazCompactionDeltaTrigger
+	conf.KazCompactionDeltaBlockRatio = block.KazCompactionDeltaBlockRatio
 }

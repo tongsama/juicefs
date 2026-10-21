@@ -153,7 +153,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	s.store.cacheMissBytes.Add(float64(len(p)))
 
 	if s.store.seekable &&
-		(!s.store.conf.CacheEnabled() || (boff > 0 && len(p) <= blockSize/4)) {
+		(!s.store.conf.CacheEnabled() || (boff > 0 && len(p) <= blockSize/4 && !s.store.kazWholeRead(ctx, blockSize))) {
 		n, err = s.store.loadRange(ctx, key, page, boff)
 		if err == nil || !errors.Is(err, errTryFullRead) {
 			return n, err
@@ -607,6 +607,8 @@ type Config struct {
 	KazCacheDemoteUnreadFirst bool
 	// KazCacheCompactionHotAge keeps protected compaction outputs younger than this out of protected placement (0 disables).
 	KazCacheCompactionHotAge time.Duration
+	// KazWholeReadMax makes a cache-enabled read of a block of at most this many bytes fetch the whole object instead of a range (0 disables).
+	KazWholeReadMax int
 }
 
 func (c *Config) SelfCheck(uuid string) {

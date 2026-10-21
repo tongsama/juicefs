@@ -178,7 +178,7 @@ func storageFlags() []cli.Flag {
 		&cli.StringFlag{
 			Name:  "kaz-compaction-mode",
 			Value: "upstream",
-			Usage: "[kaz] how compaction rewrites a chunk: upstream (the whole merged range as one new slice) or block (only the blocks changed since the last compaction, one new slice per block; juicefs compact and gc --compact leave every chunk as one slice per block with no hidden data); the synchronous compaction at 2500 slices stays upstream",
+			Usage: "[kaz] how compaction rewrites a chunk: upstream (the whole merged range as one new slice), block (only the blocks changed since the last compaction, one new slice per block; juicefs compact and gc --compact leave every chunk as one slice per block with no hidden data) or delta (like block, but scattered small changes over existing blocks are packed into one small slice per compaction; see --kaz-compaction-delta-*; on TKV engines (TiKV, etcd, BadgerDB, FoundationDB) delta falls back to block; do not run reflink copies (copy_file_range, cp --reflink) from unmodified clients while compaction runs); the synchronous compaction at 2500 slices stays upstream",
 		},
 		&cli.Float64Flag{
 			Name:  "kaz-compaction-block-hidden-ratio",
@@ -189,6 +189,36 @@ func storageFlags() []cli.Flag {
 			Name:  "kaz-compaction-block-max-slices",
 			Value: 0,
 			Usage: "[kaz] with --kaz-compaction-mode block, rewrite the whole chunk when more than this many slice records would remain (0 = blocks per chunk + 1, 17 for 4 MiB blocks)",
+		},
+		&cli.IntFlag{
+			Name:  "kaz-compaction-delta-tiers",
+			Value: 8,
+			Usage: "[kaz] with --kaz-compaction-mode delta, the maximum number of delta tiers kept on top of a block's base data; when exceeded, all deltas of the block are merged into one tier (1-16; 1 resends the whole delta every time); clients without delta mode (upstream or block) still read and write these chunks correctly but rewrite the touched blocks or the whole chunk",
+		},
+		&cli.IntFlag{
+			Name:  "kaz-compaction-delta-max-records",
+			Value: 500,
+			Usage: "[kaz] with --kaz-compaction-mode delta, fold deltas into their blocks (block-wise rewrite) when a chunk would hold more than this many slice records (50-800)",
+		},
+		&cli.StringFlag{
+			Name:  "kaz-compaction-delta-gap",
+			Value: "16K",
+			Usage: "[kaz] with --kaz-compaction-mode delta, join changes separated by a gap of at most this size, copying the original data of the gap into the delta, to reduce slice records (0-1M, 0 joins nothing; e.g. 16K)",
+		},
+		&cli.StringFlag{
+			Name:  "kaz-compaction-delta-min-file-size",
+			Value: "0",
+			Usage: "[kaz] with --kaz-compaction-mode delta, use block mode for chunks of files shorter than this size (e.g. 1G; 0 does not restrict)",
+		},
+		&cli.IntFlag{
+			Name:  "kaz-compaction-delta-trigger",
+			Value: 99,
+			Usage: "[kaz] with --kaz-compaction-mode delta, compact a chunk once this many slice records were added since its last compaction (10-400; max-records + trigger + 50 must not exceed 1000); a lower value compacts sooner and may clean more small staged slices before they upload, at the cost of more compactions and metadata reads; a higher value compacts less often",
+		},
+		&cli.Float64Flag{
+			Name:  "kaz-compaction-delta-block-ratio",
+			Value: 0.5,
+			Usage: "[kaz] with --kaz-compaction-mode delta, rewrite a block whole instead of keeping its changes in the delta once the changed bytes reach this share of the block size (0 < ratio <= 1; 1 rewrites only fully changed blocks); a higher value keeps more in the small delta slice, a lower value rewrites more blocks",
 		},
 		&cli.StringFlag{
 			Name:  "upload-limit",
