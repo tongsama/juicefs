@@ -25,7 +25,13 @@ import (
 // kazDC returns a delta setting for the 4 KiB fixed cases: hidden ratio 0.5,
 // 8 tiers and a 500-record limit unless the test changes them.
 func kazDC(trigger int, gap uint32) kazDeltaConf {
-	return kazDeltaConf{tiers: 8, maxRecords: 500, trigger: trigger, gap: gap, hiddenRatio: 0.5}
+	return kazDeltaConf{tiers: 8, maxRecords: 500, trigger: trigger, blockRatio: 0.5, gap: gap, hiddenRatio: 0.5}
+}
+
+// kazDeltaReasons returns the per-reason written block counts of a plan in
+// the order ratio, nobase, fold, whole, fallback.
+func kazDeltaReasons(p *kazBlockPlan) [5]int {
+	return [5]int{p.ratioBlocks, p.nobaseBlocks, p.foldBlocks, p.wholeBlocks, p.fallbackBlocks}
 }
 
 // kazBase16 returns 16 block-shaped base records (ids 1..16) of kazEB bytes.
@@ -185,6 +191,7 @@ func TestPlanKazDeltaHalfBlock(t *testing.T) {
 	require.True(t, p.outs[1].delta)
 	require.Equal(t, uint32(7*kazEB+10), p.outs[1].pos)
 	require.Equal(t, []uint64{4, 100, 101, 102, 103}, kazIDs(p.removed)) // base block 3 is inside the rewrite
+	require.Equal(t, [5]int{1, 0, 0, 0, 0}, kazDeltaReasons(p))
 	f := newKazFakeStore()
 	next := uint64(1000)
 	kazApplyDelta(t, f, ss, p, &next, 16*kazEB)
@@ -205,6 +212,7 @@ func TestPlanKazDeltaNoBase(t *testing.T) {
 	require.Len(t, p.outs, 2)
 	require.True(t, p.outs[0].delta)
 	require.Equal(t, kazBlockOut{pos: 6 * kazEB, length: 18, pieces: p.outs[1].pieces}, p.outs[1])
+	require.Equal(t, [5]int{0, 1, 0, 0, 0}, kazDeltaReasons(p))
 	f := newKazFakeStore()
 	next := uint64(1000)
 	kazApplyDelta(t, f, ss, p, &next, 8*kazEB)
@@ -234,6 +242,17 @@ func TestPlanKazDeltaMerge(t *testing.T) {
 			require.Equal(t, 99, removedTiers[tiers[0]])
 			require.Equal(t, 99, removedTiers[tiers[1]])
 			require.Equal(t, kazBase16(), p.kept)
+			var deltaBytes int
+			for _, o := range p.outs {
+				if o.delta {
+					deltaBytes += int(o.length)
+				}
+			}
+			require.NotZero(t, deltaBytes)
+			require.Equal(t, uint64(deltaBytes), p.mergeBytes)
+		}
+		if round < 2 {
+			require.Zero(t, p.mergeBytes)
 		}
 		var tier uint64
 		ss, tier = kazApplyDelta(t, f, ss, p, &next, 16*kazEB)
@@ -277,6 +296,7 @@ func TestPlanKazDeltaFold(t *testing.T) {
 	}
 	require.Equal(t, []uint32{1, 2, 3}, blocks)
 	require.Equal(t, 4, deltas)
+	require.Equal(t, [5]int{0, 0, 3, 0, 0}, kazDeltaReasons(p))
 	f := newKazFakeStore()
 	next := uint64(1 << 20)
 	after, _ := kazApplyDelta(t, f, ss, p, &next, 16*kazEB)
@@ -297,7 +317,7 @@ func TestPlanKazDeltaFoldZero(t *testing.T) {
 	require.NotNil(t, p)
 	require.Equal(t, "delta_fold", p.event)
 	require.False(t, p.full)
-	require.Equal(t, 1, p.foldBlocks)
+	require.Zero(t, p.foldBlocks) // the folded block became a mask: no block written
 	require.LessOrEqual(t, n, c.maxRecords-kazDeltaFoldMargin)
 	var masks, deltas int
 	for _, o := range p.outs {
@@ -385,9 +405,15 @@ func TestPlanKazDeltaProperty(t *testing.T) {
 	events := make(map[string]int)
 	for run := 0; run < 200; run++ {
 		c := kazDeltaConf{tiers: 1 + rng.Intn(16), maxRecords: 50 + rng.Intn(151), trigger: kazDeltaTrigger,
-			gap: uint32(rng.Intn(65)), hiddenRatio: 0.5}
-		if rng.Intn(2) == 0 { // plan more often to reach tiers, merges and folds
+			blockRatio: 1 - rng.Float64(), gap: uint32(rng.Intn(65)), hiddenRatio: 0.5}
+		switch rng.Intn(4) {
+		case 0, 1: // plan more often to reach tiers, merges and folds
 			c.trigger = 5 + rng.Intn(95)
+		case 2: // the --kaz-compaction-delta-trigger range
+			c.trigger = 10 + rng.Intn(391)
+		}
+		if rng.Intn(8) == 0 {
+			c.blockRatio = 1
 		}
 		// Half of the runs are mostly small writes (the VM shape), so that tiers
 		// pile up to the record limit instead of base rewrites resetting them.
@@ -472,6 +498,22 @@ func TestPlanKazDeltaProperty(t *testing.T) {
 			if !p.full {
 				require.LessOrEqual(t, len(after), c.maxRecords, "run=%d w=%d %s", run, w, p.event)
 				require.LessOrEqual(t, kazPlanPutBytes(p), bound, "run=%d w=%d %s", run, w, p.event)
+			}
+			// Every written block has exactly one reason (whole > fallback > fold >
+			// nobase > ratio): the reasons add up to the written blocks.
+			r := kazDeltaReasons(p)
+			require.Equal(t, kazDeltaDataBlocks(p), r[0]+r[1]+r[2]+r[3]+r[4], "run=%d w=%d %s %v", run, w, p.event, r)
+			switch {
+			case p.full:
+				require.Equal(t, [5]int{0, 0, 0, kazDeltaDataBlocks(p), 0}, r, "run=%d w=%d %s", run, w, p.event)
+			case p.event == kazDeltaEventFallback:
+				require.Equal(t, [5]int{0, 0, 0, 0, kazDeltaDataBlocks(p)}, r, "run=%d w=%d", run, w)
+				events["fallback/partial"]++
+			default:
+				require.Zero(t, r[3]+r[4])
+			}
+			if p.event != kazDeltaEventMerge {
+				require.Zero(t, p.mergeBytes)
 			}
 			ss = after
 		}
@@ -600,6 +642,7 @@ func TestPlanKazDeltaHiddenFull(t *testing.T) {
 	require.NotNil(t, p)
 	require.Equal(t, "delta_hidden_full", p.event)
 	require.True(t, p.full)
+	require.Equal(t, [5]int{0, 0, 0, 16, 0}, kazDeltaReasons(p))
 	require.Equal(t, len(p.kept)+len(p.outs), n)
 	f := newKazFakeStore()
 	next := uint64(1000)
@@ -615,4 +658,145 @@ func TestKazDeltaGivenUpBase(t *testing.T) {
 	require.Equal(t, 120, kazDeltaGivenUpBase(120, 150, kazDeltaTrigger))
 	require.Equal(t, 22, kazDeltaGivenUpBase(120, kazDeltaTrigger-1, kazDeltaTrigger))
 	require.Equal(t, 120, kazDeltaGivenUpBase(120, 0, kazDeltaTrigger))
+}
+
+// TestPlanKazDeltaBlockRatio keeps a block with 60% of it changed in the delta
+// at block ratio 0.75 and rewrites it at 0.5.
+func TestPlanKazDeltaBlockRatio(t *testing.T) {
+	ss := append(kazBase16(), // 3 x 820 = 2460 bytes of block 3 (60%)
+		kazRec(3*kazEB+10, 100, 820), kazRec(3*kazEB+1000, 101, 820), kazRec(3*kazEB+2000, 102, 820),
+		kazRec(7*kazEB+10, 103, 8))
+	c := kazDC(2, 16)
+	p, _ := planKazDelta(ss, kazEB, c)
+	require.NotNil(t, p)
+	require.Equal(t, 1, kazDeltaDataBlocks(p))
+	require.Equal(t, [5]int{1, 0, 0, 0, 0}, kazDeltaReasons(p))
+
+	c.blockRatio = 0.75
+	p, _ = planKazDelta(ss, kazEB, c)
+	require.NotNil(t, p)
+	require.Equal(t, "delta_tier", p.event)
+	require.Zero(t, kazDeltaDataBlocks(p))
+	require.Len(t, p.outs, 4)
+	require.Equal(t, [5]int{}, kazDeltaReasons(p))
+	f := newKazFakeStore()
+	next := uint64(1000)
+	kazApplyDelta(t, f, ss, p, &next, 16*kazEB)
+}
+
+// TestPlanKazDeltaBlockRatioOne rewrites a block at ratio 1 only when the delta
+// covers a whole block size: 4095 of 4096 bytes stay a delta, 4096 are rewritten.
+func TestPlanKazDeltaBlockRatioOne(t *testing.T) {
+	c := kazDC(2, 0)
+	c.blockRatio = 1
+	ss := append(kazBase16(), kazRec(3*kazEB, 100, 2048), kazRec(3*kazEB+2048, 101, 2047))
+	p, _ := planKazDelta(ss, kazEB, c)
+	require.NotNil(t, p)
+	require.Zero(t, kazDeltaDataBlocks(p))
+	require.Len(t, p.outs, 1) // the two writes touch: one delta range
+	require.Equal(t, uint32(4095), p.outs[0].length)
+
+	// One large base stays visible elsewhere, so block 3 keeps a base below it
+	// (with kazBase16 its block-shaped base would be hidden: no base instead).
+	ss = []*slice{kazRec(0, 1, 16*kazEB), kazRec(3*kazEB, 100, 2048), kazRec(3*kazEB+2048, 101, 2048)}
+	p, _ = planKazDelta(ss, kazEB, c)
+	require.NotNil(t, p)
+	require.Equal(t, 1, kazDeltaDataBlocks(p))
+	require.Equal(t, [5]int{1, 0, 0, 0, 0}, kazDeltaReasons(p))
+	f := newKazFakeStore()
+	next := uint64(1000)
+	kazApplyDelta(t, f, ss, p, &next, 16*kazEB)
+
+	// The ratio is a share of the full block size, so at 1 the tail block of the
+	// extent (1000 in-extent bytes, all changed) is never reached and stays a delta.
+	ss = []*slice{kazRec(0, 1, 2*kazEB+1000), kazRec(2*kazEB, 100, 600), kazRec(2*kazEB+600, 101, 400), kazRec(10, 102, 8)}
+	p, _ = planKazDelta(ss, kazEB, c)
+	require.NotNil(t, p)
+	require.Equal(t, "delta_tier", p.event)
+	require.Zero(t, kazDeltaDataBlocks(p))
+	require.Equal(t, [5]int{}, kazDeltaReasons(p))
+	kazApplyDelta(t, f, ss, p, &next, 3*kazEB)
+
+	// At 0.5 the tail block is compared with size/2 = 2048 as before: 1000 stays a delta.
+	c.blockRatio = 0.5
+	p, _ = planKazDelta(ss, kazEB, c)
+	require.NotNil(t, p)
+	require.Zero(t, kazDeltaDataBlocks(p))
+}
+
+// TestPlanKazDeltaReasons counts one ratio block and one no-base block in one
+// plan, and the blocks of a fold that ends in a whole rewrite as whole only.
+func TestPlanKazDeltaReasons(t *testing.T) {
+	ss := []*slice{kazRec(0, 1, 4*kazEB),
+		kazRec(kazEB+10, 100, 700), kazRec(kazEB+1000, 101, 700), kazRec(kazEB+2000, 102, 700), // 2100 bytes: ratio
+		kazRec(2*kazEB+10, 103, 8), // delta
+		kazRec(6*kazEB+10, 104, 8)} // beyond the base: no base
+	p, _ := planKazDelta(ss, kazEB, kazDC(2, 16))
+	require.NotNil(t, p)
+	require.Equal(t, "delta_tier", p.event)
+	require.Equal(t, 2, kazDeltaDataBlocks(p))
+	require.Equal(t, [5]int{1, 1, 0, 0, 0}, kazDeltaReasons(p))
+	f := newKazFakeStore()
+	next := uint64(1000)
+	kazApplyDelta(t, f, ss, p, &next, 8*kazEB)
+
+	// A block that is both above the ratio and without base counts as no base.
+	ss = []*slice{kazRec(0, 1, 4*kazEB), kazRec(2*kazEB+10, 103, 8),
+		kazRec(6*kazEB, 100, 3000), kazRec(6*kazEB+3010, 101, 8)}
+	p, _ = planKazDelta(ss, kazEB, kazDC(2, 16))
+	require.NotNil(t, p)
+	require.Equal(t, [5]int{0, 1, 0, 0, 0}, kazDeltaReasons(p))
+
+	// 60 block-shaped bases leave no fold candidate once blocks 3 and 7 are
+	// folded: the fold ends in a whole rewrite, counted as whole, not fold.
+	c := kazDC(2, 16)
+	c.maxRecords = 60
+	ss = nil
+	for b := uint32(0); b < 60; b++ {
+		ss = append(ss, kazRec(b*kazEB, uint64(b+1), kazEB))
+	}
+	ss = append(ss, kazRec(3*kazEB+10, 100, 8), kazRec(7*kazEB+10, 101, 8))
+	p, _ = planKazDelta(ss, kazEB, c)
+	require.NotNil(t, p)
+	require.Equal(t, "delta_fold", p.event)
+	require.True(t, p.full)
+	require.Equal(t, [5]int{0, 0, 0, 60, 0}, kazDeltaReasons(p))
+}
+
+// TestPlanKazDeltaFallbackReason counts the written blocks of a partial step-9
+// fallback as fallback: folding block 6 (many id 0 records over visible base
+// data) would upload a block no small record touches, more than block mode.
+func TestPlanKazDeltaFallbackReason(t *testing.T) {
+	c := kazDC(2, 16)
+	c.maxRecords = 60
+	ss := []*slice{kazRec(0, 1, 16*kazEB), kazRec(kazEB+100, 100, 8), kazRec(kazEB+200, 101, 8)}
+	for k := uint32(0); k < 60; k++ { // block 6 punched in 32-byte holes, 64 bytes apart
+		ss = append(ss, &slice{pos: 6*kazEB + k*64, len: 32})
+	}
+	p, _ := planKazDelta(ss, kazEB, c)
+	require.NotNil(t, p)
+	require.Equal(t, kazDeltaEventFallback, p.event)
+	require.False(t, p.full)
+	require.NotZero(t, kazDeltaDataBlocks(p))
+	require.Equal(t, [5]int{0, 0, 0, 0, kazDeltaDataBlocks(p)}, kazDeltaReasons(p))
+	f := newKazFakeStore()
+	next := uint64(1 << 20)
+	kazApplyDelta(t, f, ss, p, &next, 16*kazEB)
+}
+
+// TestKazDeltaRatioParts checks the fixed-point block ratio and the exact
+// integer comparison with the full block size.
+func TestKazDeltaRatioParts(t *testing.T) {
+	require.Equal(t, uint64(500000), kazDeltaRatioParts(0.5))
+	require.Equal(t, uint64(600000), kazDeltaRatioParts(0.6))
+	require.Equal(t, uint64(1000000), kazDeltaRatioParts(1))
+	require.Equal(t, uint64(1), kazDeltaRatioParts(1e-9))
+	require.True(t, kazDeltaRatioReached(2048, 4096, kazDeltaRatioParts(0.5)))
+	require.False(t, kazDeltaRatioReached(2047, 4096, kazDeltaRatioParts(0.5)))
+	require.True(t, kazDeltaRatioReached(3072, 4096, kazDeltaRatioParts(0.75)))
+	require.False(t, kazDeltaRatioReached(3071, 4096, kazDeltaRatioParts(0.75)))
+	require.True(t, kazDeltaRatioReached(4096, 4096, kazDeltaRatioParts(1)))
+	require.False(t, kazDeltaRatioReached(4095, 4096, kazDeltaRatioParts(1)))
+	require.True(t, kazDeltaRatioReached(2516583, 4<<20, kazDeltaRatioParts(0.6))) // ceil(0.6 * 4 MiB)
+	require.False(t, kazDeltaRatioReached(2516582, 4<<20, kazDeltaRatioParts(0.6)))
 }

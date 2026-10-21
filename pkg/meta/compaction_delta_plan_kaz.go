@@ -15,7 +15,10 @@
  */
 package meta
 
-import "sort"
+import (
+	"math"
+	"sort"
+)
 
 // kazRecKind is the role delta compaction gives a record of a chunk. Metadata
 // carries no delta mark, so the kind is derived from the records every time.
@@ -98,6 +101,50 @@ func kazRangeBytesIn(rs [][2]uint32, lo, hi uint32) uint32 {
 	return n
 }
 
+// kazDeltaRatioDen is the denominator of the block ratio as a fixed-point
+// fraction (parts per million), so the half-block rule compares integers.
+const kazDeltaRatioDen = 1000000
+
+// kazDeltaRatioParts turns a block ratio in (0, 1] into parts per million,
+// rounded to the nearest part and kept within 1..kazDeltaRatioDen.
+func kazDeltaRatioParts(ratio float64) uint64 {
+	n := math.Round(ratio * kazDeltaRatioDen)
+	switch {
+	case n < 1:
+		return 1
+	case n > kazDeltaRatioDen:
+		return kazDeltaRatioDen
+	}
+	return uint64(n)
+}
+
+// kazDeltaRatioReached reports whether the changed bytes of a block reach parts
+// (per million) of the full block size: changed * 1e6 >= parts * size, exact in
+// integers. It compares with the full block size, not the in-extent span, as
+// the half-block rule always did (ratio 0.5 = size/2; ratio 1 = a whole block).
+func kazDeltaRatioReached(changed, size uint32, parts uint64) bool {
+	return uint64(changed)*kazDeltaRatioDen >= parts*uint64(size)
+}
+
+// Reasons a delta plan rewrites a block (kazDeltaPlanner.reason).
+const (
+	kazDeltaReasonRatio  uint8 = iota + 1 // changes reached the block ratio
+	kazDeltaReasonNoBase                  // no base record (id > 0) below
+	kazDeltaReasonFold                    // chosen to stay under the record limit
+)
+
+// kazDeltaDataBlocks counts the outs of a plan that upload a rewritten block
+// (neither delta ranges nor masks).
+func kazDeltaDataBlocks(p *kazBlockPlan) int {
+	n := 0
+	for _, o := range p.outs {
+		if !o.delta && !o.mask {
+			n++
+		}
+	}
+	return n
+}
+
 // kazDeltaPlanner holds what planKazDelta derives once from a chunk's records
 // so that the block selection can be redone cheaply while folding.
 type kazDeltaPlanner struct {
@@ -105,10 +152,11 @@ type kazDeltaPlanner struct {
 	g      kazBlockGeom
 	kinds  []kazRecKind
 	hidden []bool
-	drop0  []bool          // records removed before the block selection (step 3)
-	joined [][2]uint32     // gapjoin of the removed records' ranges: the delta candidates
-	view   []Slice         // the chunk as a reader sees it now
-	fset   map[uint32]bool // blocks rewritten whole
+	drop0  []bool           // records removed before the block selection (step 3)
+	joined [][2]uint32      // gapjoin of the removed records' ranges: the delta candidates
+	view   []Slice          // the chunk as a reader sees it now
+	fset   map[uint32]bool  // blocks rewritten whole
+	reason map[uint32]uint8 // why each block of fset is rewritten (kazDeltaReason*)
 }
 
 // build returns which records the plan removes and the delta ranges, for the
@@ -136,6 +184,8 @@ func (d *kazDeltaPlanner) build() ([]bool, [][2]uint32) {
 
 // outs builds the plan for the current rewritten blocks: kept records in their
 // order, removed records, and outs (rewritten blocks and delta ranges) by position.
+// Each rewritten block that uploads data counts under its reason, so the reason
+// counts add up to the plan's written blocks (masks and empty blocks count none).
 func (d *kazDeltaPlanner) outs(drop []bool, t [][2]uint32) *kazBlockPlan {
 	p := &kazBlockPlan{}
 	for i, s := range d.ss {
@@ -163,6 +213,14 @@ func (d *kazDeltaPlanner) outs(drop []bool, t [][2]uint32) *kazBlockPlan {
 			continue
 		}
 		p.outs = append(p.outs, kazBlockOut{pos: lo, length: hi - lo, pieces: pieces})
+		switch d.reason[b] {
+		case kazDeltaReasonFold:
+			p.foldBlocks++
+		case kazDeltaReasonNoBase:
+			p.nobaseBlocks++
+		case kazDeltaReasonRatio:
+			p.ratioBlocks++
+		}
 	}
 	for _, r := range t {
 		p.outs = append(p.outs, kazBlockOut{pos: r[0], length: r[1] - r[0], delta: true, pieces: kazClipPieces(d.view, r[0], r[1])})
@@ -236,14 +294,16 @@ func kazDeltaGivenUpBase(total, news, trigger int) int {
 
 // planKazDelta plans one delta compaction of a chunk (records ss in chunk order):
 // new small records (and, past the tier limit, every earlier tier) go into one
-// new delta slice shared by several records, and blocks changed by half or more,
-// or with no base data below, are rewritten whole as in block mode. The reader's
-// view never changes: outs copy the current view and are placed above the kept
-// records. plan is nil when nothing is to be done; base is the record count the
-// caller remembers as not new (for nil: len(ss) minus the new records, or len(ss)
-// when the planner gives up although the new records reach the trigger, so the
-// trigger does not fire again at once; otherwise the records left once the plan
-// commits). The rules are in
+// new delta slice shared by several records, and blocks whose changes reach the
+// block ratio as a share of the block size (default half), or with no base data
+// below, are rewritten whole as in block mode. The plan counts written blocks by
+// reason (whole > fallback > fold > nobase > ratio, one reason per block) for
+// the metrics. The reader's view never changes: outs copy the current view and
+// are placed above the kept records. plan is nil when nothing is to be done;
+// base is the record count the caller remembers as not new (for nil: len(ss)
+// minus the new records, or len(ss) when the planner gives up although the new
+// records reach the trigger, so the trigger does not fire again at once;
+// otherwise the records left once the plan commits). The rules are in
 // docs/superpowers/specs/2026-10-20-kaz-delta-compaction-design.md §5.4.
 func planKazDelta(ss []*slice, blockSize uint32, c kazDeltaConf) (*kazBlockPlan, int) {
 	if len(ss) == 0 || blockSize == 0 {
@@ -304,17 +364,23 @@ func planKazDelta(ss []*slice, blockSize uint32, c kazDeltaConf) (*kazBlockPlan,
 	}
 	d.joined = kazGapJoin(u, c.gap)
 
-	// Step 5: blocks rewritten whole: changed by half or more, or no base below.
+	// Step 5: blocks rewritten whole: changes reaching the block ratio as a share
+	// of the block size, or no base below (counted as nobase when both hold).
 	changed := kazGapJoin(append(append([][2]uint32(nil), u...), keptDelta...), c.gap)
 	d.fset = make(map[uint32]bool)
+	d.reason = make(map[uint32]uint8)
+	parts := kazDeltaRatioParts(c.blockRatio)
 	for _, r := range d.joined {
 		for b := r[0] / d.g.size; b*d.g.size < r[1]; b++ {
 			if d.fset[b] {
 				continue
 			}
 			lo, hi := d.g.span(b)
-			if kazRangeBytesIn(changed, lo, hi) >= d.g.size/2 || !d.hasBase(lo, hi) {
-				d.fset[b] = true
+			switch {
+			case !d.hasBase(lo, hi):
+				d.fset[b], d.reason[b] = true, kazDeltaReasonNoBase
+			case kazDeltaRatioReached(kazRangeBytesIn(changed, lo, hi), d.g.size, parts):
+				d.fset[b], d.reason[b] = true, kazDeltaReasonRatio
 			}
 		}
 	}
@@ -322,28 +388,20 @@ func planKazDelta(ss []*slice, blockSize uint32, c kazDeltaConf) (*kazBlockPlan,
 	// Steps 6-8: build, folding blocks while over the record limit.
 	drop, t := d.build()
 	p := d.outs(drop, t)
-	folded, foldBlocks := false, 0
+	folded := false
 	if len(p.kept)+len(p.outs) > c.maxRecords {
 		folded = true
 		target := c.maxRecords - kazDeltaFoldMargin
 		for len(p.kept)+len(p.outs) > target {
 			b, ok := d.foldCandidate(drop, t)
-			if !ok {
-				wp, wn := kazDeltaWhole(ss, blockSize, c, kazDeltaEventFold)
-				for _, o := range wp.outs {
-					if !o.mask {
-						wp.foldBlocks++
-					}
-				}
-				return wp, wn
+			if !ok { // whole rewrite: its blocks count as whole, not fold
+				return kazDeltaWhole(ss, blockSize, c, kazDeltaEventFold)
 			}
-			d.fset[b] = true
-			foldBlocks++
+			d.fset[b], d.reason[b] = true, kazDeltaReasonFold
 			drop, t = d.build()
 			p = d.outs(drop, t)
 		}
 	}
-	p.foldBlocks = foldBlocks
 
 	// Step 9: never upload more than block mode's partial rewrite would.
 	if kazPlanPutBytes(p) > d.smallTouchedBytes() {
@@ -352,6 +410,11 @@ func planKazDelta(ss []*slice, blockSize uint32, c kazDeltaConf) (*kazBlockPlan,
 			return nil, givenUpBase
 		}
 		bp.event = kazDeltaEventFallback
+		if bp.full {
+			bp.wholeBlocks = kazDeltaDataBlocks(bp)
+		} else {
+			bp.fallbackBlocks = kazDeltaDataBlocks(bp)
+		}
 		return bp, len(bp.kept) + len(bp.outs)
 	}
 
@@ -370,6 +433,11 @@ func planKazDelta(ss []*slice, blockSize uint32, c kazDeltaConf) (*kazBlockPlan,
 		p.event = kazDeltaEventFold
 	case merge:
 		p.event = kazDeltaEventMerge
+		for _, o := range p.outs {
+			if o.delta {
+				p.mergeBytes += uint64(o.length)
+			}
+		}
 	case len(p.outs) == 0:
 		p.event = kazDeltaEventPrune
 	default:
@@ -378,10 +446,12 @@ func planKazDelta(ss []*slice, blockSize uint32, c kazDeltaConf) (*kazBlockPlan,
 	return p, len(p.kept) + len(p.outs)
 }
 
-// kazDeltaWhole returns block mode's whole rewrite of the chunk, tagged with event.
+// kazDeltaWhole returns block mode's whole rewrite of the chunk, tagged with
+// event, with every rewritten block counted as whole.
 func kazDeltaWhole(ss []*slice, blockSize uint32, c kazDeltaConf, event string) (*kazBlockPlan, int) {
 	p := planKazBlocks(ss, blockSize, 0, c.maxRecords, true)
 	p.event = event
+	p.wholeBlocks = kazDeltaDataBlocks(p)
 	return p, len(p.kept) + len(p.outs)
 }
 

@@ -93,9 +93,10 @@ func (t *kazDeltaBaseTable) forget(inode Ino, indx uint32) {
 // max-records + trigger + fold margin records.
 func (m *baseMeta) kazDeltaUsable() (capable bool, limit, need int, ok bool) {
 	_, replacer := m.en.(kazChunkReplacer)
-	dc, isDC := m.en.(kazDeltaCapable)
-	capable = replacer && isDC && dc.kazDeltaCapable()
-	need = m.conf.kazDeltaConf().maxRecords + kazDeltaTrigger + kazDeltaFoldMargin
+	en, isDC := m.en.(kazDeltaCapable)
+	capable = replacer && isDC && en.kazDeltaCapable()
+	dc := m.conf.kazDeltaConf()
+	need = dc.maxRecords + dc.trigger + kazDeltaFoldMargin
 	bs := m.kazBlockSize()
 	limit, fits := kazBlockCompactLimit(bs)
 	return capable, limit, need, capable && bs > 0 && fits && limit >= need
@@ -158,11 +159,11 @@ func kazDeltaLogMode(event string) string {
 // from prev to now records should request compaction, and returns the count to
 // give the priority scheduler hint. Without delta mode it is compactionWanted
 // (and now). In delta mode a chunk always holds hundreds of records, so it asks
-// once the records added since this client last planned the chunk reach
-// kazDeltaTrigger, and the hint is that number; at maxSlices it always asks so
-// the synchronous rewrite stays; with no usable base count (unknown, or larger
-// than now after a truncate or delete) it forgets the entry and falls back to
-// compactionWanted (spec §5.3).
+// once the records added since this client last planned the chunk reach the
+// delta trigger (--kaz-compaction-delta-trigger), and the hint is that number;
+// at maxSlices it always asks so the synchronous rewrite stays; with no usable
+// base count (unknown, or larger than now after a truncate or delete) it
+// forgets the entry and falls back to compactionWanted (spec §5.3).
 func (m *baseMeta) kazCompactionWanted(inode Ino, indx uint32, prev, now int) (bool, int) {
 	if !m.kazDeltaActive() {
 		return compactionWanted(prev, now), now
@@ -172,7 +173,7 @@ func (m *baseMeta) kazCompactionWanted(inode Ino, indx uint32, prev, now int) (b
 	}
 	if b, ok := m.kazDeltaBases.get(inode, indx); ok {
 		if now >= b {
-			return now-b >= kazDeltaTrigger, now - b
+			return now-b >= m.conf.kazDeltaConf().trigger, now - b
 		}
 		m.kazDeltaBases.forget(inode, indx)
 	}

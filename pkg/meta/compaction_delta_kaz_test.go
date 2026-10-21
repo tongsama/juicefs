@@ -461,11 +461,66 @@ func TestKazDeltaModeLog(t *testing.T) {
 	hook := capturePolicyLogs(t, logrus.InfoLevel)
 	e := newKazDeltaEnv(t, "sqlite")
 	e.logKazCompactionMode()
-	require.True(t, hasLog(hook, logrus.InfoLevel, "kaz compaction mode: delta (tiers 8, max-records 500, gap 16, min-file-size 0)"))
+	require.True(t, hasLog(hook, logrus.InfoLevel, "kaz compaction mode: delta (tiers 8, max-records 500, gap 16, min-file-size 0, trigger 99, block-ratio 0.5)"))
 	m := newKazBlockEnv(t, "memkv", 4)
 	m.conf.KazCompactionMode = KazCompactionModeDelta
 	hook.Reset()
 	m.logKazCompactionMode()
 	require.True(t, hasLog(hook, logrus.WarnLevel, "kaz compaction mode: delta is not usable here", "using block compaction"))
 	require.True(t, hasLog(hook, logrus.InfoLevel, "kaz compaction mode: block"))
+}
+
+// TestKazDeltaReasonAmounts commits one delta compaction that rewrites one block
+// for the block ratio (block 3) and one with no base below (block 18, past the
+// end of the base) and checks the per-reason amounts and the DEBUG line.
+func TestKazDeltaReasonAmounts(t *testing.T) {
+	for _, backend := range kazDeltaBackends {
+		t.Run(backend, func(t *testing.T) {
+			hook := capturePolicyLogs(t, logrus.DebugLevel)
+			e := newKazDeltaEnv(t, backend)
+			e.conf.KazCompactionDeltaTrigger = 10
+			inode := e.file(t)
+			e.write(t, inode, 0, 16*kazEB)
+			for _, off := range []uint32{10, 1000, 2000} { // 2100 bytes of block 3
+				e.write(t, inode, 3*kazEB+off, 700)
+			}
+			e.write(t, inode, 18*kazEB+10, 8)
+			kazDeltaSmallWrites(t, e, inode, []uint32{5, 9}, 6, 0) // 48 delta bytes
+			before := e.store.view(e.records(t, inode), 19*kazEB)
+			after := kazRun(t, e, inode)
+			require.Equal(t, before, e.store.view(after, 19*kazEB))
+			require.Equal(t, float64(1), kazBlockEventCount(e, "delta_tier"))
+			require.Equal(t, float64(2), kazDeltaAmount(e, "blocks_written"))
+			require.Equal(t, float64(1), kazDeltaAmount(e, "delta_blocks_ratio"))
+			require.Equal(t, float64(1), kazDeltaAmount(e, "delta_blocks_nobase"))
+			require.Zero(t, kazDeltaAmount(e, "delta_fold_blocks"))
+			require.Zero(t, kazDeltaAmount(e, "delta_blocks_whole"))
+			require.Zero(t, kazDeltaAmount(e, "delta_merge_bytes"))
+			require.Equal(t, float64(48), kazDeltaAmount(e, "delta_bytes"))
+			require.True(t, hasLog(hook, logrus.DebugLevel, "compaction block inode=", "mode=delta-tier", "blocks=2",
+				"fold_blocks=0", "ratio_blocks=1", "nobase_blocks=1", "whole_blocks=0", "fallback_blocks=0", "merge_bytes=0"))
+			var reasons float64
+			for _, k := range []string{"delta_blocks_ratio", "delta_blocks_nobase", "delta_fold_blocks", "delta_blocks_whole", "delta_blocks_fallback"} {
+				reasons += kazDeltaAmount(e, k)
+			}
+			require.Equal(t, kazDeltaAmount(e, "blocks_written"), reasons)
+		})
+	}
+}
+
+// TestKazDeltaWholeAmount counts the blocks of a whole rewrite in delta mode
+// (delta_hidden_full) as delta_blocks_whole.
+func TestKazDeltaWholeAmount(t *testing.T) {
+	e := newKazDeltaEnv(t, "sqlite")
+	e.conf.KazCompactionDeltaTrigger = 10
+	inode := e.file(t)
+	e.write(t, inode, 0, 16*kazEB) // three stacked bases: 2/3 hidden
+	e.write(t, inode, 1, 16*kazEB-1)
+	e.write(t, inode, 2, 16*kazEB-2)
+	kazDeltaSmallWrites(t, e, inode, []uint32{5, 9}, 10, 0)
+	kazRun(t, e, inode)
+	require.Equal(t, float64(1), kazBlockEventCount(e, "delta_hidden_full"))
+	require.Equal(t, float64(16), kazDeltaAmount(e, "delta_blocks_whole"))
+	require.Equal(t, float64(16), kazDeltaAmount(e, "blocks_written"))
+	require.Zero(t, kazDeltaAmount(e, "delta_blocks_ratio"))
 }

@@ -342,13 +342,20 @@ func (m *baseMeta) runKazBlockCompaction(r kazChunkReplacer, inode Ino, indx uin
 	}
 	if delta {
 		ds := kazDeltaStats(ss, bs, plan)
-		logger.Debugf("compaction block inode=%d chunk=%d mode=%s force=%t removed=%d kept=%d blocks=%d mask=%d hidden=%.2f slices=%d total=%s errno=%s tiers=%d delta_records=%d delta_bytes=%d fold_blocks=%d base=%d",
-			inode, indx, mode, force, len(plan.removed), len(plan.kept), blocks, masks, plan.hidden, sliceCount, time.Since(start), st, ds.tiers, ds.records, ds.bytes, plan.foldBlocks, base)
+		logger.Debugf("compaction block inode=%d chunk=%d mode=%s force=%t removed=%d kept=%d blocks=%d mask=%d hidden=%.2f slices=%d total=%s errno=%s tiers=%d delta_records=%d delta_bytes=%d fold_blocks=%d ratio_blocks=%d nobase_blocks=%d whole_blocks=%d fallback_blocks=%d merge_bytes=%d base=%d",
+			inode, indx, mode, force, len(plan.removed), len(plan.kept), blocks, masks, plan.hidden, sliceCount, time.Since(start), st, ds.tiers, ds.records, ds.bytes,
+			plan.foldBlocks, plan.ratioBlocks, plan.nobaseBlocks, plan.wholeBlocks, plan.fallbackBlocks, plan.mergeBytes, base)
 		if st == 0 {
 			m.kazDeltaBases.set(inode, indx, base)
 			m.kazBlockAmount("delta_bytes", int(ds.bytes))
 			m.kazBlockAmount("delta_records", ds.records)
 			m.kazBlockAmount("delta_fold_blocks", plan.foldBlocks)
+			// Why blocks were rewritten (one reason per block) and the merge share of delta_bytes.
+			m.kazBlockAmount("delta_blocks_ratio", plan.ratioBlocks)
+			m.kazBlockAmount("delta_blocks_nobase", plan.nobaseBlocks)
+			m.kazBlockAmount("delta_blocks_whole", plan.wholeBlocks)
+			m.kazBlockAmount("delta_blocks_fallback", plan.fallbackBlocks)
+			m.kazBlockAmount("delta_merge_bytes", int(plan.mergeBytes))
 		}
 	} else {
 		logger.Debugf("compaction block inode=%d chunk=%d mode=%s force=%t removed=%d kept=%d blocks=%d mask=%d hidden=%.2f slices=%d total=%s errno=%s",
@@ -525,7 +532,8 @@ func (m *baseMeta) logKazCompactionMode() {
 		capable, limit, need, usable := m.kazDeltaUsable()
 		if usable {
 			dc := m.conf.kazDeltaConf()
-			logger.Infof("kaz compaction mode: delta (tiers %d, max-records %d, gap %d, min-file-size %d)", dc.tiers, dc.maxRecords, dc.gap, dc.minFileSize)
+			logger.Infof("kaz compaction mode: delta (tiers %d, max-records %d, gap %d, min-file-size %d, trigger %d, block-ratio %v)",
+				dc.tiers, dc.maxRecords, dc.gap, dc.minFileSize, dc.trigger, dc.blockRatio)
 			return
 		}
 		logger.Warnf("kaz compaction mode: delta is not usable here (engine counts shared references %t, records per compaction %d, needed %d); using block compaction", capable, limit, need)

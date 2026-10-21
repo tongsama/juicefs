@@ -26,14 +26,18 @@ const (
 	kazDeltaDefaultTiers      = 8
 	kazDeltaDefaultMaxRecords = 500
 	kazDeltaDefaultGap        = 16 << 10
+	kazDeltaDefaultBlockRatio = 0.5
 
 	// Ranges accepted by validateKazDelta.
 	kazDeltaMaxTiers      = 16
 	kazDeltaMinMaxRecords = 50
 	kazDeltaMaxMaxRecords = 800
 	kazDeltaMaxGap        = 1 << 20
+	kazDeltaMinTrigger    = 10
+	kazDeltaMaxTrigger    = 400
 
-	// kazDeltaTrigger is the record count of a chunk that triggers delta compaction.
+	// kazDeltaTrigger is the default count of new records of a chunk that
+	// triggers delta compaction (Config.KazCompactionDeltaTrigger 0).
 	kazDeltaTrigger = 99
 	// kazDeltaFoldMargin is the headroom kept below the record limit before folding.
 	kazDeltaFoldMargin = 50
@@ -46,6 +50,7 @@ type kazDeltaConf struct {
 	tiers       int     // maximum number of delta tiers
 	maxRecords  int     // record limit of a chunk before folding by block
 	trigger     int     // record count that triggers compaction
+	blockRatio  float64 // delta share of the block size at which a block is rewritten
 	gap         uint32  // gaps up to this many bytes are joined into one delta
 	hiddenRatio float64 // hidden share above which a base is rewritten whole
 	minFileSize uint64  // files shorter than this use block mode
@@ -62,7 +67,8 @@ func (c *Config) kazDeltaConf() kazDeltaConf {
 	d := kazDeltaConf{
 		tiers:       c.KazCompactionDeltaTiers,
 		maxRecords:  c.KazCompactionDeltaMaxRecords,
-		trigger:     kazDeltaTrigger,
+		trigger:     c.KazCompactionDeltaTrigger,
+		blockRatio:  c.KazCompactionDeltaBlockRatio,
 		gap:         uint32(c.KazCompactionDeltaGap),
 		hiddenRatio: c.kazBlockHiddenRatio(),
 		minFileSize: c.KazCompactionDeltaMinFileSize,
@@ -72,6 +78,12 @@ func (c *Config) kazDeltaConf() kazDeltaConf {
 	}
 	if d.maxRecords == 0 {
 		d.maxRecords = kazDeltaDefaultMaxRecords
+	}
+	if d.trigger == 0 {
+		d.trigger = kazDeltaTrigger
+	}
+	if d.blockRatio == 0 {
+		d.blockRatio = kazDeltaDefaultBlockRatio
 	}
 	switch c.KazCompactionDeltaGap {
 	case 0:
@@ -83,7 +95,9 @@ func (c *Config) kazDeltaConf() kazDeltaConf {
 }
 
 // validateKazDelta rejects out-of-range delta knobs. Zero means "use the default".
-// It checks nothing unless the mode is delta.
+// It also rejects a max-records and trigger pair whose sum plus the fold margin
+// exceeds the records one compaction reads (kazUpstreamMaxCompactSlices), since
+// delta compaction could then never run. It checks nothing unless the mode is delta.
 func (c *Config) validateKazDelta() error {
 	if !c.kazDeltaEnabled() {
 		return nil
@@ -96,6 +110,17 @@ func (c *Config) validateKazDelta() error {
 	}
 	if g := c.KazCompactionDeltaGap; g < -1 || g > kazDeltaMaxGap {
 		return fmt.Errorf("invalid kaz-compaction-delta-gap %d (want -1 (no joining), 0 (default) or 1..%d)", g, kazDeltaMaxGap)
+	}
+	if n := c.KazCompactionDeltaTrigger; n != 0 && (n < kazDeltaMinTrigger || n > kazDeltaMaxTrigger) {
+		return fmt.Errorf("invalid kaz-compaction-delta-trigger %d (want %d..%d)", n, kazDeltaMinTrigger, kazDeltaMaxTrigger)
+	}
+	if r := c.KazCompactionDeltaBlockRatio; r != 0 && !(r > 0 && r <= 1) {
+		return fmt.Errorf("invalid kaz-compaction-delta-block-ratio %v (want 0 < ratio <= 1)", r)
+	}
+	d := c.kazDeltaConf()
+	if need := d.maxRecords + d.trigger + kazDeltaFoldMargin; need > kazUpstreamMaxCompactSlices {
+		return fmt.Errorf("invalid kaz-compaction-delta-max-records %d with kaz-compaction-delta-trigger %d: max-records + trigger + %d (fold margin) = %d exceeds the %d records one compaction reads",
+			d.maxRecords, d.trigger, kazDeltaFoldMargin, need, kazUpstreamMaxCompactSlices)
 	}
 	return nil
 }

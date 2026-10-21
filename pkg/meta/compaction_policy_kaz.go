@@ -76,7 +76,7 @@ func newKazCompactionMetrics() *kazCompactionMetrics {
 		}, []string{"event"}),
 		amount: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "kaz_compaction_block_amount_total",
-			Help: "Kaz block compaction amounts: blocks_written, masks, removed (records dropped), delta_bytes, delta_records, delta_fold_blocks.",
+			Help: "Kaz block compaction amounts: blocks_written, masks, removed (records dropped), delta_bytes (all delta slice bytes), delta_records, delta_merge_bytes (delta bytes of plans whose event is delta_merge only; a merge inside a delta_fold is not included), and delta-mode written blocks by reason, one per block, adding up to blocks_written (whole > fallback > fold > nobase > ratio): delta_blocks_whole (whole rewrites), delta_blocks_fallback (partial block-mode fallback), delta_fold_blocks (record limit), delta_blocks_nobase (no base record below), delta_blocks_ratio (delta reached the block ratio of the block size).",
 		}, []string{"kind"}),
 		events: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "kaz_compaction_policy_events_total",
@@ -169,13 +169,14 @@ func (m *baseMeta) stopCompactionPolicy() {
 // requestCompactionFromRead routes a read-triggered request through the policy, if any.
 //
 // In delta mode, for a chunk whose base count this client remembers, the request
-// is dropped (event delta_below_trigger) unless at least kazDeltaTrigger records
-// were added since the last plan; the count passed on is that number. Such a
+// is dropped (event delta_below_trigger) unless at least the delta trigger
+// (--kaz-compaction-delta-trigger) records were added since the last plan; the
+// count passed on is that number. Such a
 // request replaces the read-min check, which is meant for chunks that hold few
 // records. The event is counted even when no policy is attached.
 func (m *baseMeta) requestCompactionFromRead(inode Ino, chunk uint32, count, tier int) {
 	if n, ok := m.kazDeltaReadCount(inode, chunk, count); ok {
-		if n < kazDeltaTrigger {
+		if n < m.conf.kazDeltaConf().trigger {
 			if m.kazCompactMetrics != nil {
 				m.kazCompactMetrics.events.WithLabelValues("delta_below_trigger").Inc()
 			}

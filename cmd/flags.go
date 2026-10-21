@@ -210,6 +210,16 @@ func storageFlags() []cli.Flag {
 			Value: "0",
 			Usage: "[kaz] with --kaz-compaction-mode delta, use block mode for chunks of files shorter than this size (e.g. 1G; 0 does not restrict)",
 		},
+		&cli.IntFlag{
+			Name:  "kaz-compaction-delta-trigger",
+			Value: 99,
+			Usage: "[kaz] with --kaz-compaction-mode delta, compact a chunk once this many slice records were added since its last compaction (10-400; max-records + trigger + 50 must not exceed 1000); a lower value compacts sooner and may clean more small staged slices before they upload, at the cost of more compactions and metadata reads; a higher value compacts less often",
+		},
+		&cli.Float64Flag{
+			Name:  "kaz-compaction-delta-block-ratio",
+			Value: 0.5,
+			Usage: "[kaz] with --kaz-compaction-mode delta, rewrite a block whole instead of keeping its changes in the delta once the changed bytes reach this share of the block size (0 < ratio <= 1; 1 rewrites only fully changed blocks); a higher value keeps more in the small delta slice, a lower value rewrites more blocks",
+		},
 		&cli.StringFlag{
 			Name:  "upload-limit",
 			Usage: "bandwidth limit for upload in Mbps",

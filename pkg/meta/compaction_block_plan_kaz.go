@@ -37,9 +37,17 @@ type kazBlockPlan struct {
 	outs    []kazBlockOut // new records in ascending chunk order
 	hidden  float64       // share of kept data hidden in the partial result
 	event   string        // delta plan kind (delta_tier, ...); empty for block plans
-	// foldBlocks counts the blocks a delta plan rewrites to stay under the
-	// record limit (all data blocks when the fold ends in a whole rewrite).
-	foldBlocks int
+	// Written (non-mask) blocks of a delta-mode plan by reason, one reason per
+	// block (whole > fallback > fold > nobase > ratio), adding up to the plan's
+	// written blocks, for kaz_compaction_block_amount_total: wholeBlocks are the
+	// blocks of a whole rewrite (plan.full), fallbackBlocks those of a partial
+	// block-mode fallback (step 9), foldBlocks are chosen to stay under the
+	// record limit, nobaseBlocks have no base record (id > 0) below, ratioBlocks
+	// have changes reaching the block ratio.
+	wholeBlocks, fallbackBlocks, foldBlocks, nobaseBlocks, ratioBlocks int
+	// mergeBytes is the delta slice size of a delta_merge plan (every earlier
+	// tier packed again), so merge cost is separable from new-tier bytes.
+	mergeBytes uint64
 }
 
 // kazBlockGeom answers block questions for one chunk: block size and data extent.
