@@ -298,8 +298,12 @@ type baseMeta struct {
 	sessCtx Context
 	sessWG  sync.WaitGroup
 
-	dSliceMu sync.Mutex
-	dSliceWG sync.WaitGroup
+	dSliceMu          sync.Mutex
+	dSliceWG          sync.WaitGroup
+	compactionGC      atomic.Pointer[compactionGC]
+	priorityCompactor atomic.Pointer[compactionScheduler]
+	kazCompact        atomic.Pointer[compactionPolicy]
+	kazDeltaBases     kazDeltaBaseTable // kaz: per-chunk base counts of delta compaction
 
 	dirStatsLock sync.RWMutex
 	dirStats     map[Ino]dirStat
@@ -355,8 +359,10 @@ type baseMeta struct {
 	groupQuotaUsedSpaceG  *prometheus.GaugeVec
 	groupQuotaUsedInodesG *prometheus.GaugeVec
 
-	bgjobDels     *prometheus.CounterVec
-	bgjobDuration *prometheus.HistogramVec
+	compactionGCEvents *prometheus.CounterVec
+	kazCompactMetrics  *kazCompactionMetrics
+	bgjobDels          *prometheus.CounterVec
+	bgjobDuration      *prometheus.HistogramVec
 
 	en engine
 }
@@ -533,6 +539,12 @@ func newBaseMeta(addr string, conf *Config) *baseMeta {
 			[]string{"job"},
 		),
 
+		compactionGCEvents: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "compaction_gc_events_total",
+			Help: "Compaction GC phase outcomes; local success counts callbacks, not removed files; deferred remote intent remains durable.",
+		}, []string{"event"}),
+		kazCompactMetrics: newKazCompactionMetrics(),
+
 		dirQuotaMetricKeys:   make(map[uint64]bool),
 		userQuotaMetricKeys:  make(map[uint64]bool),
 		groupQuotaMetricKeys: make(map[uint64]bool),
@@ -563,6 +575,8 @@ func (m *baseMeta) InitSharedMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(m.groupQuotaUsedInodesG)
 	reg.MustRegister(m.bgjobDuration)
 	reg.MustRegister(m.bgjobDels)
+	reg.MustRegister(m.compactionGCEvents)
+	m.kazCompactMetrics.register(reg)
 	reg.MustRegister(m.subdirInfoG)
 
 	// Initialize subdir info metric
@@ -784,6 +798,7 @@ func (m *baseMeta) currentSessionInfo() []byte {
 	return m.newSessionInfo()
 }
 
+// NewSession attaches session workers and optional request-derived compaction scheduling.
 func (m *baseMeta) NewSession(record bool) error {
 	m.sessCtx = Background()
 	ctx := m.sessCtx
@@ -823,6 +838,7 @@ func (m *baseMeta) NewSession(record bool) error {
 	go m.flushDirStat(ctx)
 	go m.flushQuotas(ctx)
 	m.startDeleteSliceTasks() // start MaxDeletes tasks
+	m.startPriorityCompactor()
 
 	if !m.conf.NoBGJob {
 		m.sessWG.Add(4)
@@ -844,6 +860,7 @@ const (
 	bgJobCanceled = "canceled"
 )
 
+// startDeleteSliceTasks starts physical deletion workers and optional nonblocking GC hints.
 func (m *baseMeta) startDeleteSliceTasks() {
 	m.Lock()
 	defer m.Unlock()
@@ -870,9 +887,14 @@ func (m *baseMeta) startDeleteSliceTasks() {
 			}
 		}(m.dslices)
 	}
+	m.startCompactionGC()
 }
 
+// stopDeleteSliceTasks joins the hint dispatcher before closing its deletion transport.
 func (m *baseMeta) stopDeleteSliceTasks() {
+	if g := m.compactionGC.Swap(nil); g != nil {
+		g.close()
+	}
 	m.dSliceMu.Lock()
 	if m.conf.MaxDeletes <= 0 || m.dslices == nil {
 		m.dSliceMu.Unlock()
@@ -999,6 +1021,7 @@ func (m *baseMeta) CleanStaleSessions(ctx Context) {
 	}
 }
 
+// CloseSession joins asynchronous metadata work before disconnecting session resources.
 func (m *baseMeta) CloseSession() error {
 	m.FlushSession()
 	m.sesMu.Lock()
@@ -1011,6 +1034,7 @@ func (m *baseMeta) CloseSession() error {
 	if m.sessCtx != nil {
 		m.sessCtx.Cancel()
 	}
+	m.stopPriorityCompactor()
 	m.sessWG.Wait()
 	m.stopDeleteSliceTasks()
 	logger.Infof("close session %d: %v", m.sid, err)
@@ -2112,6 +2136,7 @@ func (m *baseMeta) InvalidateChunkCache(ctx Context, inode Ino, indx uint32) sys
 	return 0
 }
 
+// Read resolves committed slices and requests advisory compaction from counts already fetched.
 func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (st syscall.Errno) {
 	defer func() {
 		if st == 0 {
@@ -2156,7 +2181,7 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 		if f != nil {
 			tierID = int(f.attr.Tier)
 		}
-		go m.compactChunk(inode, indx, false, false, tierID)
+		m.requestCompactionFromRead(inode, indx, len(ss), tierID)
 	}
 	return 0
 }
@@ -2192,30 +2217,163 @@ func (m *baseMeta) Close(ctx Context, inode Ino) syscall.Errno {
 	return 0
 }
 
-func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno {
-	defer m.timeit("Write", time.Now())
-	f := m.of.find(inode)
-	if f != nil {
-		f.Lock()
-		defer f.Unlock()
+// Write commits a slice and diagnoses stalls without changing inode lock ordering.
+// compactionWanted reports whether a chunk whose slice count grew from prev to
+// now passed a count at which a single Write would request compaction
+// (every count ending in 99, or more than 350 slices).
+func compactionWanted(prev, now int) bool {
+	if now > 350 {
+		return true
 	}
-	defer func() { m.of.InvalidateChunk(inode, indx) }()
-	var numSlices int
-	var delta dirStat
-	var attr Attr
-	st := m.en.doWrite(ctx, inode, indx, off, slice, mtime, &numSlices, &delta, &attr)
-	if st == 0 {
-		m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
-		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
-		if numSlices%100 == 99 || numSlices > 350 {
-			if numSlices < maxSlices {
-				go m.compactChunk(inode, indx, false, false, int(attr.Tier))
-			} else {
-				m.compactChunk(inode, indx, true, false, int(attr.Tier))
-			}
+	for n := max(prev+1, 0); n <= now; n++ {
+		if n%100 == 99 {
+			return true
 		}
 	}
+	return false
+}
+
+// sliceBatchWriter is implemented by engines that can append several slices of
+// one chunk in a single transaction, all or nothing.
+type sliceBatchWriter interface {
+	doWriteSlices(ctx Context, inode Ino, indx uint32, slices []SliceWrite, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno
+}
+
+// writePhases records where a metadata write spent its time, for slow-write reports.
+type writePhases struct {
+	numSlices              int
+	backend, stat, compact time.Duration
+}
+
+// Write commits one slice under the open-file lock.
+func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) (st syscall.Errno) {
+	start := time.Now()
+	defer m.timeit("Write", start)
+	var lockWait time.Duration
+	var ph writePhases
+	defer func() {
+		if total := time.Since(start); total >= time.Second {
+			logger.Warnf("slow metadata write inode=%d chunk=%d slice=%d slices=%d total=%s lock_wait=%s doWrite=%s stat=%s compact=%s errno=%s",
+				inode, indx, slice.Id, ph.numSlices, total, lockWait, ph.backend, ph.stat, ph.compact, st)
+		}
+	}()
+	logger.Debugf("metadata write inode=%d chunk=%d slice=%d phase=lock_wait", inode, indx, slice.Id)
+	f := m.of.find(inode)
+	if f != nil {
+		lockStart := time.Now()
+		f.Lock()
+		defer f.Unlock()
+		lockWait = time.Since(lockStart)
+	}
+	defer func() { m.of.InvalidateChunk(inode, indx) }()
+	logger.Debugf("metadata write inode=%d chunk=%d slice=%d phase=doWrite lock_wait=%s", inode, indx, slice.Id, lockWait)
+	st = m.writeLocked(ctx, inode, indx, off, slice, mtime, &ph)
+	logger.Debugf("metadata write inode=%d chunk=%d slice=%d phase=done errno=%s", inode, indx, slice.Id, st)
 	return st
+}
+
+// writeLocked commits one slice and applies its statistics and compaction
+// triggers; the caller holds the open-file lock (if the file is open) and
+// invalidates the chunk cache.
+func (m *baseMeta) writeLocked(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time, ph *writePhases) syscall.Errno {
+	var delta dirStat
+	var attr Attr
+	phaseStart := time.Now()
+	st := m.en.doWrite(ctx, inode, indx, off, slice, mtime, &ph.numSlices, &delta, &attr)
+	ph.backend = time.Since(phaseStart)
+	if st == 0 {
+		logger.Debugf("metadata write inode=%d chunk=%d slice=%d phase=stat slices=%d doWrite=%s", inode, indx, slice.Id, ph.numSlices, ph.backend)
+		m.afterWrite(ctx, inode, indx, &attr, delta, ph.numSlices-1, ph)
+	}
+	return st
+}
+
+// afterWrite applies the statistics of committed slices and requests
+// compaction when the chunk's slice count passed a trigger.
+func (m *baseMeta) afterWrite(ctx Context, inode Ino, indx uint32, attr *Attr, delta dirStat, prevSlices int, ph *writePhases) {
+	phaseStart := time.Now()
+	m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
+	m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
+	ph.stat = time.Since(phaseStart)
+	if want, count := m.kazCompactionWanted(inode, indx, prevSlices, ph.numSlices); want {
+		if ph.numSlices < maxSlices {
+			m.requestBackgroundCompaction(inode, indx, count, int(attr.Tier))
+		} else {
+			logger.Debugf("metadata write inode=%d chunk=%d phase=compact slices=%d", inode, indx, ph.numSlices)
+			phaseStart = time.Now()
+			m.compactChunk(inode, indx, true, false, int(attr.Tier))
+			ph.compact = time.Since(phaseStart)
+		}
+	}
+}
+
+// errWriteSlicesFallback is returned by doWriteSlices, before changing anything,
+// for a batch the engine will not commit at once (for example one that would
+// take a chunk past maxSlices); WriteSlices then writes the slices one by one.
+const errWriteSlicesFallback = syscall.E2BIG
+
+// batchErrorUnapplied reports errors that a write transaction returns before
+// changing anything, so its slices can safely be retried one by one.
+func batchErrorUnapplied(st syscall.Errno) bool {
+	return st == syscall.ENOENT || st == syscall.EPERM || st == syscall.ENOSPC || st == syscall.EDQUOT || st == errWriteSlicesFallback
+}
+
+// WriteSlices appends slices to chunk indx in creation order. Engines that
+// implement sliceBatchWriter commit them in one transaction; otherwise, or for
+// a single slice, they are written one by one with Write.
+func (m *baseMeta) WriteSlices(ctx Context, inode Ino, indx uint32, slices []SliceWrite, mtime time.Time) (int, syscall.Errno, bool) {
+	bw, ok := m.en.(sliceBatchWriter)
+	if len(slices) <= 1 || !ok {
+		for i, w := range slices {
+			if st := m.Write(ctx, inode, indx, w.Off, w.Slice, mtime); st != 0 {
+				return i, st, false
+			}
+		}
+		return len(slices), 0, false
+	}
+	start := time.Now()
+	defer m.timeit("WriteSlices", start)
+	first := slices[0].Slice.Id
+	var lockWait time.Duration
+	var ph writePhases
+	var st syscall.Errno
+	defer func() {
+		if total := time.Since(start); total >= time.Second {
+			logger.Warnf("slow metadata write batch inode=%d chunk=%d first_slice=%d count=%d slices=%d total=%s lock_wait=%s doWrite=%s stat=%s compact=%s errno=%s",
+				inode, indx, first, len(slices), ph.numSlices, total, lockWait, ph.backend, ph.stat, ph.compact, st)
+		}
+	}()
+	logger.Debugf("metadata write batch inode=%d chunk=%d first_slice=%d count=%d phase=lock_wait", inode, indx, first, len(slices))
+	f := m.of.find(inode)
+	if f != nil {
+		lockStart := time.Now()
+		f.Lock()
+		defer f.Unlock()
+		lockWait = time.Since(lockStart)
+	}
+	defer func() { m.of.InvalidateChunk(inode, indx) }()
+	var delta dirStat
+	var attr Attr
+	phaseStart := time.Now()
+	st = bw.doWriteSlices(ctx, inode, indx, slices, mtime, &ph.numSlices, &delta, &attr)
+	ph.backend = time.Since(phaseStart)
+	logger.Debugf("metadata write batch inode=%d chunk=%d first_slice=%d count=%d phase=done lock_wait=%s doWrite=%s slices=%d errno=%s",
+		inode, indx, first, len(slices), lockWait, ph.backend, ph.numSlices, st)
+	if st == 0 {
+		m.afterWrite(ctx, inode, indx, &attr, delta, ph.numSlices-len(slices), &ph)
+		return len(slices), 0, false
+	}
+	if !batchErrorUnapplied(st) {
+		// The transaction may have been applied; retrying could register slices twice.
+		return 0, st, true
+	}
+	for i, w := range slices {
+		var one writePhases
+		if st = m.writeLocked(ctx, inode, indx, w.Off, w.Slice, mtime, &one); st != 0 {
+			return i, st, false
+		}
+	}
+	return len(slices), 0, false
 }
 
 func (m *baseMeta) Truncate(ctx Context, inode Ino, flags uint8, length uint64, attr *Attr, skipPermCheck bool) syscall.Errno {
@@ -2816,7 +2974,7 @@ func (m *baseMeta) CompactAll(ctx Context, threads int, bar *utils.Bar) syscall.
 		go func() {
 			for c := range ch {
 				logger.Debugf("Compacting chunk %d:%d (%d slices)", c.inode, c.indx, c.slices)
-				m.compactChunk(c.inode, c.indx, false, true, -1)
+				m.forcedCompactChunk(c.inode, c.indx, -1) // kaz: block mode when selected
 				bar.Increment()
 			}
 			wg.Done()
@@ -2833,7 +2991,9 @@ func (m *baseMeta) CompactAll(ctx Context, threads int, bar *utils.Bar) syscall.
 	return 0
 }
 
+// compactChunk rewrites fragmented slices, retaining durable object storage semantics.
 func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID int) {
+	start := time.Now()
 	// avoid too many or duplicated compaction
 	k := uint64(inode) + (uint64(indx) << 40)
 	m.Lock()
@@ -2842,8 +3002,13 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 		return
 	}
 	if once || force {
+		loggedWait := false
 		for m.compacting[k] {
 			m.Unlock()
+			if !loggedWait {
+				logger.Debugf("compaction inode=%d chunk=%d phase=queue_wait once=%t force=%t", inode, indx, once, force)
+				loggedWait = true
+			}
 			time.Sleep(time.Millisecond * 10)
 			m.Lock()
 		}
@@ -2853,12 +3018,23 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 	}
 	m.compacting[k] = true
 	m.Unlock()
+	queueWait := time.Since(start)
+	var objectTime, metadataTime time.Duration
+	var sliceCount int
+	var compactSize uint32
+	defer func() {
+		if total := time.Since(start); total >= time.Second {
+			logger.Warnf("slow compaction inode=%d chunk=%d once=%t force=%t slices=%d bytes=%d total=%s queue_wait=%s object=%s metadata=%s",
+				inode, indx, once, force, sliceCount, compactSize, total, queueWait, objectTime, metadataTime)
+		}
+	}()
 	defer func() {
 		m.Lock()
 		delete(m.compacting, k)
 		m.Unlock()
 	}()
 
+	logger.Debugf("compaction inode=%d chunk=%d phase=read queue_wait=%s", inode, indx, queueWait)
 	ss, st := m.en.doRead(Background(), inode, indx)
 	if st != 0 {
 		return
@@ -2876,6 +3052,7 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 	skipped := skipSome(ss)
 	compacted := ss[skipped:]
 	pos, size, slices := compactChunk(compacted)
+	sliceCount, compactSize = len(compacted), size
 	if len(compacted) < 2 || size == 0 {
 		return
 	}
@@ -2901,7 +3078,10 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 		}
 		tierID = int(attr.Tier)
 	}
+	logger.Debugf("compaction inode=%d chunk=%d slice=%d phase=object slices=%d bytes=%d", inode, indx, id, sliceCount, size)
+	phaseStart := time.Now()
 	err := m.newMsg(CompactChunk, slices, id, uint8(tierID))
+	objectTime = time.Since(phaseStart)
 	if err != nil {
 		if !strings.Contains(err.Error(), "not exist") && !strings.Contains(err.Error(), "not found") {
 			logger.Warnf("compact %d %d with %d slices: %s", inode, indx, len(compacted), err)
@@ -2923,7 +3103,11 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 	for _, s := range ss {
 		origin = append(origin, marshalSlice(s.pos, s.id, s.size, s.off, s.len)...)
 	}
+	logger.Debugf("compaction inode=%d chunk=%d slice=%d phase=metadata object=%s", inode, indx, id, objectTime)
+	phaseStart = time.Now()
 	st = m.en.doCompactChunk(inode, indx, origin, compacted, skipped, pos, id, size, dsbuf)
+	metadataTime = time.Since(phaseStart)
+	logger.Debugf("compaction inode=%d chunk=%d slice=%d phase=done errno=%s", inode, indx, id, st)
 	if st == syscall.EINVAL {
 		logger.Infof("compaction for %d:%d is wasted, delete slice %d (%d bytes)", inode, indx, id, size)
 		m.deleteSlice(id, size)
@@ -2956,7 +3140,7 @@ func (m *baseMeta) Compact(ctx Context, inode Ino, concurrency int, preFunc, pos
 		go func() {
 			defer wg.Done()
 			for c := range chunkChan {
-				m.compactChunk(c.inode, c.indx, false, true, int(attr.Tier))
+				m.forcedCompactChunk(c.inode, c.indx, int(attr.Tier)) // kaz: block mode when selected
 				postFunc()
 				if ctx.Canceled() {
 					return

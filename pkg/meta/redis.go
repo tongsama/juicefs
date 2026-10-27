@@ -1141,7 +1141,8 @@ func replaceErrno(txf func(tx *redis.Tx) error) func(tx *redis.Tx) error {
 	}
 }
 
-func (m *redisMeta) txn(ctx Context, txf func(tx *redis.Tx) error, keys ...string) error {
+// txn serializes watched keys and separates local lock contention from transaction time.
+func (m *redisMeta) txn(ctx Context, txf func(tx *redis.Tx) error, keys ...string) (result error) {
 	if m.conf.ReadOnly {
 		return syscall.EROFS
 	}
@@ -1157,8 +1158,20 @@ func (m *redisMeta) txn(ctx Context, txf func(tx *redis.Tx) error, keys ...strin
 	start := time.Now()
 	defer func() { m.txDist.Observe(time.Since(start).Seconds()) }()
 
+	logger.Debugf("metadata transaction key=%s phase=lock_wait", keys[0])
+	lockStart := time.Now()
 	m.txLock(h)
+	lockWait := time.Since(lockStart)
+	activeStart := time.Now()
+	var attempts int
+	defer func() {
+		if total := time.Since(start); total >= time.Second {
+			logger.Warnf("slow metadata transaction key=%s total=%s lock_wait=%s active=%s attempts=%d err=%v",
+				keys[0], total, lockWait, time.Since(activeStart), attempts, result)
+		}
+	}()
 	defer m.txUnlock(h)
+	logger.Debugf("metadata transaction key=%s phase=active lock_wait=%s", keys[0], lockWait)
 	// TODO: enable retry for some of idempotent transactions
 	var (
 		retryOnFailure = false
@@ -1174,6 +1187,7 @@ func (m *redisMeta) txn(ctx Context, txf func(tx *redis.Tx) error, keys ...strin
 			logger.Warnf("Transaction %s interrupted after %s, tried %d, keys: %v", method.name(ctx), time.Since(start), i+1, keys)
 			return syscall.EINTR
 		}
+		attempts = i + 1
 		err := m.rdb.Watch(ctx, replaceErrno(txf), keys...)
 		if eno, ok := err.(errNo); ok {
 			if eno == 0 {
@@ -3173,6 +3187,60 @@ func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, sli
 	}, m.inodeKey(inode)))
 }
 
+// doWriteSlices appends slices to one chunk and updates the inode in a single
+// transaction: one RPUSH with every slice, one SET of the attributes.
+func (m *redisMeta) doWriteSlices(ctx Context, inode Ino, indx uint32, slices []SliceWrite, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
+	return errno(m.txn(ctx, func(tx *redis.Tx) error {
+		*delta = dirStat{}
+		*attr = Attr{}
+		a, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
+		if err != nil {
+			return err
+		}
+		m.parseAttr(a, attr)
+		if attr.Typ != TypeFile {
+			return syscall.EPERM
+		}
+		oldLength := attr.Length
+		for _, w := range slices {
+			if newleng := uint64(indx)*ChunkSize + uint64(w.Off) + uint64(w.Slice.Len); newleng > attr.Length {
+				attr.Length = newleng
+			}
+		}
+		delta.length = int64(attr.Length - oldLength)
+		delta.space = align4K(attr.Length) - align4K(oldLength)
+		if err := m.checkQuota(ctx, delta.space, 0, attr.Uid, attr.Gid, m.getParents(ctx, tx, inode, attr.Parent)...); err != 0 {
+			return err
+		}
+		now := time.Now()
+		attr.Mtime = mtime.Unix()
+		attr.Mtimensec = uint32(mtime.Nanosecond())
+		attr.Ctime = now.Unix()
+		attr.Ctimensec = uint32(now.Nanosecond())
+		vals := make([]interface{}, len(slices))
+		for i, w := range slices {
+			vals[i] = marshalSlice(w.Off, w.Slice.Id, w.Slice.Size, w.Slice.Off, w.Slice.Len)
+		}
+		var rpush *redis.IntCmd
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			rpush = pipe.RPush(ctx, m.chunkKey(inode, indx), vals...)
+			pipe.Set(ctx, m.inodeKey(inode), m.marshal(attr), 0)
+			if delta.space > 0 {
+				pipe.IncrBy(ctx, m.usedSpaceKey(), delta.space)
+			}
+			for _, w := range slices {
+				m.genLog(ctx, pipe, now, "WRITE(%d,%d,%d,%d,%d,%d,%d):%d", inode, indx, w.Off, w.Slice.Id, w.Slice.Len, attr.Mtime, attr.Mtimensec, *numSlices)
+			}
+			return nil
+		})
+		if err == nil {
+			*numSlices = int(rpush.Val())
+		}
+		return err
+	}, m.inodeKey(inode)))
+}
+
+// CopyFileRange copies only a watched source chunk snapshot and commits its shared references atomically.
 func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut uint64, size uint64, flags uint32, copied, outLength *uint64) syscall.Errno {
 	defer m.timeit("CopyFileRange", time.Now())
 	f := m.of.find(fout)
@@ -3234,9 +3302,18 @@ func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, 
 			*outLength = attr.Length
 		}
 
-		var vals [][]string
+		// Watch every source chunk before reading it: compaction changes chunk
+		// lists without changing the inode, and a stale copy must not revive dead refs.
+		var sourceKeys []string
 		for i := offIn / ChunkSize; i <= (offIn+size)/ChunkSize; i++ {
-			val, err := tx.LRange(ctx, m.chunkKey(fin, uint32(i)), 0, -1).Result()
+			sourceKeys = append(sourceKeys, m.chunkKey(fin, uint32(i)))
+		}
+		if err := tx.Watch(ctx, sourceKeys...).Err(); err != nil {
+			return err
+		}
+		var vals [][]string
+		for _, key := range sourceKeys {
+			val, err := tx.LRange(ctx, key, 0, -1).Result()
 			if err != nil {
 				return err
 			}
@@ -3782,6 +3859,7 @@ func (r *redisMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error)
 	return count, err
 }
 
+// doCompactChunk atomically replaces references before notifying obsolete-slice cleanup.
 func (m *redisMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*slice, skipped int, pos uint32, id uint64, size uint32, delayed []byte) syscall.Errno {
 	var rs []*redis.IntCmd // trash disabled: check reference of slices
 	if delayed == nil {
@@ -3844,7 +3922,7 @@ func (m *redisMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*
 		if delayed == nil {
 			for i, s := range ss {
 				if s.id > 0 && rs[i].Err() == nil && rs[i].Val() < 0 {
-					m.deleteSlice(s.id, s.size)
+					m.enqueueCompactionDelete(s.id, s.size)
 				}
 			}
 		}
@@ -5286,6 +5364,7 @@ func (m *redisMeta) loadQuotasForDump(ctx Context, quotaKey string) map[uint64]*
 	return quotas
 }
 
+// doCloneEntry clones one entry while detecting concurrent source chunk replacement.
 func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, ino Ino, originAttr *Attr, cmode uint8, cumask uint16, top bool) syscall.Errno {
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
 		a, err := tx.Get(ctx, m.inodeKey(srcIno)).Bytes()
@@ -5339,6 +5418,18 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 			}
 			if eno := m.Access(ctx, parent, MODE_MASK_W|MODE_MASK_X, &pattr); eno != 0 {
 				return eno
+			}
+		}
+
+		// Pin the source snapshot before any chunk LRANGE. A concurrent
+		// compaction then aborts EXEC instead of restoring an obsolete slice ref.
+		if attr.Typ == TypeFile && attr.Length != 0 {
+			var sourceKeys []string
+			for i := uint64(0); i <= attr.Length/ChunkSize; i++ {
+				sourceKeys = append(sourceKeys, m.chunkKey(srcIno, uint32(i)))
+			}
+			if err := tx.Watch(ctx, sourceKeys...).Err(); err != nil {
+				return err
 			}
 		}
 
@@ -5414,6 +5505,7 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 	}, m.inodeKey(srcIno), m.xattrKey(srcIno)))
 }
 
+// doBatchClone clones a batch with watched source chunk snapshots and shared-reference updates.
 func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries []*Entry, cmode uint8, cumask uint16, result *batchCloneResult) syscall.Errno {
 	type cloneInfo struct {
 		entry   *Entry
@@ -5556,6 +5648,7 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 				cmd    *redis.StringSliceCmd
 			}
 			var ccmds []chunkCmd
+			var sourceKeys []string
 			for _, ino := range srcList {
 				sd, ok := srcData[ino]
 				if !ok {
@@ -5569,7 +5662,9 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 						chunkNum := int(a.Length/ChunkSize) + 1
 						sd.chunks = make([]chunkData, chunkNum)
 						for i := 0; i < chunkNum; i++ {
-							cmd := readPipe.LRange(ctx, m.chunkKey(ino, uint32(i)), 0, -1)
+							key := m.chunkKey(ino, uint32(i))
+							sourceKeys = append(sourceKeys, key)
+							cmd := readPipe.LRange(ctx, key, 0, -1)
 							ccmds = append(ccmds, chunkCmd{srcIno: ino, indx: uint32(i), cmd: cmd})
 						}
 					}
@@ -5578,6 +5673,13 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 				default:
 					logger.Warnf("doBatchClone: unsupported type %d for inode %d, skipping", a.Typ, ino)
 					delete(srcData, ino)
+				}
+			}
+			// All source chunk reads are still only queued locally. Batch WATCH
+			// before executing them so a concurrent compaction invalidates this snapshot.
+			if len(sourceKeys) > 0 {
+				if err := tx.Watch(ctx, sourceKeys...).Err(); err != nil {
+					return err
 				}
 			}
 			if _, err := readPipe.Exec(ctx); err != nil && err != redis.Nil {

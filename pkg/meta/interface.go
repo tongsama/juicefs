@@ -57,6 +57,8 @@ const (
 	OpSummary = 1007
 	// CompactPath is a message to trigger compact
 	CompactPath = 1008
+	// RetireSlice optionally cancels local staging after committed reference retirement, without remote I/O.
+	RetireSlice = 1009
 )
 
 const (
@@ -334,6 +336,12 @@ type Slice struct {
 	Len  uint32
 }
 
+// SliceWrite is one slice to append to a chunk, starting at Off within the chunk.
+type SliceWrite struct {
+	Off   uint32
+	Slice Slice
+}
+
 // Summary represents the total number of files/directories and
 // total length of all files inside a directory.
 type Summary struct {
@@ -474,6 +482,12 @@ type Meta interface {
 	NewSlice(ctx Context, id *uint64) syscall.Errno
 	// Write put a slice of data on top of the given chunk.
 	Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno
+	// WriteSlices appends slices to chunk indx in order, using one metadata
+	// transaction when the engine supports it. The first n slices are committed;
+	// if n < len(slices), slices[n] failed with st. When uncertain is true, a
+	// batch transaction failed with an unknown outcome and slices[n:] may or may
+	// not have been written; otherwise the slices after slices[n] were not written.
+	WriteSlices(ctx Context, inode Ino, indx uint32, slices []SliceWrite, mtime time.Time) (n int, st syscall.Errno, uncertain bool)
 	// InvalidateChunkCache invalidate chunk cache
 	InvalidateChunkCache(ctx Context, inode Ino, indx uint32) syscall.Errno
 	// CopyFileRange copies part of a file to another one.

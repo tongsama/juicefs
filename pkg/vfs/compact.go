@@ -40,7 +40,7 @@ func readSlice(store chunk.ChunkStore, s *meta.Slice, page *chunk.Page, off int)
 	reader := store.NewReader(s.Id, int(s.Size))
 	for read < len(buf) {
 		p := page.Slice(read, len(buf)-read)
-		n, err := reader.ReadAt(context.Background(), p, off+int(s.Off))
+		n, err := reader.ReadAt(chunk.KazCompactionReadContext(context.Background()), p, off+int(s.Off))
 		p.Release()
 		if n == 0 && err != nil {
 			return err
@@ -64,6 +64,9 @@ func Compact(conf chunk.Config, store chunk.ChunkStore, slices []meta.Slice, id 
 
 	writer := store.NewWriter(id, tierID)
 	writer.SetWriteback(false)
+	if w, ok := writer.(kazCompactionWriter); ok {
+		w.KazSetCompactionSources(kazCompactionSources(slices, conf.BlockSize)) // kaz-2q: cache output like its sources
+	}
 
 	var pos int
 	for i, s := range slices {
