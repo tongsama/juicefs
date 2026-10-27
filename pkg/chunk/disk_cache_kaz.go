@@ -23,6 +23,19 @@ import (
 	"strings"
 )
 
+// kazDiskCache and kazNewDiskCache are the names kaz code uses for the local
+// disk cache store, so that upstream's kazDiskCache -> diskCache rename only
+// needs to change these two definitions.
+type kazDiskCache = cacheStore
+
+var kazNewDiskCache = newCacheStore
+
+// flushPage writes data to path via a tmp file and rename without syncing it.
+// It keeps upstream's signature; kaz's durable variant is flushPageOpt.
+func (cache *kazDiskCache) flushPage(path string, data []byte, dropCache bool, tierID uint8) error {
+	return cache.flushPageOpt(path, data, dropCache, tierID, false)
+}
+
 // kazPeeker is implemented by key indexes that can look up a key without
 // counting it as a user read (the kaz-2q index).
 type kazPeeker interface {
@@ -46,7 +59,7 @@ func kazLookupNoTouch(keys KeyIndex, k cacheKey) *cacheItem {
 // scan restores the segments) and starts the periodic state saver. It does
 // nothing for other eviction policies. It must run before the store
 // goroutines start.
-func (cache *cacheStore) kazAttach(capacity int64) {
+func (cache *kazDiskCache) kazAttach(capacity int64) {
 	idx, ok := cache.keys.(*kaz2QIndex)
 	if !ok {
 		return
@@ -63,7 +76,7 @@ func (cache *cacheStore) kazAttach(capacity int64) {
 // exactly as load does (pending pages, the scanned check, removing an index
 // entry whose file cannot be opened) but looks the key up without counting
 // it as a user read, so that neither atime nor the 2Q segment changes.
-func (cache *cacheStore) kazLoadNoTouch(key string) (ReadCloser, error) {
+func (cache *kazDiskCache) kazLoadNoTouch(key string) (ReadCloser, error) {
 	cache.Lock()
 	defer cache.Unlock()
 	if p, ok := cache.pages[key]; ok {
@@ -95,7 +108,7 @@ func (cache *cacheStore) kazLoadNoTouch(key string) (ReadCloser, error) {
 }
 
 // kazLoadNoTouch is cacheManager.load for a compaction read: the same store
-// routing and legacy-store fallback, using cacheStore.kazLoadNoTouch.
+// routing and legacy-store fallback, using kazDiskCache.kazLoadNoTouch.
 func (m *cacheManager) kazLoadNoTouch(key string) (ReadCloser, error) {
 	store := m.getStore(key)
 	if store == nil {
@@ -266,7 +279,7 @@ func (m *cacheManager) kazCacheState(key string) (string, bool) {
 // syncDirs persists the entry renamed into dir, then the entry of dir and each ancestor below cache.dir in
 // its parent, stopping at the first dir this process already made durable. A dir is recorded only after its
 // whole chain is synced, so a concurrent writer never skips a parent sync that is still in progress.
-func (cache *cacheStore) syncDirs(dir string) error {
+func (cache *kazDiskCache) syncDirs(dir string) error {
 	if err := cache.checkErr(func() error { return syncStagingDir(dir) }); err != nil {
 		return err
 	}
@@ -295,14 +308,14 @@ func (cache *cacheStore) syncDirs(dir string) error {
 }
 
 // forgetDurableDir drops dir after it is removed, so a recreated dir is synced into its parent again.
-func (cache *cacheStore) forgetDurableDir(dir string) {
+func (cache *kazDiskCache) forgetDurableDir(dir string) {
 	cache.durableMu.Lock()
 	delete(cache.durableDirs, filepath.Clean(dir))
 	cache.durableMu.Unlock()
 }
 
 // removeLocal returns unlink failures and retries staged paths even after index removal.
-func (cache *cacheStore) removeLocal(key string, staging bool) error {
+func (cache *kazDiskCache) removeLocal(key string, staging bool) error {
 	cache.Lock()
 	delete(cache.pages, key)
 	path := cache.cachePath(key)

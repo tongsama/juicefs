@@ -74,7 +74,7 @@ func TestKaz2QCompatRoundTrip(t *testing.T) {
 	// Phase 2: an lru store opens the same directory and reads every block.
 	lru := conf
 	lru.CacheEviction = EvictionLRU
-	l := newCacheStore(nil, dir, 1<<30, 0, 1, &lru, nil)
+	l := kazNewDiskCache(nil, dir, 1<<30, 0, 1, &lru, nil)
 	l.scanCached(false)
 	l.Lock()
 	require.Equal(t, 5, l.keys.len())

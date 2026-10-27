@@ -302,14 +302,14 @@ func readKazCacheState(path string) (kazCacheState, error) {
 }
 
 // kazStatePath returns the path of the state file of this store.
-func (cache *cacheStore) kazStatePath() string {
+func (cache *kazDiskCache) kazStatePath() string {
 	return filepath.Join(cache.dir, kazStateFile)
 }
 
 // kazLoadState imports the state file if it exists. A missing file is normal;
 // any other failure is logged and counted, and the store starts with every
 // block in probation. It runs from kazAttach, before the first scan.
-func (cache *cacheStore) kazLoadState(idx *kaz2QIndex) {
+func (cache *kazDiskCache) kazLoadState(idx *kaz2QIndex) {
 	path := cache.kazStatePath()
 	st, err := readKazCacheState(path)
 	if err != nil {
@@ -328,7 +328,7 @@ func (cache *cacheStore) kazLoadState(idx *kaz2QIndex) {
 // kazSaveState exports the state under the store mutex and writes it outside
 // of it. Failures are logged and counted only; they never affect cache
 // operations. Saves of one store are serialized.
-func (cache *cacheStore) kazSaveState() {
+func (cache *kazDiskCache) kazSaveState() {
 	idx, ok := cache.keys.(*kaz2QIndex)
 	if !ok {
 		return
@@ -351,7 +351,7 @@ func (cache *cacheStore) kazSaveState() {
 }
 
 // kazSaveLoop saves the state every interval while the store is available.
-func (cache *cacheStore) kazSaveLoop(interval time.Duration) {
+func (cache *kazDiskCache) kazSaveLoop(interval time.Duration) {
 	for cache.available() {
 		time.Sleep(interval)
 		if !cache.available() {
@@ -365,7 +365,7 @@ func (cache *cacheStore) kazSaveLoop(interval time.Duration) {
 // waiting at most kazFlushTimeout so that a hung disk cannot block umount.
 func (m *cacheManager) kazFlushState() {
 	m.Lock()
-	stores := append([]*cacheStore(nil), m.stores...)
+	stores := append([]*kazDiskCache(nil), m.stores...)
 	m.Unlock()
 	var wg sync.WaitGroup
 	for _, s := range stores {
@@ -376,7 +376,7 @@ func (m *cacheManager) kazFlushState() {
 			continue
 		}
 		wg.Add(1)
-		go func(s *cacheStore) {
+		go func(s *kazDiskCache) {
 			defer wg.Done()
 			s.kazSaveState()
 		}(s)

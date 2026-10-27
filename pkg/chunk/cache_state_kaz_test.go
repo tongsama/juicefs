@@ -43,13 +43,13 @@ func kazStateTestConf() Config {
 	return conf
 }
 
-// newKazStateStore builds a real store with newCacheStore on dir (which must
+// newKazStateStore builds a real store with kazNewDiskCache on dir (which must
 // end with a separator, as cache.dir does). Like TestSetlimitByFreeRatio, the
 // store goroutines are left running: shutdownStore writes s.state without the
 // lock that available() lacks too, which -race reports.
-func newKazStateStore(t *testing.T, dir string, conf Config) *cacheStore {
+func newKazStateStore(t *testing.T, dir string, conf Config) *kazDiskCache {
 	t.Helper()
-	return newCacheStore(newKazTestMetrics(), dir, 1<<30, 0, 1, &conf, nil)
+	return kazNewDiskCache(newKazTestMetrics(), dir, 1<<30, 0, 1, &conf, nil)
 }
 
 // kazStateDir returns a fresh cache directory ending with a separator.
@@ -62,7 +62,7 @@ func kazStateDir(t *testing.T) string {
 }
 
 // kazGhostKeys returns the evicted-key list of the index, oldest first.
-func kazGhostKeys(s *cacheStore, idx *kaz2QIndex) []cacheKey {
+func kazGhostKeys(s *kazDiskCache, idx *kaz2QIndex) []cacheKey {
 	s.Lock()
 	defer s.Unlock()
 	var keys []cacheKey
@@ -73,7 +73,7 @@ func kazGhostKeys(s *cacheStore, idx *kaz2QIndex) []cacheKey {
 }
 
 // kazStateEvents returns the count of a 2Q event on the store metrics.
-func kazStateEvents(s *cacheStore, name string) float64 {
+func kazStateEvents(s *kazDiskCache, name string) float64 {
 	return testutil.ToFloat64(s.m.kaz2Q.events.WithLabelValues(name))
 }
 
@@ -229,7 +229,7 @@ func TestKazCacheStateIgnoredByLRU(t *testing.T) {
 
 	lru := conf
 	lru.CacheEviction = EvictionLRU
-	s := newCacheStore(nil, dir, 1<<30, 0, 1, &lru, nil)
+	s := kazNewDiskCache(nil, dir, 1<<30, 0, 1, &lru, nil)
 	s.scanCached(false)
 	s.Lock()
 	require.Equal(t, len(keys), s.keys.len())

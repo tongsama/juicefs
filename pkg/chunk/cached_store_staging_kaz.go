@@ -132,7 +132,7 @@ func (store *cachedStore) retireCache(key string) error {
 // An in-flight error is retryable: the caller must retain its durable dead marker and
 // must not hand physical deletion off as completed while a PUT can recreate the object.
 func (store *cachedStore) Retire(id uint64, length int) error {
-	keys := sliceForRead(id, length, store).keys()
+	keys := kazSliceKeys(id, length, store)
 	var err error
 	busy := false
 	cancel := func() {

@@ -123,7 +123,7 @@ func (store *cachedStore) kazCacheCompactionOutput(key string, block *Page, sour
 		return
 	}
 	// getCacheKey only parses the key, it does not use the store.
-	indx := (*cacheStore)(nil).getCacheKey(key).indx
+	indx := (*kazDiskCache)(nil).getCacheKey(key).indx
 	refs := sources(int(indx))
 	srcs := make([]kazPlacementSource, 0, len(refs))
 	var outBytes uint32 // the same in every ref; max guards hand-made refs
@@ -401,4 +401,19 @@ func (store *cachedStore) kazPutParam(payload int, used time.Duration) string {
 		param = fmt.Sprintf("payload_bytes=%d ", payload)
 	}
 	return param
+}
+
+// kazSliceKeys returns the object keys of every block of slice id with the given
+// length, in block order. It replaces rSlice.keys(), which upstream removed.
+func kazSliceKeys(id uint64, length int, store *cachedStore) []string {
+	if length <= 0 {
+		return nil
+	}
+	r := rSlice{id: id, length: length, store: store}
+	lastIndx := (length - 1) / store.conf.BlockSize
+	keys := make([]string, lastIndx+1)
+	for i := 0; i <= lastIndx; i++ {
+		keys[i] = r.key(i)
+	}
+	return keys
 }

@@ -195,7 +195,7 @@ func (s *rSlice) Remove() error {
 	}
 
 	var err error
-	keys := s.keys()
+	keys := kazSliceKeys(s.id, s.length, s.store)
 	for i := range keys {
 		err = errors.Join(err, s.delete(i))
 	}

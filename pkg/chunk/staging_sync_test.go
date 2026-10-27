@@ -52,14 +52,14 @@ func (r *stagingSyncRecorder) install(t *testing.T, finalPath string) {
 }
 
 // newStagingSyncStore builds a writeback disk cache in a temp dir for staging durability tests.
-func newStagingSyncStore(t *testing.T, noSync bool) *cacheStore {
+func newStagingSyncStore(t *testing.T, noSync bool) *kazDiskCache {
 	conf := defaultConf
 	conf.Writeback = true
 	conf.StagingNoSync = noSync
 	conf.CacheScanInterval = -1
 	m := new(cacheManagerMetrics)
 	m.initMetrics()
-	s := newCacheStore(m, t.TempDir(), 1<<30, conf.CacheItems, 1, &conf, nil)
+	s := kazNewDiskCache(m, t.TempDir(), 1<<30, conf.CacheItems, 1, &conf, nil)
 	s.scanned = true
 	return s
 }

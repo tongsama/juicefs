@@ -513,10 +513,10 @@ func (cache *cacheStore) curFreeRatio() DiskFreeRatio {
 	return usage
 }
 
-// flushPage writes data to path via a tmp file and rename. With durable set, the data is synced before the
+// kaz: flushPageOpt is flushPage with a durable option. With durable set, the data is synced before the
 // rename publishes the name, and the rename plus the directory chain are synced afterwards, so an OS crash
 // cannot leave a published block with missing contents or lose its name.
-func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool, tierID uint8, durable bool) (err error) {
+func (cache *cacheStore) flushPageOpt(path string, data []byte, dropCache bool, tierID uint8, durable bool) (err error) {
 	if !cache.available() {
 		return errCacheDown
 	}
@@ -744,7 +744,7 @@ func (cache *cacheStore) flush() {
 	for {
 		w := <-cache.pending
 		path := cache.cachePath(w.key)
-		if cache.enabled() && cache.flushPage(path, w.page.Data, w.dropCache, 0, false) == nil {
+		if cache.enabled() && cache.flushPage(path, w.page.Data, w.dropCache, 0) == nil {
 			cache.add(w.key, int32(len(w.page.Data)), uint32(time.Now().Unix()))
 		}
 		cache.Lock()
@@ -796,7 +796,7 @@ func (cache *cacheStore) stage(key string, data []byte, tierID uint8) (string, e
 	}
 	stagingBlocks.Add(1)
 	defer stagingBlocks.Add(-1)
-	err := cache.flushPage(stagingPath, data, false, tierID, cache.stagingSync)
+	err := cache.flushPageOpt(stagingPath, data, false, tierID, cache.stagingSync)
 	if err == nil {
 		cache.m.stageBlocks.Add(1)
 		cache.m.stageBlockBytes.Add(float64(len(data)))
