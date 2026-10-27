@@ -79,6 +79,15 @@ func kazBlockCompactionFromFlags(mode string, ratio float64, maxSlices, deltaTie
 // applyKazCompactionPolicyFlags copies the kaz compaction policy and block
 // compaction flags into conf and exits on an invalid value, like the other compaction modes.
 func applyKazCompactionPolicyFlags(c *cli.Context, conf *meta.Config) {
+	// optional compaction modes, validated before the metadata client is built.
+	conf.CompactionGCMode = c.String("kaz-compaction-gc-mode")
+	conf.CompactionScheduler = c.String("kaz-compaction-scheduler")
+	if err := conf.ValidateCompactionGC(); err != nil {
+		logger.Fatalf("%s", err)
+	}
+	if err := conf.ValidateCompactionScheduler(); err != nil {
+		logger.Fatalf("%s", err)
+	}
 	readMin, err := kazCompactionReadMinFromFlag(c.Int("kaz-compaction-read-min"))
 	if err != nil {
 		logger.Fatalf("%s", err)
