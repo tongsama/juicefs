@@ -160,6 +160,8 @@ func (c *chunkWriter) commitSlices(batch []*sliceWriter, mtime time.Time) (int, 
 	}
 	for _, s := range batch[:end] {
 		f.w.reader.Invalidate(f.inode, uint64(c.indx)*meta.ChunkSize+uint64(s.off), uint64(s.slen))
+		// A slice that is, or may be, in the chunk records can be packed (staging_pack_kaz.go).
+		f.w.kazRememberStaged(f.inode, c.indx, s)
 	}
 	return n, err, uncertain
 }

@@ -28,4 +28,9 @@ type KazVfsConfig struct {
 	WriterFlushTimeout time.Duration // 0 waits without a deadline; AutoWriterFlushTimeout uses the legacy deadline.
 	WriterFlushScope   string        // WriterFlushScopeFile (default) or WriterFlushScopeRange for Read/Fallocate barriers.
 	MetaWriteBatch     int           // Maximum slices of one chunk committed per metadata transaction; 0 disables batching.
+	KazStagingPack     bool          // Pack staged small slices of one chunk when they are uploaded (--kaz-staging-pack).
+
+	// kazPackIdx is runtime state, not a setting: the slice -> chunk index of the
+	// staging packer, set by kazInitStagingPack (nil when packing is off).
+	kazPackIdx *kazPackIndex
 }

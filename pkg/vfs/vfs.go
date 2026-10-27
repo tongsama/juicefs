@@ -1309,6 +1309,8 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
 
 	go v.cleanupModified()
 	initVFSMetrics(v, writer, reader, registerer)
+	// kaz: register the staging packer when --kaz-staging-pack is on.
+	v.kazInitStagingPack()
 	return v
 }
 
