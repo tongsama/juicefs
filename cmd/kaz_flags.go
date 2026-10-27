@@ -147,6 +147,14 @@ func kazDataCacheFlags(upstream []cli.Flag) []cli.Flag {
 			Value:   true,
 			Usage:   "[kaz] fdatasync staged blocks and fsync their directories before acknowledging writes in writeback mode; disabling it is faster but staged data may be lost on an OS crash (--writeback-fsync is a deprecated alias)",
 		},
+		&cli.BoolFlag{
+			Name:  "kaz-staging-pack",
+			Usage: "[kaz] when writeback uploads are queued, upload the small staged slices of one chunk waiting in the queue as one object and point their records into it (needs --kaz-compaction-mode delta and a Redis or SQL metadata engine; skipped while the trash is enabled; uploads are never delayed for it; do not run reflink copies from unmodified clients while it runs)",
+		},
+		&cli.BoolFlag{
+			Name:  "kaz-skip-unuploaded-delete",
+			Usage: "[kaz] do not send DELETE for a staged block that this process never started to upload when its slice is removed; blocks staged before a restart, blocks with any upload attempt and direct uploads are still deleted",
+		},
 		&cli.StringFlag{
 			Name:    "kaz-slice-flush-wait",
 			Aliases: []string{"slice-flush-wait"}, // deprecated old name

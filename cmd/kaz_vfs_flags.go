@@ -57,6 +57,12 @@ func applyKazVfsFlags(c *cli.Context, cfg *vfs.Config) {
 	cfg.WriterFlushTimeout = flushTimeout
 	cfg.WriterFlushScope = c.String("kaz-writer-flush-scope")
 	cfg.MetaWriteBatch = c.Int("kaz-meta-write-batch")
+	cfg.KazStagingPack = c.Bool("kaz-staging-pack")
+	if cfg.KazStagingPack && c.String("kaz-compaction-mode") != "delta" {
+		// packing relies on delta compaction to keep chunks small; without it the pack would only add slice records
+		logger.Warnf("--kaz-staging-pack needs --kaz-compaction-mode delta; staging pack is disabled")
+		cfg.KazStagingPack = false
+	}
 }
 
 // kazRegisterMetaMsg registers the kaz metadata message handlers: durable

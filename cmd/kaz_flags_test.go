@@ -20,9 +20,11 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli/v2"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
+	"github.com/juicedata/juicefs/pkg/meta"
 )
 
 // TestKazRewordedUsage pins the kaz wording of the upstream --max-deletes and
@@ -60,4 +62,47 @@ func TestKazRewordedUsage(t *testing.T) {
 	}
 	mustPanic("missing", []cli.Flag{&cli.IntFlag{Name: "other"}})
 	mustPanic("b", []cli.Flag{&cli.BoolFlag{Name: "b"}})
+}
+
+// TestKazStagingPackFlag checks that --kaz-staging-pack reaches the VFS config
+// only together with --kaz-compaction-mode delta, and is off by default.
+func TestKazStagingPackFlag(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{nil, false},
+		{[]string{"--kaz-staging-pack", "--kaz-compaction-mode", "delta"}, true},
+		{[]string{"--kaz-staging-pack", "--kaz-compaction-mode", "upstream"}, false},
+		{[]string{"--kaz-staging-pack"}, false},
+		{[]string{"--kaz-compaction-mode", "delta"}, false},
+	} {
+		var got bool
+		app := &cli.App{Flags: cmdMount().Flags, Action: func(c *cli.Context) error {
+			got = getVfsConf(c, meta.DefaultConf(), &meta.Format{}, &chunk.Config{}).KazStagingPack
+			return nil
+		}}
+		require.NoError(t, app.Run(append([]string{"test"}, tc.args...)), "%v", tc.args)
+		require.Equal(t, tc.want, got, "%v", tc.args)
+	}
+}
+
+// TestKazSkipUnuploadedDeleteFlag checks that --kaz-skip-unuploaded-delete
+// reaches the chunk config and is off by default.
+func TestKazSkipUnuploadedDeleteFlag(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{nil, false},
+		{[]string{"--kaz-skip-unuploaded-delete"}, true},
+	} {
+		var got bool
+		app := &cli.App{Flags: cmdMount().Flags, Action: func(c *cli.Context) error {
+			got = getChunkConf(c, &meta.Format{BlockSize: 4096}).KazSkipUnuploadedDelete
+			return nil
+		}}
+		require.NoError(t, app.Run(append([]string{"test"}, tc.args...)), "%v", tc.args)
+		require.Equal(t, tc.want, got, "%v", tc.args)
+	}
 }
