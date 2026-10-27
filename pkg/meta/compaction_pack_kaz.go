@@ -16,6 +16,8 @@
 
 package meta
 
+import "syscall"
+
 // kazPackOut is one visible range that the packed slice takes over: the
 // chunk position, the source slice id, the offset inside that source slice's
 // data, and the length.
@@ -64,7 +66,7 @@ func planKazPack(ss []*slice, cands []uint64, maxBytes uint32) *kazPackPlan {
 	var ids []uint64
 	var outs []kazPackOut
 	for _, id := range cands {
-		if !present[id] || selected[id] {
+		if id == 0 || !present[id] || selected[id] { // id 0 is hole records, never a staged slice
 			continue
 		}
 		var vis uint64
@@ -100,4 +102,127 @@ func planKazPack(ss []*slice, cands []uint64, maxBytes uint32) *kazPackPlan {
 	}
 	plan.outs = outs
 	return plan
+}
+
+// KazPackResult is the outcome of KazPackChunk. Packed are the source slice ids
+// removed from the chunk (including fully hidden ones), Dead those of them whose
+// last reference was dropped, Bytes the size of the new slice, and Reason why
+// nothing was packed (empty on success): skip_busy, skip_trash, skip_engine,
+// skip_not_in_chunk, fail_put or fail_replace.
+type KazPackResult struct {
+	Packed []uint64
+	Dead   []uint64
+	Bytes  uint32
+	Reason string
+}
+
+// KazStagingPacker is implemented by metadata clients that can pack the staged
+// small slices of one chunk into a single slice (spec 5.4).
+type KazStagingPacker interface {
+	KazPackChunk(inode Ino, indx uint32, cands []uint64, data map[uint64][]byte, write func(id uint64, data []byte) error) KazPackResult
+}
+
+// KazPackChunk packs the candidate slices of one chunk into one new slice.
+// data holds each candidate's whole bytes from offset 0, and write PUTs the new
+// slice's bytes to the object store. It skips (never waits) when the chunk is
+// being compacted, when trash is on or when the engine cannot replace chunks
+// safely (delta mode must be active). The chunk is replaced only if it is
+// unchanged since the read; records written meanwhile stay on top.
+func (m *baseMeta) KazPackChunk(inode Ino, indx uint32, cands []uint64, data map[uint64][]byte, write func(id uint64, data []byte) error) KazPackResult {
+	r, isReplacer := m.en.(kazChunkReplacer)
+	if !isReplacer || !m.kazDeltaActive() {
+		return KazPackResult{Reason: "skip_engine"}
+	}
+	if m.toTrash(0) {
+		return KazPackResult{Reason: "skip_trash"}
+	}
+	bs := m.kazBlockSize()
+	limit, fits := kazBlockCompactLimit(bs)
+	if bs == 0 || !fits {
+		return KazPackResult{Reason: "skip_engine"}
+	}
+	k := uint64(inode) + (uint64(indx) << 40)
+	m.Lock()
+	if m.sessCtx != nil && m.sessCtx.Canceled() {
+		m.Unlock()
+		return KazPackResult{Reason: "skip_busy"}
+	}
+	if m.compacting[k] {
+		m.Unlock()
+		return KazPackResult{Reason: "skip_busy"}
+	}
+	m.compacting[k] = true
+	m.Unlock()
+	defer func() {
+		m.Lock()
+		delete(m.compacting, k)
+		m.Unlock()
+	}()
+
+	ss, st := m.en.doRead(Background(), inode, indx)
+	if st != 0 || ss == nil {
+		return KazPackResult{Reason: "skip_not_in_chunk"}
+	}
+	if len(ss) > limit {
+		ss = ss[:limit] // plan and origin cover the same prefix; later records stay on top
+	}
+	plan := planKazPack(ss, cands, uint32(bs))
+	if plan == nil {
+		return KazPackResult{Reason: "skip_not_in_chunk"}
+	}
+	var size uint32
+	for _, o := range plan.outs {
+		src := data[o.srcID]
+		if uint64(o.srcOff)+uint64(o.length) > uint64(len(src)) {
+			logger.Warnf("staging pack inode=%d chunk=%d: no data for slice %d [%d,+%d)", inode, indx, o.srcID, o.srcOff, o.length)
+			return KazPackResult{Reason: "fail_put"}
+		}
+		size += o.length
+	}
+	buf := make([]byte, 0, size)
+	for _, o := range plan.outs {
+		buf = append(buf, data[o.srcID][o.srcOff:o.srcOff+o.length]...)
+	}
+	var id uint64
+	if st := m.NewSlice(Background(), &id); st != 0 {
+		return KazPackResult{Reason: "fail_put"}
+	}
+	if err := write(id, buf); err != nil {
+		logger.Warnf("staging pack inode=%d chunk=%d slice=%d: put failed: %s", inode, indx, id, err)
+		m.deleteSlice(id, size)
+		return KazPackResult{Reason: "fail_put"}
+	}
+	replaced := make([]byte, 0, (len(plan.kept)+len(plan.outs))*sliceBytes)
+	for _, s := range plan.kept {
+		replaced = append(replaced, marshalSlice(s.pos, s.id, s.size, s.off, s.len)...)
+	}
+	var off uint32
+	for _, o := range plan.outs {
+		replaced = append(replaced, marshalSlice(o.pos, id, size, off, o.length)...)
+		off += o.length
+	}
+	origin := make([]byte, 0, len(ss)*sliceBytes)
+	for _, s := range ss {
+		origin = append(origin, marshalSlice(s.pos, s.id, s.size, s.off, s.len)...)
+	}
+	var dead []uint64
+	created := []kazCreated{{Slice: Slice{Id: id, Size: size, Len: size}, Refs: len(plan.outs)}}
+	if eno := r.doKazReplaceChunk(inode, indx, origin, replaced, plan.removed, created, nil, 0, func(did uint64, _ uint32) { dead = append(dead, did) }); eno != 0 {
+		logger.Infof("staging pack inode=%d chunk=%d slice=%d: replace failed: %s", inode, indx, id, eno)
+		if eno == syscall.EINVAL {
+			m.deleteSlice(id, size) // wasted: the chunk changed; EINVAL already released the references
+		}
+		return KazPackResult{Reason: "fail_replace"}
+	}
+	m.of.InvalidateChunk(inode, indx)
+	var packed []uint64
+	seen := make(map[uint64]bool)
+	for _, s := range plan.removed {
+		if s.id != 0 && !seen[s.id] {
+			seen[s.id] = true
+			packed = append(packed, s.id)
+		}
+	}
+	logger.Debugf("staging pack inode=%d chunk=%d slice=%d slices=%d bytes=%d dead=%d", inode, indx, id, len(packed), size, len(dead))
+	return KazPackResult{Packed: packed, Dead: dead, Bytes: size}
 }

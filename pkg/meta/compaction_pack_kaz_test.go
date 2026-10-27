@@ -17,6 +17,7 @@
 package meta
 
 import (
+	"errors"
 	"math/rand"
 	"testing"
 
@@ -251,4 +252,230 @@ func TestKazPackPlanLaterWrite(t *testing.T) {
 		{pos: 200, srcID: 2, srcOff: 0, length: 100},
 	}, p.outs)
 	require.Len(t, p.kept, 1)
+}
+
+// TestKazPackPlanZeroCandidate: a candidate id 0 never selects hole records.
+func TestKazPackPlanZeroCandidate(t *testing.T) {
+	ss := []*slice{
+		{id: 1, size: 100, len: 100, pos: 0},
+		{id: 0, len: 50, pos: 100}, // hole record
+		{id: 2, size: 100, len: 100, pos: 200},
+	}
+	p := planKazPack(ss, []uint64{0, 1, 2}, 1<<20)
+	require.NotNil(t, p)
+	require.Equal(t, []uint64{1, 2}, p.ids)
+	require.Len(t, p.removed, 2)
+	require.Len(t, p.kept, 1)
+	require.Nil(t, planKazPack(ss, []uint64{0, 1}, 1<<20))
+}
+
+// kazPackData returns the bytes of a test-written slice (what the fake store
+// reads for an id it has no data for).
+func kazPackData(id uint64, size uint32) []byte {
+	b := make([]byte, size)
+	for i := range b {
+		b[i] = kazFakeByte(id, uint32(i))
+	}
+	return b
+}
+
+// kazPackEnv is a delta-mode env holding five small writes in chunk 0 of one
+// file; the fifth hides parts of the first two. data maps each id to its bytes.
+type kazPackEnv struct {
+	*kazBlockEnv
+	inode Ino
+	ids   []uint64
+	data  map[uint64][]byte
+	puts  int
+	newID uint64
+}
+
+// newKazPackEnv builds the env (trash off) and writes the five slices.
+func newKazPackEnv(t *testing.T, backend string) *kazPackEnv {
+	t.Helper()
+	e := newKazDeltaEnv(t, backend)
+	e.kazTestUpdateFormat(func(f *Format) { f.TrashDays = 0 })
+	pe := &kazPackEnv{kazBlockEnv: e, inode: e.file(t), data: map[uint64][]byte{}}
+	for _, pos := range []uint32{0, 1000, 2000, 3000, 500} {
+		id := e.write(t, pe.inode, pos, 1000)
+		pe.ids = append(pe.ids, id)
+		pe.data[id] = kazPackData(id, 1000)
+	}
+	return pe
+}
+
+// put is the chunk-store PUT stand-in: it stores the bytes in the fake store.
+func (pe *kazPackEnv) put(hook func()) func(id uint64, data []byte) error {
+	return func(id uint64, data []byte) error {
+		pe.puts++
+		pe.newID = id
+		if hook != nil {
+			hook()
+		}
+		pe.store.mu.Lock()
+		pe.store.data[id] = append([]byte(nil), data...)
+		pe.store.mu.Unlock()
+		return nil
+	}
+}
+
+// pack runs KazPackChunk over all five ids.
+func (pe *kazPackEnv) pack(hook func()) KazPackResult {
+	return pe.KazPackChunk(pe.inode, 0, pe.ids, pe.data, pe.put(hook))
+}
+
+// TestKazPackChunkView packs five slices: the view stays, the new slice has one
+// record per out, and exactly the Dead ids are cleaned up.
+func TestKazPackChunkView(t *testing.T) {
+	for _, backend := range kazBlockBackends {
+		t.Run(backend, func(t *testing.T) {
+			pe := newKazPackEnv(t, backend)
+			before := pe.store.view(pe.records(t, pe.inode), 4096)
+			res := pe.pack(nil)
+			if backend == "memkv" {
+				require.Equal(t, "skip_engine", res.Reason)
+				require.Zero(t, pe.puts)
+				return
+			}
+			require.Empty(t, res.Reason)
+			require.Equal(t, 1, pe.puts)
+			require.ElementsMatch(t, pe.ids, res.Packed)
+			require.Equal(t, uint32(4000), res.Bytes)
+			after := pe.records(t, pe.inode)
+			require.Equal(t, before, pe.store.view(after, 4096))
+			n := 0
+			for _, s := range after {
+				if s.id == pe.newID {
+					n++
+					require.Equal(t, res.Bytes, s.size)
+				} else {
+					t.Fatalf("unexpected record %d", s.id)
+				}
+			}
+			require.Equal(t, 5, n) // 0-500 A, 500-1500 E, 1500-2000 B, C, D
+			require.NoError(t, pe.en.doCleanupSlices(Background(), nil))
+			deleted := pe.deletedIDs()
+			require.Zero(t, deleted[pe.newID])
+			want := map[uint64]int{}
+			for _, id := range res.Dead {
+				want[id]++
+			}
+			require.Equal(t, want, deleted)
+			require.Len(t, res.Dead, 5)
+		})
+	}
+}
+
+// TestKazPackChunkConcurrentWrite keeps a write added during the PUT on top.
+func TestKazPackChunkConcurrentWrite(t *testing.T) {
+	for _, backend := range []string{"sqlite", "redis"} {
+		t.Run(backend, func(t *testing.T) {
+			pe := newKazPackEnv(t, backend)
+			var extra uint64
+			res := pe.pack(func() { extra = pe.write(t, pe.inode, 100, 10) })
+			require.Empty(t, res.Reason)
+			after := pe.records(t, pe.inode)
+			require.Equal(t, extra, after[len(after)-1].id)
+			want := pe.store.view(append(kazPackOrig(pe), &slice{pos: 100, id: extra, size: 10, len: 10}), 4096)
+			require.Equal(t, want, pe.store.view(after, 4096))
+		})
+	}
+}
+
+// kazPackOrig returns the records the five writes made (before any pack).
+func kazPackOrig(pe *kazPackEnv) []*slice {
+	var ss []*slice
+	for i, pos := range []uint32{0, 1000, 2000, 3000, 500} {
+		ss = append(ss, &slice{pos: pos, id: pe.ids[i], size: 1000, len: 1000})
+	}
+	return ss
+}
+
+// TestKazPackChunkChanged fails the replace when a candidate's record is
+// removed during the PUT, and deletes the new slice.
+func TestKazPackChunkChanged(t *testing.T) {
+	for _, backend := range []string{"sqlite", "redis"} {
+		t.Run(backend, func(t *testing.T) {
+			pe := newKazPackEnv(t, backend)
+			res := pe.pack(func() {
+				ss := pe.records(t, pe.inode)
+				r := pe.en.(kazChunkReplacer)
+				require.Zero(t, r.doKazReplaceChunk(pe.inode, 0, kazMarshal(ss), kazMarshal(ss[:4]), ss[4:], nil, nil, 0, nil))
+			})
+			require.Equal(t, "fail_replace", res.Reason)
+			require.Empty(t, res.Packed)
+			require.Equal(t, 1, pe.deletedIDs()[pe.newID])
+		})
+	}
+}
+
+// TestKazPackChunkPutFailure deletes the new slice and reports fail_put.
+func TestKazPackChunkPutFailure(t *testing.T) {
+	pe := newKazPackEnv(t, "sqlite")
+	before := kazIDs(pe.records(t, pe.inode))
+	res := pe.KazPackChunk(pe.inode, 0, pe.ids, pe.data, func(id uint64, data []byte) error {
+		pe.newID = id
+		return errors.New("injected")
+	})
+	require.Equal(t, "fail_put", res.Reason)
+	require.Equal(t, before, kazIDs(pe.records(t, pe.inode)))
+	require.Equal(t, 1, pe.deletedIDs()[pe.newID])
+}
+
+// TestKazPackChunkTrash skips when trash is on, without calling write.
+func TestKazPackChunkTrash(t *testing.T) {
+	pe := newKazPackEnv(t, "sqlite")
+	pe.kazTestUpdateFormat(func(f *Format) { f.TrashDays = 1 })
+	res := pe.pack(nil)
+	require.Equal(t, "skip_trash", res.Reason)
+	require.Zero(t, pe.puts)
+}
+
+// TestKazPackChunkBusy skips (without waiting) when the chunk is compacting.
+func TestKazPackChunkBusy(t *testing.T) {
+	pe := newKazPackEnv(t, "sqlite")
+	k := uint64(pe.inode)
+	pe.Lock()
+	pe.compacting[k] = true
+	pe.Unlock()
+	res := pe.pack(nil)
+	require.Equal(t, "skip_busy", res.Reason)
+	require.Zero(t, pe.puts)
+	pe.Lock()
+	require.True(t, pe.compacting[k]) // not released by the skipped call
+	delete(pe.compacting, k)
+	pe.Unlock()
+	require.Empty(t, pe.pack(nil).Reason)
+}
+
+// TestKazPackChunkNotInChunk reports skip_not_in_chunk when no id is present.
+func TestKazPackChunkNotInChunk(t *testing.T) {
+	pe := newKazPackEnv(t, "sqlite")
+	res := pe.KazPackChunk(pe.inode, 0, []uint64{pe.ids[0], 999999}, pe.data, pe.put(nil))
+	require.Equal(t, "skip_not_in_chunk", res.Reason)
+	require.Zero(t, pe.puts)
+}
+
+// TestKazPackChunkUpstreamRead reads the packed chunk the upstream way (Read
+// gives Slices) and gets the bytes that were written.
+func TestKazPackChunkUpstreamRead(t *testing.T) {
+	for _, backend := range []string{"sqlite", "redis"} {
+		t.Run(backend, func(t *testing.T) {
+			pe := newKazPackEnv(t, backend)
+			before := pe.store.view(pe.records(t, pe.inode), 4096)
+			require.Empty(t, pe.pack(nil).Reason)
+			var sl []Slice
+			require.Zero(t, pe.Read(Background(), pe.inode, 0, &sl))
+			var got []byte
+			pe.store.mu.Lock()
+			for _, s := range sl {
+				for i := uint32(0); i < s.Len; i++ {
+					got = append(got, pe.store.byteAtLocked(s.Id, s.Off+i))
+				}
+			}
+			pe.store.mu.Unlock()
+			require.Equal(t, before[:len(got)], got)
+			require.Equal(t, 4000, len(got)) // the file ends at 4000
+		})
+	}
 }
