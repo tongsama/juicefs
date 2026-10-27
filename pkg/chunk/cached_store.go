@@ -50,7 +50,8 @@ type pendingItem struct {
 	fpath     string    // full path of local file corresponding to the key
 	ts        time.Time // timestamp when this item is added
 	uploading atomic.Bool
-	kaz       kazPendingInfo // guarded by cachedStore.pendingMutex
+	// kaz: staging-pack and skip-delete state of the item.
+	kaz kazPendingInfo // guarded by cachedStore.pendingMutex
 }
 
 // slice for read and remove

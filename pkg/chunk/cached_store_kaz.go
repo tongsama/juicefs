@@ -387,7 +387,7 @@ func (store *cachedStore) kazInitMetrics() {
 	})
 	store.kazPackTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "kaz_staging_pack_total",
-		Help: "Staging-pack events (packed, packed_slices, packed_bytes, skip_*, fail_*).",
+		Help: "Staging-pack events (packed, packed_slices, packed_bytes, skip_* including skip_no_delete, fail_*).",
 	}, []string{"event"})
 }
 

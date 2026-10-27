@@ -164,7 +164,7 @@ func (m *baseMeta) runKazBlockCompaction(r kazChunkReplacer, inode Ino, indx uin
 			time.Sleep(time.Millisecond * 10)
 			m.Lock()
 		}
-	} else if len(m.compacting) > 10 || m.compacting[k] {
+	} else if len(m.compacting)-m.kazPacking > 10 || m.compacting[k] {
 		m.Unlock()
 		return false
 	}

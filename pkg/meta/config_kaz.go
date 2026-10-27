@@ -65,6 +65,7 @@ type kazMetaState struct {
 	priorityCompactor  atomic.Pointer[compactionScheduler]
 	kazCompact         atomic.Pointer[compactionPolicy]
 	kazDeltaBases      kazDeltaBaseTable // kaz: per-chunk base counts of delta compaction
+	kazPacking         int               // staging packs in flight; they hold m.compacting entries too (guarded by baseMeta's mutex)
 	compactionGCEvents *prometheus.CounterVec
 	kazCompactMetrics  *kazCompactionMetrics
 }

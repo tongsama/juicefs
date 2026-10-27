@@ -51,6 +51,11 @@ type kazPendingInfo struct {
 // kazAddLocalStaging registers a staging file written by this mount and marks the
 // item local only when no pending item existed before the call.
 func (store *cachedStore) kazAddLocalStaging(key, path string, added time.Time) {
+	if !store.conf.KazSkipUnuploadedDelete {
+		// the local mark is only read by kazMarkUnuploaded (skip-delete)
+		store.addDelayedStaging(key, path, added, false)
+		return
+	}
 	store.pendingMutex.Lock()
 	existed := store.pendingKeys[key] != nil
 	store.pendingMutex.Unlock()
@@ -110,6 +115,9 @@ func (store *cachedStore) kazForgetUnuploaded(key string) {
 // kazTakeUnuploaded removes key from the never-PUT set and reports whether it was
 // there, i.e. whether the object DELETE can be skipped.
 func (store *cachedStore) kazTakeUnuploaded(key string) bool {
+	if !store.conf.KazSkipUnuploadedDelete {
+		return false
+	}
 	store.pendingMutex.Lock()
 	_, ok := store.kazUnuploaded[key]
 	delete(store.kazUnuploaded, key)
@@ -242,8 +250,11 @@ func (store *cachedStore) KazPutStaged(id uint64, data []byte, tier uint8) error
 	block := NewOffPage(len(data))
 	copy(block.Data, data)
 	ctx := context.WithValue(context.Background(), object.TierKey{}, tier)
-	// A non-nil wSlice selects the synchronous path: MaxRetries+1 tries and read-cache population.
-	return store.upload(ctx, key, block, &wSlice{rSlice: rSlice{id: id, length: len(data), store: store}})
+	// Populate the read cache the way upload does for a small synchronous block (the
+	// cache takes its own reference), then PUT with the 3-try budget of uploadStagingFile:
+	// a stalled object store must not hold the uploader, its claims and the chunk for minutes.
+	store.bcache.cache(key, block, false, false)
+	return store.upload(ctx, key, block, nil)
 }
 
 // KazClaimStaged claims the staged blocks of refs for packing. Items that are

@@ -48,6 +48,7 @@ func TestKazPendingPutMark(t *testing.T) {
 // TestKazPendingLocalMark checks that only an item newly created by the writer is marked local.
 func TestKazPendingLocalMark(t *testing.T) {
 	store, _, _ := newRetireFixture(t, time.Hour)
+	store.conf.KazSkipUnuploadedDelete = true
 	path1, err := store.bcache.stage("k1", []byte("a"), 0)
 	require.NoError(t, err)
 	store.kazAddLocalStaging("k1", path1, time.Now())
@@ -404,4 +405,30 @@ func TestKazPutStagedNoDeadlock(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 5, n)
 	require.Equal(t, []byte("hello"), page.Data)
+}
+
+// TestKazLocalMarkOffWithoutSkipDelete checks that the off-path takes no local mark and skips no DELETE.
+func TestKazLocalMarkOffWithoutSkipDelete(t *testing.T) {
+	store, _, _ := newRetireFixture(t, time.Hour)
+	path, err := store.bcache.stage("k1", []byte("a"), 0)
+	require.NoError(t, err)
+	store.kazAddLocalStaging("k1", path, time.Now())
+	store.pendingMutex.Lock()
+	require.NotNil(t, store.pendingKeys["k1"])
+	require.False(t, store.pendingKeys["k1"].kaz.local)
+	store.kazUnuploaded = map[string]struct{}{"k1": {}}
+	store.pendingMutex.Unlock()
+	require.False(t, store.kazTakeUnuploaded("k1"))
+}
+
+// TestKazPutStagedBoundedTries checks that a failing object store sees at most 3 PUTs.
+func TestKazPutStagedBoundedTries(t *testing.T) {
+	store, disk, objects := newRetireFixture(t, time.Hour)
+	disk.pending = make(chan pendingFile, 10)
+	store.conf.MaxRetries = 10
+	objects.putFail.Store(true)
+	start := time.Now()
+	require.Error(t, store.KazPutStaged(9, []byte("hello"), 0))
+	require.Equal(t, int64(3), objects.putCalls.Load())
+	require.Less(t, time.Since(start), 30*time.Second)
 }

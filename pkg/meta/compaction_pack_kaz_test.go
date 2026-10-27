@@ -479,3 +479,40 @@ func TestKazPackChunkUpstreamRead(t *testing.T) {
 		})
 	}
 }
+
+// TestKazPackChunkNoDelete skips without writing when deleteSlice is a no-op (--max-deletes 0).
+func TestKazPackChunkNoDelete(t *testing.T) {
+	pe := newKazPackEnv(t, "sqlite")
+	pe.conf.MaxDeletes = 0
+	res := pe.pack(nil)
+	require.Equal(t, "skip_no_delete", res.Reason)
+	require.Zero(t, pe.puts)
+}
+
+// TestKazPackingDoesNotStarveCompaction holds 11 pack entries and checks that a
+// background delta compaction of another chunk still runs, and that a pack
+// releases its counter.
+func TestKazPackingDoesNotStarveCompaction(t *testing.T) {
+	e := newKazDeltaEnv(t, "sqlite")
+	inode := e.file(t)
+	e.write(t, inode, 0, 16*kazEB)
+	kazDeltaSmallWrites(t, e, inode, []uint32{2, 5, 11}, kazDeltaTrigger, 0)
+	e.Lock()
+	for i := 0; i < 11; i++ {
+		e.compacting[uint64(1000000+i)<<40] = true
+	}
+	e.kazPacking = 11
+	e.Unlock()
+	kazRun(t, e, inode)
+	require.Equal(t, 1, e.store.callCount())
+	e.Lock()
+	require.Equal(t, 11, len(e.compacting))
+	e.Unlock()
+
+	pe := newKazPackEnv(t, "sqlite")
+	require.Empty(t, pe.pack(nil).Reason)
+	pe.Lock()
+	require.Zero(t, pe.kazPacking)
+	require.Empty(t, pe.compacting)
+	pe.Unlock()
+}

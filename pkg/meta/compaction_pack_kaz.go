@@ -108,7 +108,7 @@ func planKazPack(ss []*slice, cands []uint64, maxBytes uint32) *kazPackPlan {
 // removed from the chunk (including fully hidden ones), Dead those of them whose
 // last reference was dropped, Bytes the size of the new slice, and Reason why
 // nothing was packed (empty on success): skip_busy, skip_trash, skip_engine,
-// skip_not_in_chunk, fail_put or fail_replace.
+// skip_not_in_chunk, skip_no_delete, fail_put or fail_replace.
 type KazPackResult struct {
 	Packed []uint64
 	Dead   []uint64
@@ -136,6 +136,10 @@ func (m *baseMeta) KazPackChunk(inode Ino, indx uint32, cands []uint64, data map
 	if m.toTrash(0) {
 		return KazPackResult{Reason: "skip_trash"}
 	}
+	if m.conf.MaxDeletes == 0 {
+		// deleteSlice is a no-op without delete workers, so Retire never runs and packed items would stay
+		return KazPackResult{Reason: "skip_no_delete"}
+	}
 	bs := m.kazBlockSize()
 	limit, fits := kazBlockCompactLimit(bs)
 	if bs == 0 || !fits {
@@ -152,10 +156,12 @@ func (m *baseMeta) KazPackChunk(inode Ino, indx uint32, cands []uint64, data map
 		return KazPackResult{Reason: "skip_busy"}
 	}
 	m.compacting[k] = true
+	m.kazPacking++ // packs do not count against the background compaction limit
 	m.Unlock()
 	defer func() {
 		m.Lock()
 		delete(m.compacting, k)
+		m.kazPacking--
 		m.Unlock()
 	}()
 
@@ -211,6 +217,8 @@ func (m *baseMeta) KazPackChunk(inode Ino, indx uint32, cands []uint64, data map
 		logger.Infof("staging pack inode=%d chunk=%d slice=%d: replace failed: %s", inode, indx, id, eno)
 		if eno == syscall.EINVAL {
 			m.deleteSlice(id, size) // wasted: the chunk changed; EINVAL already released the references
+		} else {
+			logger.Warnf("staging pack inode=%d chunk=%d: replace failed, the new slice %d may be orphaned and will be cleaned by gc: %s", inode, indx, id, eno)
 		}
 		return KazPackResult{Reason: "fail_replace"}
 	}
