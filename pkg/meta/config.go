@@ -89,8 +89,8 @@ func DefaultConf() *Config {
 	return &Config{Retries: 10, MaxDeletes: 2, Heartbeat: 12 * time.Second, AtimeMode: NoAtime, DirStatFlushPeriod: 1 * time.Second}
 }
 
-// SelfCheck validates client settings and warns about potentially disruptive modes.
 func (c *Config) SelfCheck() {
+	// kaz: validate the kaz settings and warn about modes that may disrupt the workload.
 	if err := c.ValidateCompactionScheduler(); err != nil {
 		logger.Warnf("%s; falling back to legacy compaction scheduler", err)
 		c.CompactionScheduler = "legacy"

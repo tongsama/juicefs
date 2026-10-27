@@ -121,7 +121,6 @@ type SecurityConfig struct {
 	EnableSELinux bool
 }
 
-// Config controls VFS caching, write scheduling and flush completion policy.
 type Config struct {
 	Meta *meta.Config
 	// Format is the startup snapshot; Meta.GetFormat returns the current one
@@ -608,7 +607,6 @@ func (v *VFS) marshalConf() []byte {
 	return data
 }
 
-// Truncate flushes pending writes before changing file length.
 func (v *VFS) Truncate(ctx Context, ino Ino, size int64, fh uint64, attr *Attr) (err syscall.Errno) {
 	// defer func() { logit(ctx, "truncate (%d,%d): %s", ino, size, strerr(err)) }()
 	if IsSpecialNode(ino) {
@@ -632,6 +630,7 @@ func (v *VFS) Truncate(ctx Context, ino Ino, size int64, fh uint64, attr *Attr) 
 		}
 		defer func(h *handle) { h.Wunlock() }(h)
 	}
+	// kaz: tag the flush origin for writer flush diagnostics.
 	_ = v.writer.Flush(WithWriterFlushOrigin(ctx, "vfs.Truncate"), ino)
 	if fh == 0 {
 		err = v.Meta.Truncate(ctx, ino, 0, uint64(size), attr, false)
@@ -660,7 +659,6 @@ func (v *VFS) ReleaseHandler(ino Ino, fh uint64) {
 	v.releaseFileHandle(ino, fh)
 }
 
-// Release flushes pending writes before releasing the file handle.
 func (v *VFS) Release(ctx Context, ino Ino, fh uint64) {
 	var err syscall.Errno
 	defer func() { logit(ctx, "release", err, "(%d,%d)", ino, fh) }()
@@ -688,6 +686,7 @@ func (v *VFS) Release(ctx Context, ino Ino, fh uint64) {
 			powner := f.ofdOwner
 			f.Unlock()
 			if f.writer != nil {
+				// kaz: tag the flush origin for writer flush diagnostics.
 				_ = f.writer.Flush(WithWriterFlushOrigin(ctx, "vfs.Release"))
 				v.invalidateAttr(ino)
 			}
@@ -707,7 +706,6 @@ func hasReadPerm(flag uint32) bool {
 	return (flag & O_ACCMODE) != syscall.O_WRONLY
 }
 
-// Read flushes pending writes before fetching data and preserves preflush failures.
 func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n int, err syscall.Errno) {
 	size := uint32(len(buf))
 	if IsSpecialNode(ino) {
@@ -884,7 +882,6 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 	return
 }
 
-// Fallocate flushes pending writes before changing allocated file ranges.
 func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh uint64) (err syscall.Errno) {
 	defer func() { logit(ctx, "fallocate", err, "(%d,%d,%d,%d)", ino, mode, off, size) }()
 	if off < 0 || size <= 0 {
@@ -971,7 +968,6 @@ func (v *VFS) prelockFlush(ctx meta.Context, ino Ino, off, size uint64) syscall.
 	return 0
 }
 
-// CopyFileRange flushes both files before copying committed slices.
 func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut Ino, fhOut, offOut, size uint64, flags uint32) (copied uint64, err syscall.Errno) {
 	defer func() {
 		logit(ctx, "copy_file_range", err, "(%d,%d,%d,%d,%d,%d)", nodeIn, offIn, nodeOut, offOut, size, flags)
@@ -1030,6 +1026,7 @@ func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut
 		defer hi.removeOp(ctx)
 	}
 
+	// kaz: tag the flush origin for writer flush diagnostics.
 	err = v.writer.Flush(WithWriterFlushOrigin(ctx, "vfs.CopyFileRange.source"), nodeIn)
 	if err != 0 {
 		return
@@ -1048,7 +1045,6 @@ func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut
 	return
 }
 
-// Flush waits for pending writer data and metadata.
 func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err syscall.Errno) {
 	if ino == controlInode && runtime.GOOS == "darwin" {
 		fh = v.getControlHandle(ctx.Pid())
@@ -1072,6 +1068,7 @@ func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err sysc
 			h.cancelOp(ctx.Pid())
 		}
 
+		// kaz: tag the flush origin for writer flush diagnostics.
 		err = h.writer.Flush(WithWriterFlushOrigin(ctx, "vfs.Flush"))
 		if err == syscall.ENOENT || err == syscall.EPERM || err == syscall.EINVAL {
 			err = syscall.EBADF
@@ -1094,7 +1091,6 @@ func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err sysc
 	return
 }
 
-// Fsync waits for pending writer data and metadata.
 func (v *VFS) Fsync(ctx Context, ino Ino, datasync int, fh uint64) (err syscall.Errno) {
 	defer func() { logit(ctx, "fsync", err, "(%d,%d)", ino, datasync) }()
 	if IsSpecialNode(ino) {
@@ -1112,6 +1108,7 @@ func (v *VFS) Fsync(ctx Context, ino Ino, datasync int, fh uint64) (err syscall.
 		defer h.Wunlock()
 		defer h.removeOp(ctx)
 
+		// kaz: tag the flush origin for writer flush diagnostics.
 		err = h.writer.Flush(WithWriterFlushOrigin(ctx, "vfs.Fsync"))
 		if err == syscall.ENOENT || err == syscall.EPERM || err == syscall.EINVAL {
 			err = syscall.EBADF

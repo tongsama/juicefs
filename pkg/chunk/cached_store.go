@@ -189,11 +189,12 @@ func (s *rSlice) delete(indx int) error {
 	return s.store.delete(key)
 }
 
-// Remove retires local data first and refuses physical deletion while a staging PUT is active.
 func (s *rSlice) Remove() error {
+	// kaz: retire local data first; physical deletion is refused while a staging PUT is active.
 	if err := s.store.Retire(s.id, s.length); err != nil {
 		return err
 	}
+
 	var err error
 	keys := s.keys()
 	for i := range keys {
@@ -304,7 +305,6 @@ func (s *wSlice) WriteAt(p []byte, off int64) (n int, err error) {
 	return n, nil
 }
 
-// put sends a compressed block and reports its payload length separately from the raw key suffix.
 func (store *cachedStore) put(ctx context.Context, key string, p *Page) error {
 	if store.upLimit != nil {
 		store.upLimit.Wait(int64(len(p.Data)))
@@ -319,6 +319,7 @@ func (store *cachedStore) put(ctx context.Context, key string, p *Page) error {
 		st := time.Now()
 		err := store.storage.Put(ctx, key, bytes.NewReader(p.Data), object.WithRequestID(&reqID), object.WithStorageClass(&sc))
 		used := time.Since(st)
+		// kaz: log the payload length separately from the raw length in the key.
 		param := ""
 		if used > SlowRequest || logger.IsLevelEnabled(logrus.DebugLevel) {
 			param = fmt.Sprintf("payload_bytes=%d ", len(p.Data))
@@ -399,7 +400,6 @@ func (store *cachedStore) upload(ctx context.Context, key string, block *Page, s
 	return err
 }
 
-// upload stages writeback blocks before acknowledgment and tracks deferred cloud I/O through cleanup.
 func (s *wSlice) upload(indx int) {
 	blen := s.blockSize(indx)
 	key := s.key(indx)
@@ -426,6 +426,7 @@ func (s *wSlice) upload(indx int) {
 		ctx := context.WithValue(context.Background(), object.TierKey{}, s.tierID)
 		if s.writeback && blen < s.store.conf.WritebackThresholdSize {
 			stagingPath := "unknown"
+			// kaz: stage writeback blocks before acknowledging them and track the deferred cloud I/O until cleanup.
 			var stageMu sync.Mutex
 			stageFailed := false
 			stageCompleted := false
@@ -825,20 +826,12 @@ func (store *cachedStore) forgetHeaderTimeout(key string) {
 // errGetHeaderTimeout reports a full-block GET abandoned by GetHeaderTimeout.
 var errGetHeaderTimeout = errors.New("no response headers within --kaz-get-header-timeout")
 
-// getResult holds what one GET callback produced. The callback fills its own
-// copy and the caller adopts it only when utils.WithTimeout reports success, so
-// a callback abandoned by a timeout or cancel can neither race with the caller
-// nor turn a failed read into a success (upstream #7500).
 type getResult struct {
 	n     int
 	reqID string
 	sc    string
 }
 
-// loadRange reads len(page.Data) bytes of key at off with a range GET.
-// It returns errTryFullRead only for failures after which a full read is safe;
-// a timeout is returned as is, because the abandoned GET may still be writing
-// into page (upstream #7509/#7520).
 func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page, off int) (int, error) {
 	p := page.Data
 	fullPage, err := store.group.TryPiggyback(key)
@@ -881,6 +874,7 @@ func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page,
 	store.objectDataBytes.WithLabelValues("GET", res.sc).Add(float64(res.n))
 	store.objectReqsHistogram.WithLabelValues("GET", res.sc).Observe(used.Seconds())
 	if err == nil {
+		// kaz: a compaction read does not prefetch the block.
 		if !store.kazCompactionRead(ctx) {
 			store.fetcher.fetch(key)
 		}
@@ -1338,13 +1332,13 @@ func parseObjOrigSize(key string) int {
 	return l
 }
 
-// uploadStagingFile checks pending intent and keeps actual PUT/cleanup visible to durable GC.
 func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 	store.currentUpload <- struct{}{}
 	defer func() {
 		<-store.currentUpload
 	}()
 
+	// kaz: check the pending intent and keep the PUT and its cleanup visible to durable GC.
 	item := store.beginStagingUpload(key)
 	if item == nil {
 		logger.Debugf("Key %s is not needed, drop it", key)
@@ -1487,9 +1481,9 @@ func (store *cachedStore) finishStagingUpload(key string, item *pendingItem, ble
 	}
 }
 
-// addDelayedStaging drops known absent files and retains intent when file presence is uncertain.
 func (store *cachedStore) addDelayedStaging(key, stagingPath string, added time.Time, force bool) bool {
 	store.pendingMutex.Lock()
+	// kaz: drop a staging file known to be absent and keep the intent when its presence is uncertain.
 	_, statErr := os.Stat(stagingPath)
 	if os.IsNotExist(statErr) {
 		store.pendingMutex.Unlock()
@@ -1613,7 +1607,6 @@ func (store *cachedStore) Retire(id uint64, length int) error {
 	return err
 }
 
-// Remove retires local staging and then deletes cloud blocks after active uploads finish.
 func (store *cachedStore) Remove(id uint64, length int) error {
 	r := sliceForRead(id, length, store)
 	return r.Remove()

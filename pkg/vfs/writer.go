@@ -133,13 +133,13 @@ func (s *sliceWriter) freezeWithTrace(reason string, trace writerFlushTrace) {
 	go s.flushData()
 }
 
-// flushData finishes a frozen slice's blocks before allowing its metadata commit.
 func (s *sliceWriter) flushData() {
 	defer s.markDone()
 	if s.slen == 0 {
 		return
 	}
 	s.prepareID(meta.Background(), true)
+	// kaz: trace when a frozen slice starts finishing its blocks.
 	s.logFinish()
 	if s.err != 0 {
 		logger.Infof("flush inode: %v chunk: %d err: %s", s.chunk.file.inode, s.id, s.err)
@@ -155,7 +155,7 @@ func (s *sliceWriter) flushData() {
 	}
 }
 
-// write grows only writable data and uploads complete blocks under the file lock.
+// protected by s.chunk.file
 func (s *sliceWriter) write(ctx meta.Context, off uint32, data []uint8) syscall.Errno {
 	f := s.chunk.file
 	_, err := s.writer.WriteAt(data, int64(off))
@@ -168,6 +168,7 @@ func (s *sliceWriter) write(ctx meta.Context, off uint32, data []uint8) syscall.
 	}
 	s.lastMod = time.Now()
 	if s.slen == meta.ChunkSize {
+		// kaz: freeze a full slice so that no later write reuses it.
 		s.freeze("full_slice")
 	} else if int(s.slen) >= f.w.blockSize {
 		if s.id > 0 {
@@ -187,7 +188,7 @@ type chunkWriter struct {
 	slices []*sliceWriter
 }
 
-// findWritableSlice reuses the unflushed tail and freezes old candidates under the file lock.
+// protected by file
 func (c *chunkWriter) findWritableSlice(pos uint32, size uint32) *sliceWriter {
 	blockSize := uint32(c.file.w.blockSize)
 	for i := range c.slices {
@@ -197,6 +198,7 @@ func (c *chunkWriter) findWritableSlice(pos uint32, size uint32) *sliceWriter {
 			if pos >= s.off+flushoff && pos <= s.off+s.slen {
 				return s
 			} else if i >= c.file.w.conf.WriterReuseWindow {
+				// kaz: only the unflushed tail is reused; older candidates are frozen.
 				s.freeze("writable_window")
 			}
 		}
@@ -209,7 +211,6 @@ func (c *chunkWriter) findWritableSlice(pos uint32, size uint32) *sliceWriter {
 	return nil
 }
 
-// commitThread commits slices in creation order and reports slow metadata calls.
 func (c *chunkWriter) commitThread() {
 	f := c.file
 	defer f.w.free(f)
@@ -226,6 +227,7 @@ func (c *chunkWriter) commitThread() {
 		for s.dep != nil && !s.dep.committed {
 			f.commitcond.WaitWithTimeout(time.Millisecond * 100)
 		}
+		// kaz: commit consecutive done slices together, in creation order.
 		batch := c.commitBatch()
 		err := s.err
 		f.Unlock()
@@ -524,9 +526,9 @@ func (f *fileWriter) raiseMtimeFloor(t time.Time) {
 	}
 }
 
-// updateMtime applies an explicit mtime (utimes) to pending slices and drops the
-// floor, so an older explicit time is not overridden by earlier commits.
 func (f *fileWriter) updateMtime(t time.Time) {
+	// kaz: an explicit mtime (utimes) drops the mtime floor, so an older explicit
+	// time is not overridden by earlier commits.
 	f.commitMu.Lock()
 	defer f.commitMu.Unlock()
 	f.Lock()
@@ -756,8 +758,8 @@ func (f *fileWriter) Flush(ctx meta.Context) syscall.Errno {
 	return f.flush(ctx, false)
 }
 
-// Close waits for data and metadata and then drops this writer reference.
 func (f *fileWriter) Close(ctx meta.Context) syscall.Errno {
+	// kaz: tag the flush origin for writer flush diagnostics.
 	if writerFlushOrigin(ctx) == "unknown" {
 		ctx = WithWriterFlushOrigin(ctx, "internal.close")
 	}
@@ -816,8 +818,8 @@ func (w *dataWriter) flushTimeout() time.Duration {
 	return w.conf.WriterFlushTimeout
 }
 
-// NewDataWriter validates scheduling settings before starting the background slice flusher.
 func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader DataReader) DataWriter {
+	// kaz: validate the writer scheduling settings before starting the background flusher.
 	if conf.WriterFlushTimeout < 0 && conf.WriterFlushTimeout != AutoWriterFlushTimeout {
 		logger.Warnf("invalid writer flush timeout %s: using no deadline; use AutoWriterFlushTimeout for the legacy deadline", conf.WriterFlushTimeout)
 		conf.WriterFlushTimeout = 0
@@ -859,7 +861,6 @@ func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader Dat
 	return w
 }
 
-// flushAll closes aged, idle or excess slices without changing explicit flush barriers.
 func (w *dataWriter) flushAll() {
 	for {
 		w.Lock()
@@ -877,6 +878,7 @@ func (w *dataWriter) flushAll() {
 					if !s.freezed && (now.Sub(s.started) > w.conf.SliceFlushWait ||
 						now.Sub(s.lastMod) > w.conf.SliceFlushIdle && now.Sub(s.started) > w.conf.SliceFlushIdle ||
 						tooMany && i%2 == lastBit && j <= hs) {
+						// kaz: record why a slice was closed (age, idle or pressure).
 						reason := "slice_pressure"
 						if now.Sub(s.started) > w.conf.SliceFlushWait {
 							reason = "age"
