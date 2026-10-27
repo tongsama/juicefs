@@ -23,7 +23,7 @@ import (
 )
 
 // doKazReplaceChunk follows kvMeta.doCompactChunk with a list of new records.
-func (m *kvMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []kazCreated, delayed []byte, delayedKey uint64) syscall.Errno {
+func (m *kvMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []kazCreated, delayed []byte, delayedKey uint64, onDead func(id uint64, size uint32)) syscall.Errno {
 	st := errno(m.txn(Background(), func(tx *kvTxn) error {
 		buf2 := tx.get(m.chunkKey(inode, indx))
 		if len(buf2) < len(origin) || !bytes.Equal(origin, buf2[:len(origin)]) {
@@ -84,6 +84,10 @@ func (m *kvMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []by
 				}, 0) == nil && refs < 0
 			}) {
 				m.enqueueCompactionDelete(s.id, s.size)
+				// kaz: tell the caller which slices lost their last reference
+				if onDead != nil {
+					onDead(s.id, s.size)
+				}
 			}
 		}
 	}

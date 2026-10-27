@@ -26,7 +26,7 @@ import (
 )
 
 // doKazReplaceChunk follows dbMeta.doCompactChunk with a list of new records.
-func (m *dbMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []kazCreated, delayed []byte, delayedKey uint64) syscall.Errno {
+func (m *dbMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []kazCreated, delayed []byte, delayedKey uint64, onDead func(id uint64, size uint32)) syscall.Errno {
 	st := errno(m.txn(func(s *xorm.Session) error {
 		var c2 = chunk{Inode: inode, Indx: indx}
 		_, err := s.ForUpdate().MustCols("indx").Get(&c2)
@@ -102,6 +102,10 @@ func (m *dbMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []by
 			return err == nil && ok && ref.Refs <= 0
 		}) {
 			m.enqueueCompactionDelete(s.id, s.size)
+			// kaz: tell the caller which slices lost their last reference
+			if onDead != nil {
+				onDead(s.id, s.size)
+			}
 		}
 	}
 	return st
