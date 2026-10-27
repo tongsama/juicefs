@@ -385,6 +385,10 @@ func (store *cachedStore) kazInitMetrics() {
 		Name: "kaz_delete_skipped_total",
 		Help: "Object DELETEs skipped because the staged block was never PUT.",
 	})
+	store.kazPackTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "kaz_staging_pack_total",
+		Help: "[kaz] Staging-pack events (packed, packed_slices, packed_bytes, skip_*, fail_*).",
+	}, []string{"event"})
 }
 
 // kazRegMetrics registers the kaz counters. It is called from regMetrics at the
@@ -394,6 +398,7 @@ func (store *cachedStore) kazRegMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(store.canceledGetDropped)
 	reg.MustRegister(store.getHeaderTimeouts)
 	reg.MustRegister(store.kazDeleteSkipped)
+	reg.MustRegister(store.kazPackTotal)
 }
 
 // kazPutParam returns the param of the PUT request log: the payload length, which

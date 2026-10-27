@@ -16,7 +16,11 @@
 
 package chunk
 
-import "time"
+import (
+	"strconv"
+	"strings"
+	"time"
+)
 
 // This file holds the kaz staging-pack state of pending items.
 
@@ -110,4 +114,177 @@ func (store *cachedStore) kazTakeUnuploaded(key string) bool {
 		store.kazDeleteSkipped.Inc()
 	}
 	return ok
+}
+
+// KazStagedRef names a single-block slice offered to the staging packer.
+type KazStagedRef struct {
+	ID     uint64
+	Length int
+}
+
+// KazStagedData is the staged content of a claimed slice, with its storage tier.
+type KazStagedData struct {
+	ID   uint64
+	Data []byte
+	Tier uint8
+}
+
+// KazSetStagingPacker registers the packer called from uploadStagingFile for
+// small single-block slices. It returns true when it took over the slice.
+func (store *cachedStore) KazSetStagingPacker(p func(id uint64, length int) bool) {
+	if p == nil {
+		store.kazPacker.Store(nil)
+		return
+	}
+	store.kazPacker.Store(&p)
+}
+
+// KazStagingPackEvent adds n to kaz_staging_pack_total{event}.
+func (store *cachedStore) KazStagingPackEvent(event string, n int) {
+	if store.kazPackTotal != nil && n > 0 {
+		store.kazPackTotal.WithLabelValues(event).Add(float64(n))
+	}
+}
+
+// kazParseSingleBlockKey extracts id and length from a key "<...>/<id>_0_<length>"
+// and reports false for any other block number or format.
+func kazParseSingleBlockKey(key string) (id uint64, length int, ok bool) {
+	name := key[strings.LastIndexByte(key, '/')+1:]
+	parts := strings.Split(name, "_")
+	if len(parts) != 3 || parts[1] != "0" {
+		return 0, 0, false
+	}
+	id, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	l, err := strconv.Atoi(parts[2])
+	if err != nil || l <= 0 {
+		return 0, 0, false
+	}
+	return id, l, true
+}
+
+// kazTryPack offers a small single-block key to the registered packer and
+// reports whether the packer took over (so no single-object PUT is needed).
+func (store *cachedStore) kazTryPack(key string) bool {
+	p := store.kazPacker.Load()
+	if p == nil {
+		return false
+	}
+	id, length, ok := kazParseSingleBlockKey(key)
+	if !ok || length >= store.conf.BlockSize {
+		return false
+	}
+	return (*p)(id, length)
+}
+
+// KazClaimStaged claims the staged blocks of refs for packing. Items that are
+// waiting, never PUT and not busy become claimed (even when queued for upload or
+// still inside the upload delay) and their data is read from the staging file.
+// Ids without a pending item are returned in absent; other ids are in neither.
+func (store *cachedStore) KazClaimStaged(refs []KazStagedRef) (claimed []KazStagedData, absent []uint64) {
+	type claim struct {
+		ref  KazStagedRef
+		key  string
+		item *pendingItem
+		path string
+	}
+	var taken []claim
+	store.pendingMutex.Lock()
+	for _, ref := range refs {
+		if ref.Length <= 0 || ref.Length >= store.conf.BlockSize {
+			continue
+		}
+		key := sliceForRead(ref.ID, ref.Length, store).key(0)
+		item := store.pendingKeys[key]
+		if item == nil {
+			absent = append(absent, ref.ID)
+			continue
+		}
+		if item.kaz.state != kazStagingWait || item.kaz.putStarted || store.activeStaging[key] > 0 {
+			continue
+		}
+		item.kaz.state = kazStagingClaimed
+		if store.kazClaimedKeys == nil {
+			store.kazClaimedKeys = make(map[uint64]string)
+		}
+		store.kazClaimedKeys[ref.ID] = key
+		taken = append(taken, claim{ref, key, item, item.fpath})
+	}
+	store.pendingMutex.Unlock()
+
+	var failed []claim
+	for _, c := range taken {
+		data, tier, err := store.kazReadStaged(c.path, c.ref.Length)
+		if err != nil {
+			logger.Warnf("claim staged %s: %s", c.key, err)
+			failed = append(failed, c)
+			continue
+		}
+		claimed = append(claimed, KazStagedData{ID: c.ref.ID, Data: data, Tier: tier})
+	}
+	if len(failed) > 0 {
+		store.pendingMutex.Lock()
+		for _, c := range failed {
+			if store.pendingKeys[c.key] == c.item && c.item.kaz.state == kazStagingClaimed {
+				c.item.kaz.state = kazStagingWait
+			}
+			delete(store.kazClaimedKeys, c.ref.ID)
+		}
+		store.pendingMutex.Unlock()
+	}
+	return claimed, absent
+}
+
+// kazReadStaged reads a staging file the same way uploadStagingFile does and
+// returns the block data with the tier stored in its footer.
+func (store *cachedStore) kazReadStaged(path string, blen int) ([]byte, uint8, error) {
+	f, err := openCacheFile(path, blen, store.conf.CacheChecksum)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer f.Close()
+	data := make([]byte, blen)
+	if _, err = f.ReadAt(data, 0); err != nil {
+		return nil, 0, err
+	}
+	tier := uint8(0)
+	footer := &stageFooter{}
+	if ferr := footer.unmarshal(f); ferr != nil {
+		logger.Warnf("Parse stage footer of %s failed, use default tier: %s", path, ferr)
+	} else {
+		tier = footer.Tier
+	}
+	return data, tier, nil
+}
+
+// KazReleaseStaged ends a claim. Packed ids become packed (never PUT singly);
+// the others return to wait and are queued for upload unless already queued.
+func (store *cachedStore) KazReleaseStaged(ids []uint64, packed map[uint64]bool) {
+	store.pendingMutex.Lock()
+	defer store.pendingMutex.Unlock()
+	for _, id := range ids {
+		key, ok := store.kazClaimedKeys[id]
+		if !ok {
+			continue
+		}
+		delete(store.kazClaimedKeys, id)
+		item := store.pendingKeys[key]
+		if item == nil || item.kaz.state != kazStagingClaimed {
+			continue
+		}
+		if packed[id] {
+			item.kaz.state = kazStagingPacked
+			continue
+		}
+		item.kaz.state = kazStagingWait
+		if item.uploading.CompareAndSwap(false, true) {
+			select {
+			case store.pendingCh <- item:
+			default:
+				item.uploading.Store(false)
+			}
+		}
+	}
 }

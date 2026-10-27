@@ -18,6 +18,7 @@ package chunk
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -78,6 +79,13 @@ type kazStoreState struct {
 	// kazUnuploaded holds keys never PUT whose slice was retired; protected by pendingMutex.
 	kazUnuploaded    map[string]struct{}
 	kazDeleteSkipped prometheus.Counter
+
+	// kazClaimedKeys maps a claimed slice id to its pending key; protected by pendingMutex.
+	kazClaimedKeys map[uint64]string
+	// kazPacker is the staging packer registered by the vfs layer (nil when off).
+	kazPacker atomic.Pointer[func(id uint64, length int) bool]
+	// kazPackTotal counts staging-pack events (kaz_staging_pack_total{event}).
+	kazPackTotal *prometheus.CounterVec
 }
 
 // kazInitState initializes the kaz state of a new store right after the

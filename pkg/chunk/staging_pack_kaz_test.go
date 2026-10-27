@@ -194,3 +194,134 @@ func TestKazSkipDeleteBusyNotRecorded(t *testing.T) {
 	store.pendingMutex.Unlock()
 	require.False(t, ok)
 }
+
+// kazStateOf returns the kaz state of the pending item of key under pendingMutex.
+func kazStateOf(store *cachedStore, key string) (kazStagingState, bool) {
+	store.pendingMutex.Lock()
+	defer store.pendingMutex.Unlock()
+	item := store.pendingKeys[key]
+	if item == nil {
+		return 0, false
+	}
+	return item.kaz.state, true
+}
+
+// TestKazClaimQueuedItem checks that an item already in the upload channel can be claimed.
+func TestKazClaimQueuedItem(t *testing.T) {
+	store, _, _ := newRetireFixture(t, 0)
+	key := stageRetireSlice(t, store, 1, []byte("aaa"))
+	require.Len(t, store.pendingCh, 1)
+	claimed, absent := store.KazClaimStaged([]KazStagedRef{{ID: 1, Length: 3}, {ID: 2, Length: 3}})
+	require.Len(t, claimed, 1)
+	require.Equal(t, uint64(1), claimed[0].ID)
+	require.Equal(t, []byte("aaa"), claimed[0].Data)
+	require.Equal(t, []uint64{2}, absent)
+	st, _ := kazStateOf(store, key)
+	require.Equal(t, kazStagingClaimed, st)
+}
+
+// TestKazClaimSkipsPutStarted checks that an item whose PUT started is neither claimed nor absent.
+func TestKazClaimSkipsPutStarted(t *testing.T) {
+	store, _, _ := newRetireFixture(t, time.Hour)
+	key := stageRetireSlice(t, store, 1, []byte("aaa"))
+	store.pendingMutex.Lock()
+	store.pendingKeys[key].kaz.putStarted = true
+	store.pendingMutex.Unlock()
+	claimed, absent := store.KazClaimStaged([]KazStagedRef{{ID: 1, Length: 3}})
+	require.Empty(t, claimed)
+	require.Empty(t, absent)
+}
+
+// TestKazReleaseRequeuesOnce checks that release queues only items that are not already queued.
+func TestKazReleaseRequeuesOnce(t *testing.T) {
+	store, _, _ := newRetireFixture(t, time.Hour)
+	k1 := stageRetireSlice(t, store, 1, []byte("aaa"))
+	k2 := stageRetireSlice(t, store, 2, []byte("bbb"))
+	store.pendingMutex.Lock()
+	store.pendingKeys[k2].uploading.Store(true) // as if already in the channel
+	store.pendingMutex.Unlock()
+	claimed, _ := store.KazClaimStaged([]KazStagedRef{{ID: 1, Length: 3}, {ID: 2, Length: 3}})
+	require.Len(t, claimed, 2)
+	require.Empty(t, store.pendingCh)
+	store.KazReleaseStaged([]uint64{1, 2, 99}, nil)
+	require.Len(t, store.pendingCh, 1)
+	require.Equal(t, k1, (<-store.pendingCh).key)
+	st, _ := kazStateOf(store, k2)
+	require.Equal(t, kazStagingWait, st)
+}
+
+// TestKazReleasePacked checks that a packed item is never PUT by the uploader.
+func TestKazReleasePacked(t *testing.T) {
+	store, _, objects := newRetireFixture(t, 0)
+	key := stageRetireSlice(t, store, 1, []byte("aaa"))
+	claimed, _ := store.KazClaimStaged([]KazStagedRef{{ID: 1, Length: 3}})
+	require.Len(t, claimed, 1)
+	store.KazReleaseStaged([]uint64{1}, map[uint64]bool{1: true})
+	for len(store.pendingCh) > 0 {
+		item := <-store.pendingCh
+		store.uploadStagingFile(item.key, item.fpath)
+	}
+	store.uploadStagingFile(key, "")
+	require.Equal(t, int64(0), objects.putCalls.Load())
+	st, _ := kazStateOf(store, key)
+	require.Equal(t, kazStagingPacked, st)
+}
+
+// TestKazTryPackHook checks when the packer is consulted from uploadStagingFile.
+func TestKazTryPackHook(t *testing.T) {
+	store, _, objects := newRetireFixture(t, time.Hour)
+	var calls []KazStagedRef
+	ret := true
+	store.KazSetStagingPacker(func(id uint64, length int) bool {
+		calls = append(calls, KazStagedRef{ID: id, Length: length})
+		return ret
+	})
+	key := stageRetireSlice(t, store, 1, []byte("aaa"))
+	store.uploadStagingFile(key, "")
+	require.Equal(t, int64(0), objects.putCalls.Load())
+	require.Equal(t, []KazStagedRef{{ID: 1, Length: 3}}, calls)
+
+	ret = false
+	key = stageRetireSlice(t, store, 2, []byte("bbb"))
+	store.pendingMutex.Lock()
+	path := store.pendingKeys[key].fpath
+	store.pendingMutex.Unlock()
+	store.uploadStagingFile(key, path)
+	require.Equal(t, int64(1), objects.putCalls.Load())
+
+	// block number 1 and a full block are never offered to the packer.
+	calls = nil
+	for i, ln := range []int{4096 + 3, 4096} {
+		id := uint64(10 + i)
+		r := sliceForRead(id, ln, store)
+		k := r.key(r.index(ln - 1))
+		if ln == 4096 {
+			k = r.key(0)
+		}
+		data := make([]byte, parseObjOrigSize(k))
+		p, err := store.bcache.stage(k, data, 0)
+		require.NoError(t, err)
+		store.addDelayedStaging(k, p, time.Now(), false)
+		store.uploadStagingFile(k, p)
+	}
+	require.Empty(t, calls)
+}
+
+// TestKazClaimedRetireSucceeds checks that Retire is not blocked by a claimed item.
+func TestKazClaimedRetireSucceeds(t *testing.T) {
+	store, _, _ := newRetireFixture(t, time.Hour)
+	stageRetireSlice(t, store, 1, []byte("aaa"))
+	claimed, _ := store.KazClaimStaged([]KazStagedRef{{ID: 1, Length: 3}})
+	require.Len(t, claimed, 1)
+	require.NoError(t, store.Retire(1, 3))
+}
+
+// TestKazClaimIgnoresDelay checks that an item still inside the upload delay can be claimed.
+func TestKazClaimIgnoresDelay(t *testing.T) {
+	store, _, _ := newRetireFixture(t, 60*time.Second)
+	stageRetireSlice(t, store, 1, []byte("aaa"))
+	require.Empty(t, store.pendingCh)
+	claimed, absent := store.KazClaimStaged([]KazStagedRef{{ID: 1, Length: 3}})
+	require.Len(t, claimed, 1)
+	require.Empty(t, absent)
+}
