@@ -54,6 +54,8 @@ type KazChunkConfig struct {
 	KazCacheCompactionHotAge time.Duration
 	// KazWholeReadMax makes a cache-enabled read of a block of at most this many bytes fetch the whole object instead of a range (0 disables).
 	KazWholeReadMax int
+	// KazSkipUnuploadedDelete skips the object DELETE of a staged block that this mount never tried to PUT.
+	KazSkipUnuploadedDelete bool
 }
 
 // kazStoreState holds the cachedStore state added by kaz. It is embedded in
@@ -72,6 +74,10 @@ type kazStoreState struct {
 	// headerTimedOut remembers keys recently cut by GetHeaderTimeout (key -> time).
 	headerTimedOutMu sync.Mutex
 	headerTimedOut   map[string]time.Time
+
+	// kazUnuploaded holds keys never PUT whose slice was retired; protected by pendingMutex.
+	kazUnuploaded    map[string]struct{}
+	kazDeleteSkipped prometheus.Counter
 }
 
 // kazInitState initializes the kaz state of a new store right after the

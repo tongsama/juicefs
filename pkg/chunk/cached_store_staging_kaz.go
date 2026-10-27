@@ -58,6 +58,7 @@ func (store *cachedStore) beginStagingUpload(key string) *pendingItem {
 			return nil
 		}
 		item.kaz.putStarted = true
+		store.kazForgetUnuploaded(key)
 		if store.activeStaging == nil {
 			store.activeStaging = make(map[string]int)
 		}
@@ -79,6 +80,7 @@ func (store *cachedStore) beginImmediateStaging(key, path string, added time.Tim
 		return nil
 	}
 	item.kaz.putStarted = true
+	store.kazForgetUnuploaded(key)
 	if store.activeStaging == nil {
 		store.activeStaging = make(map[string]int)
 	}
@@ -142,10 +144,18 @@ func (store *cachedStore) Retire(id uint64, length int) error {
 	keys := kazSliceKeys(id, length, store)
 	var err error
 	busy := false
+	var marked []string
+	first := true
 	cancel := func() {
 		store.pendingMutex.Lock()
 		defer store.pendingMutex.Unlock()
 		for _, key := range keys {
+			if first {
+				// kaz: remember keys whose PUT never started, so the later DELETE can be skipped.
+				if store.kazMarkUnuploaded(key) {
+					marked = append(marked, key)
+				}
+			}
 			delete(store.pendingKeys, key)
 			if store.activeStaging[key] > 0 || store.activeStageWrites[key] > 0 {
 				busy = true
@@ -153,6 +163,7 @@ func (store *cachedStore) Retire(id uint64, length int) error {
 		}
 	}
 	cancel()
+	first = false
 	for _, key := range keys {
 		err = errors.Join(err, store.retireCache(key))
 	}
@@ -161,6 +172,10 @@ func (store *cachedStore) Retire(id uint64, length int) error {
 	cancel()
 	if busy {
 		err = errors.Join(err, ErrSliceUploadInFlight)
+	}
+	// kaz: keep the DELETE (safe side) unless every unlink succeeded and nothing is in flight.
+	if err != nil {
+		store.kazUnmarkUnuploaded(marked)
 	}
 	return err
 }

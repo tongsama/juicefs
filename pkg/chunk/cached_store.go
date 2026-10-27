@@ -198,6 +198,10 @@ func (s *rSlice) Remove() error {
 	var err error
 	keys := kazSliceKeys(s.id, s.length, s.store)
 	for i := range keys {
+		// kaz: a block that was never PUT needs no DELETE.
+		if s.store.kazTakeUnuploaded(keys[i]) {
+			continue
+		}
 		err = errors.Join(err, s.delete(i))
 	}
 	return err

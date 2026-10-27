@@ -56,3 +56,58 @@ func (store *cachedStore) kazAddLocalStaging(key, path string, added time.Time) 
 	}
 	store.pendingMutex.Unlock()
 }
+
+// kazUnuploadedMax bounds the set of retired keys waiting for their DELETE to be skipped.
+const kazUnuploadedMax = 1 << 20
+
+// kazMarkUnuploaded records key as never PUT when the setting is on and the pending
+// item is local with no PUT started. The caller holds pendingMutex and must call it
+// before removing the item. It reports whether the key was added to the set.
+func (store *cachedStore) kazMarkUnuploaded(key string) bool {
+	if !store.conf.KazSkipUnuploadedDelete {
+		return false
+	}
+	item := store.pendingKeys[key]
+	if item == nil || !item.kaz.local || item.kaz.putStarted {
+		return false
+	}
+	if _, ok := store.kazUnuploaded[key]; ok || len(store.kazUnuploaded) >= kazUnuploadedMax {
+		return false
+	}
+	if store.kazUnuploaded == nil {
+		store.kazUnuploaded = make(map[string]struct{})
+	}
+	store.kazUnuploaded[key] = struct{}{}
+	return true
+}
+
+// kazUnmarkUnuploaded takes back marks made by a Retire that did not fully succeed.
+func (store *cachedStore) kazUnmarkUnuploaded(keys []string) {
+	if len(keys) == 0 {
+		return
+	}
+	store.pendingMutex.Lock()
+	defer store.pendingMutex.Unlock()
+	for _, key := range keys {
+		delete(store.kazUnuploaded, key)
+	}
+}
+
+// kazForgetUnuploaded drops the mark of key because a PUT of it is starting. The
+// caller holds pendingMutex.
+func (store *cachedStore) kazForgetUnuploaded(key string) {
+	delete(store.kazUnuploaded, key)
+}
+
+// kazTakeUnuploaded removes key from the never-PUT set and reports whether it was
+// there, i.e. whether the object DELETE can be skipped.
+func (store *cachedStore) kazTakeUnuploaded(key string) bool {
+	store.pendingMutex.Lock()
+	_, ok := store.kazUnuploaded[key]
+	delete(store.kazUnuploaded, key)
+	store.pendingMutex.Unlock()
+	if ok {
+		store.kazDeleteSkipped.Inc()
+	}
+	return ok
+}

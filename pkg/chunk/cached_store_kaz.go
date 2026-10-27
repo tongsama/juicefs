@@ -381,6 +381,10 @@ func (store *cachedStore) kazInitMetrics() {
 		Name: "kaz_get_header_timeouts",
 		Help: "Full-block GETs abandoned because no response headers arrived within --kaz-get-header-timeout.",
 	})
+	store.kazDeleteSkipped = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "kaz_delete_skipped_total",
+		Help: "Object DELETEs skipped because the staged block was never PUT.",
+	})
 }
 
 // kazRegMetrics registers the kaz counters. It is called from regMetrics at the
@@ -389,6 +393,7 @@ func (store *cachedStore) kazRegMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(store.canceledGetFinished)
 	reg.MustRegister(store.canceledGetDropped)
 	reg.MustRegister(store.getHeaderTimeouts)
+	reg.MustRegister(store.kazDeleteSkipped)
 }
 
 // kazPutParam returns the param of the PUT request log: the payload length, which
