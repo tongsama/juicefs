@@ -35,7 +35,7 @@ func TestMountWaitPolicyReachesFuse(t *testing.T) {
 		args     []string
 		deadline time.Duration
 	}{
-		{"default", nil, 0}, {"explicit_hour", []string{"--writer-flush-timeout", "1h"}, time.Hour},
+		{"default", nil, 0}, {"explicit_hour", []string{"--kaz-writer-flush-timeout", "1h"}, time.Hour},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			set := flag.NewFlagSet("fuse-wait", flag.ContinueOnError)

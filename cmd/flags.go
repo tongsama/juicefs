@@ -157,15 +157,17 @@ func storageFlags() []cli.Flag {
 			Usage: "number of background threads to delete objects; 0 disables deletion, negative values delete synchronously in the caller (not unlimited concurrency)",
 		},
 		&cli.StringFlag{
-			Name: "compaction-gc-mode", Value: "legacy",
-			Usage: "obsolete-slice cleanup notification: legacy waits for queue space; deferred uses durable references and bounded asynchronous hints",
+			Name: "kaz-compaction-gc-mode", Value: "legacy",
+			Aliases: []string{"compaction-gc-mode"}, // deprecated old name
+			Usage:   "[kaz] obsolete-slice cleanup notification: legacy waits for queue space; deferred uses durable references and bounded asynchronous hints (--compaction-gc-mode is a deprecated alias)",
 			Action: func(c *cli.Context, value string) error {
 				return (&meta.Config{CompactionGCMode: value, MaxDeletes: c.Int("max-deletes"), NoBGJob: c.Bool("no-bgjob"), ReadOnly: c.Bool("read-only")}).ValidateCompactionGC()
 			},
 		},
 		&cli.StringFlag{
-			Name: "compaction-scheduler", Value: "legacy",
-			Usage: "background compaction admission: legacy or bounded advisory priority scheduling",
+			Name: "kaz-compaction-scheduler", Value: "legacy",
+			Aliases: []string{"compaction-scheduler"}, // deprecated old name
+			Usage:   "[kaz] background compaction admission: legacy or bounded advisory priority scheduling (--compaction-scheduler is a deprecated alias)",
 			Action: func(_ *cli.Context, value string) error {
 				return (&meta.Config{CompactionScheduler: value}).ValidateCompactionScheduler()
 			},
@@ -293,57 +295,64 @@ func dataCacheFlags() []cli.Flag {
 			Usage: "blocks smaller than this size will be staged, 0 means all staged.",
 		},
 		&cli.BoolFlag{
-			Name:  "writeback-fsync",
-			Value: true,
-			Usage: "fdatasync staged blocks and fsync their directories before acknowledging writes in writeback mode; disabling it is faster but staged data may be lost on an OS crash",
+			Name:    "kaz-writeback-fsync",
+			Aliases: []string{"writeback-fsync"}, // deprecated old name
+			Value:   true,
+			Usage:   "[kaz] fdatasync staged blocks and fsync their directories before acknowledging writes in writeback mode; disabling it is faster but staged data may be lost on an OS crash (--writeback-fsync is a deprecated alias)",
 		},
 		&cli.StringFlag{
-			Name:  "slice-flush-wait",
-			Value: "5s",
-			Usage: "maximum duration before flushing a pending slice",
+			Name:    "kaz-slice-flush-wait",
+			Aliases: []string{"slice-flush-wait"}, // deprecated old name
+			Value:   "5s",
+			Usage:   "[kaz] maximum duration before flushing a pending slice (--slice-flush-wait is a deprecated alias)",
 		},
 		&cli.StringFlag{
-			Name:  "slice-flush-idle",
-			Value: "1s",
-			Usage: "idle duration before flushing a pending slice",
+			Name:    "kaz-slice-flush-idle",
+			Aliases: []string{"slice-flush-idle"}, // deprecated old name
+			Value:   "1s",
+			Usage:   "[kaz] idle duration before flushing a pending slice (--slice-flush-idle is a deprecated alias)",
 		},
 		&cli.IntFlag{
-			Name: "writer-reuse-window", Value: 4,
-			Usage: "pending slice search distance before freezing old candidates (1..64); does not bypass flush barriers or merge gaps",
+			Name: "kaz-writer-reuse-window", Value: 4,
+			Aliases: []string{"writer-reuse-window"}, // deprecated old name
+			Usage:   "[kaz] pending slice search distance before freezing old candidates (1..64); does not bypass flush barriers or merge gaps (--writer-reuse-window is a deprecated alias)",
 			Action: func(_ *cli.Context, value int) error {
 				if value < 1 || value > 64 {
-					return fmt.Errorf("writer-reuse-window must be between 1 and 64")
+					return fmt.Errorf("kaz-writer-reuse-window must be between 1 and 64")
 				}
 				return nil
 			},
 		},
 		&cli.StringFlag{
-			Name:  "writer-flush-timeout",
-			Value: "0s",
-			Usage: "deadline for pending file writes; 0s waits until completion, auto uses the legacy retry-derived deadline, positive durations opt into timeout errors",
+			Name:    "kaz-writer-flush-timeout",
+			Aliases: []string{"writer-flush-timeout"}, // deprecated old name
+			Value:   "0s",
+			Usage:   "[kaz] deadline for pending file writes; 0s waits until completion, auto uses the legacy retry-derived deadline, positive durations opt into timeout errors (--writer-flush-timeout is a deprecated alias)",
 			Action: func(_ *cli.Context, value string) error {
 				_, err := parseWriterFlushTimeout(value)
 				return err
 			},
 		},
 		&cli.StringFlag{
-			Name:  "writer-flush-scope",
-			Value: vfs.WriterFlushScopeFile,
-			Usage: "pending writes committed before read and fallocate: file waits for the whole file, range only for the touched chunks; fsync and close always wait for the whole file",
+			Name:    "kaz-writer-flush-scope",
+			Aliases: []string{"writer-flush-scope"}, // deprecated old name
+			Value:   vfs.WriterFlushScopeFile,
+			Usage:   "[kaz] pending writes committed before read and fallocate: file waits for the whole file, range only for the touched chunks; fsync and close always wait for the whole file (--writer-flush-scope is a deprecated alias)",
 			Action: func(_ *cli.Context, value string) error {
 				if value != vfs.WriterFlushScopeFile && value != vfs.WriterFlushScopeRange {
-					return fmt.Errorf("invalid writer-flush-scope %q: use file or range", value)
+					return fmt.Errorf("invalid kaz-writer-flush-scope %q: use file or range", value)
 				}
 				return nil
 			},
 		},
 		&cli.IntFlag{
-			Name:  "meta-write-batch",
-			Value: 0,
-			Usage: "maximum slices of one chunk committed in one metadata transaction (0 disables, up to 1024); applies to every commit including fsync",
+			Name:    "kaz-meta-write-batch",
+			Aliases: []string{"meta-write-batch"}, // deprecated old name
+			Value:   0,
+			Usage:   "[kaz] maximum slices of one chunk committed in one metadata transaction (0 disables, up to 1024); applies to every commit including fsync (--meta-write-batch is a deprecated alias)",
 			Action: func(_ *cli.Context, value int) error {
 				if value < 0 || value > 1024 {
-					return fmt.Errorf("meta-write-batch must be between 0 and 1024")
+					return fmt.Errorf("kaz-meta-write-batch must be between 0 and 1024")
 				}
 				return nil
 			},

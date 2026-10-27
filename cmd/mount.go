@@ -290,14 +290,14 @@ func parseWriterFlushTimeout(value string) (time.Duration, error) {
 	}
 	timeout, err := time.ParseDuration(value)
 	if err != nil || timeout < 0 {
-		return 0, fmt.Errorf("invalid writer-flush-timeout %q: use 0s, auto, or a positive duration", value)
+		return 0, fmt.Errorf("invalid kaz-writer-flush-timeout %q: use 0s, auto, or a positive duration", value)
 	}
 	return timeout, nil
 }
 
 func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chunkConf *chunk.Config) *vfs.Config {
 	// kaz: carry the validated writer settings into the VFS completion policy.
-	flushTimeout, err := parseWriterFlushTimeout(c.String("writer-flush-timeout"))
+	flushTimeout, err := parseWriterFlushTimeout(c.String("kaz-writer-flush-timeout"))
 	if err != nil {
 		logger.Fatalf("%s", err)
 	}
@@ -312,12 +312,12 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 		Chunk:              chunkConf,
 		BackupMeta:         utils.Duration(c.String("backup-meta")),
 		BackupSkipTrash:    c.Bool("backup-skip-trash"),
-		SliceFlushWait:     utils.Duration(c.String("slice-flush-wait")),
-		SliceFlushIdle:     utils.Duration(c.String("slice-flush-idle")),
-		WriterReuseWindow:  c.Int("writer-reuse-window"),
+		SliceFlushWait:     utils.Duration(c.String("kaz-slice-flush-wait")),
+		SliceFlushIdle:     utils.Duration(c.String("kaz-slice-flush-idle")),
+		WriterReuseWindow:  c.Int("kaz-writer-reuse-window"),
 		WriterFlushTimeout: flushTimeout,
-		WriterFlushScope:   c.String("writer-flush-scope"),
-		MetaWriteBatch:     c.Int("meta-write-batch"),
+		WriterFlushScope:   c.String("kaz-writer-flush-scope"),
+		MetaWriteBatch:     c.Int("kaz-meta-write-batch"),
 		Port:               &vfs.Port{DebugAgent: debugAgent, PyroscopeAddr: c.String("pyroscope")},
 		PrefixInternal:     c.Bool("prefix-internal"),
 		Pid:                os.Getpid(),
@@ -376,8 +376,8 @@ func getMetaConf(c *cli.Context, mp string, readOnly bool) *meta.Config {
 	conf.ReadOnly = readOnly
 	conf.NoBGJob = c.Bool("no-bgjob")
 	// kaz: optional compaction modes, validated before the metadata client is built.
-	conf.CompactionGCMode = c.String("compaction-gc-mode")
-	conf.CompactionScheduler = c.String("compaction-scheduler")
+	conf.CompactionGCMode = c.String("kaz-compaction-gc-mode")
+	conf.CompactionScheduler = c.String("kaz-compaction-scheduler")
 	if err := conf.ValidateCompactionGC(); err != nil {
 		logger.Fatalf("%s", err)
 	}
@@ -434,7 +434,7 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 		MaxRetries:             c.Int("io-retries"),
 		Writeback:              c.Bool("writeback"),
 		WritebackThresholdSize: int(utils.ParseBytes(c, "writeback-threshold-size", 'B')),
-		StagingNoSync:          !c.Bool("writeback-fsync"),
+		StagingNoSync:          !c.Bool("kaz-writeback-fsync"),
 		Prefetch:               c.Int("prefetch"),
 		FinishCanceledGet:      c.Bool("kaz-finish-canceled-get"),
 		BufferSize:             utils.ParseBytes(c, "buffer-size", 'M'),
@@ -608,6 +608,10 @@ func mount(c *cli.Context) error {
 	supervisor := os.Getenv("JFS_SUPERVISOR")
 	if supervisor != "" || runtime.GOOS == "windows" {
 		stage = 3
+	}
+	// kaz: warn about kaz flags still given by their old names (they are aliases now).
+	if stage == 0 || stage == 3 {
+		kazWarnOldFlagNames(os.Args)
 	}
 
 	var err error

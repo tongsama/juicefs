@@ -33,9 +33,9 @@ func TestWriterFlushOption(t *testing.T) {
 		args []string
 		want time.Duration
 	}{
-		{nil, 0}, {[]string{"--writer-flush-timeout", "0s"}, 0},
-		{[]string{"--writer-flush-timeout", "auto"}, vfs.AutoWriterFlushTimeout},
-		{[]string{"--writer-flush-timeout", "1h"}, time.Hour},
+		{nil, 0}, {[]string{"--kaz-writer-flush-timeout", "0s"}, 0},
+		{[]string{"--kaz-writer-flush-timeout", "auto"}, vfs.AutoWriterFlushTimeout},
+		{[]string{"--kaz-writer-flush-timeout", "1h"}, time.Hour},
 	} {
 		t.Run(time.Duration(tc.want).String(), func(t *testing.T) {
 			set := flag.NewFlagSet("flush-test", flag.ContinueOnError)
@@ -61,7 +61,7 @@ func TestWriterFlushOptionRejectsInvalid(t *testing.T) {
 		t.Run(input, func(t *testing.T) {
 			called := false
 			app := &cli.App{Flags: clientFlags(1), Action: func(*cli.Context) error { called = true; return nil }}
-			if err := app.Run([]string{"test", "--writer-flush-timeout", input}); err == nil {
+			if err := app.Run([]string{"test", "--kaz-writer-flush-timeout", input}); err == nil {
 				t.Fatal("invalid duration accepted")
 			}
 			if called {
@@ -71,15 +71,15 @@ func TestWriterFlushOptionRejectsInvalid(t *testing.T) {
 	}
 }
 
-// TestWriterFlushScopeOption carries --writer-flush-scope into the VFS configuration and keeps file as the default.
+// TestWriterFlushScopeOption carries --kaz-writer-flush-scope into the VFS configuration and keeps file as the default.
 func TestWriterFlushScopeOption(t *testing.T) {
 	for _, tc := range []struct {
 		args []string
 		want string
 	}{
 		{nil, vfs.WriterFlushScopeFile},
-		{[]string{"--writer-flush-scope", "file"}, vfs.WriterFlushScopeFile},
-		{[]string{"--writer-flush-scope", "range"}, vfs.WriterFlushScopeRange},
+		{[]string{"--kaz-writer-flush-scope", "file"}, vfs.WriterFlushScopeFile},
+		{[]string{"--kaz-writer-flush-scope", "range"}, vfs.WriterFlushScopeRange},
 	} {
 		t.Run(tc.want, func(t *testing.T) {
 			set := flag.NewFlagSet("scope-test", flag.ContinueOnError)
@@ -105,7 +105,7 @@ func TestWriterFlushScopeOptionRejectsInvalid(t *testing.T) {
 		t.Run(input, func(t *testing.T) {
 			called := false
 			app := &cli.App{Flags: clientFlags(1), Action: func(*cli.Context) error { called = true; return nil }}
-			if err := app.Run([]string{"test", "--writer-flush-scope", input}); err == nil {
+			if err := app.Run([]string{"test", "--kaz-writer-flush-scope", input}); err == nil {
 				t.Fatal("invalid scope accepted")
 			}
 			if called {
@@ -115,13 +115,13 @@ func TestWriterFlushScopeOptionRejectsInvalid(t *testing.T) {
 	}
 }
 
-// TestMetaWriteBatchOption carries --meta-write-batch into the VFS configuration, disabled by default.
+// TestMetaWriteBatchOption carries --kaz-meta-write-batch into the VFS configuration, disabled by default.
 func TestMetaWriteBatchOption(t *testing.T) {
 	for _, tc := range []struct {
 		args []string
 		want int
 	}{
-		{nil, 0}, {[]string{"--meta-write-batch", "64"}, 64}, {[]string{"--meta-write-batch", "1024"}, 1024},
+		{nil, 0}, {[]string{"--kaz-meta-write-batch", "64"}, 64}, {[]string{"--kaz-meta-write-batch", "1024"}, 1024},
 	} {
 		set := flag.NewFlagSet("batch-test", flag.ContinueOnError)
 		for _, f := range clientFlags(1) {
@@ -144,7 +144,7 @@ func TestMetaWriteBatchOptionRejectsInvalid(t *testing.T) {
 	for _, input := range []string{"-1", "1025"} {
 		called := false
 		app := &cli.App{Flags: clientFlags(1), Action: func(*cli.Context) error { called = true; return nil }}
-		if err := app.Run([]string{"test", "--meta-write-batch", input}); err == nil || called {
+		if err := app.Run([]string{"test", "--kaz-meta-write-batch", input}); err == nil || called {
 			t.Fatalf("%s: accepted=%v called=%v", input, err == nil, called)
 		}
 	}
