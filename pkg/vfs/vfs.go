@@ -948,7 +948,7 @@ func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh ui
 }
 
 // flushForRange commits the pending writes a Read or Fallocate of [off, off+size)
-// depends on: only those of the touched chunks with --writer-flush-scope=range,
+// depends on: only those of the touched chunks with --kaz-writer-flush-scope=range,
 // otherwise every pending write of the file. fsync, close, truncate and
 // copy_file_range keep using whole-file flushes.
 func (v *VFS) flushForRange(ctx meta.Context, ino Ino, off, size uint64) syscall.Errno {

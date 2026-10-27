@@ -26,6 +26,7 @@ import (
 )
 
 // TestCombinedVMOptions carries real flag defaults and opt-ins to metadata and writer configuration.
+// It keeps the deprecated old flag names to cover their aliases.
 func TestCombinedVMOptions(t *testing.T) {
 	for _, tc := range []struct {
 		name          string

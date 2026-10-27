@@ -130,7 +130,7 @@ func (c *Config) ValidateCompactionScheduler() error {
 	if c.CompactionScheduler == "" || c.CompactionScheduler == "legacy" || c.CompactionScheduler == "priority" {
 		return nil
 	}
-	return fmt.Errorf("invalid compaction-scheduler %q (want legacy or priority)", c.CompactionScheduler)
+	return fmt.Errorf("invalid kaz-compaction-scheduler %q (want legacy or priority)", c.CompactionScheduler)
 }
 
 type Format struct {
@@ -379,6 +379,6 @@ func (c *Config) ValidateCompactionGC() error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("invalid compaction-gc-mode %q (want legacy or deferred)", c.CompactionGCMode)
+		return fmt.Errorf("invalid kaz-compaction-gc-mode %q (want legacy or deferred)", c.CompactionGCMode)
 	}
 }
