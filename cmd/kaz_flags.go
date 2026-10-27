@@ -28,6 +28,9 @@ import (
 
 // kazSetFlagUsage replaces the Usage text of the flag called name in flags.
 // It is used to reword an upstream flag without editing the upstream literal.
+// It panics when the flag is missing or has an unsupported type, so that an
+// upstream rename, removal or type change shows up at the first command build
+// instead of silently dropping the kaz wording.
 func kazSetFlagUsage(flags []cli.Flag, name, usage string) {
 	for _, f := range flags {
 		if f.Names()[0] != name {
@@ -38,13 +41,18 @@ func kazSetFlagUsage(flags []cli.Flag, name, usage string) {
 			ff.Usage = usage
 		case *cli.IntFlag:
 			ff.Usage = usage
+		default:
+			panic(fmt.Sprintf("kaz: cannot reword usage of flag --%s: unsupported flag type %T", name, f))
 		}
+		return
 	}
+	panic(fmt.Sprintf("kaz: cannot reword usage of flag --%s: not found in the upstream flags", name))
 }
 
 // kazStorageFlags returns the upstream data storage flags with the kaz wording
 // of --max-deletes, followed by the kaz data storage flags (block download
-// header timeout and compaction policy).
+// header timeout and compaction policy). It appends to the upstream slice, so
+// pass the upstream flag literal directly.
 func kazStorageFlags(upstream []cli.Flag) []cli.Flag {
 	kazSetFlagUsage(upstream, "max-deletes", "number of background threads to delete objects; 0 disables deletion, negative values delete synchronously in the caller (not unlimited concurrency)")
 	return append(upstream, []cli.Flag{
@@ -124,7 +132,8 @@ func kazStorageFlags(upstream []cli.Flag) []cli.Flag {
 
 // kazDataCacheFlags returns the upstream data cache flags with the kaz wording
 // of --cache-eviction, followed by the kaz data cache flags (writer, staging
-// and kaz-2q cache eviction settings).
+// and kaz-2q cache eviction settings). It appends to the upstream slice, so
+// pass the upstream flag literal directly.
 func kazDataCacheFlags(upstream []cli.Flag) []cli.Flag {
 	kazSetFlagUsage(upstream, "cache-eviction", fmt.Sprintf("cache eviction policy [%s, %s, %s, %s]", chunk.EvictionNone, chunk.Eviction2Random, chunk.EvictionLRU, chunk.EvictionKaz2Q))
 	return append(upstream, []cli.Flag{
