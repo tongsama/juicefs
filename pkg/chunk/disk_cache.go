@@ -702,8 +702,8 @@ func (cache *cacheStore) getPathFromKey(k cacheKey) string {
 	}
 }
 
-// remove drops cached data and retains the historical warning-only eviction API.
 func (cache *cacheStore) remove(key string, staging bool) {
+	// kaz: removeLocal returns the error; this eviction API still only warns.
 	if err := cache.removeLocal(key, staging); err != nil {
 		logger.Warnf("remove local block %s failed: %s", key, err)
 	}

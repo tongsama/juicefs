@@ -295,8 +295,8 @@ func parseWriterFlushTimeout(value string) (time.Duration, error) {
 	return timeout, nil
 }
 
-// getVfsConf carries validated CLI settings into the VFS completion policy.
 func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chunkConf *chunk.Config) *vfs.Config {
+	// kaz: carry the validated writer settings into the VFS completion policy.
 	flushTimeout, err := parseWriterFlushTimeout(c.String("writer-flush-timeout"))
 	if err != nil {
 		logger.Fatalf("%s", err)
@@ -341,8 +341,8 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 	return cfg
 }
 
-// registerMetaMsg connects durable metadata decisions to data storage and optional local retirement.
 func registerMetaMsg(m meta.Meta, store chunk.ChunkStore, chunkConf *chunk.Config) {
+	// kaz: let durable metadata decisions retire the local copy of a slice.
 	m.OnMsg(meta.RetireSlice, func(args ...interface{}) error {
 		if retire, ok := store.(interface {
 			Retire(id uint64, length int) error
@@ -368,7 +368,6 @@ func readConfig(mp string) ([]byte, error) {
 	return contents, err
 }
 
-// getMetaConf validates optional compaction modes before constructing a metadata client.
 func getMetaConf(c *cli.Context, mp string, readOnly bool) *meta.Config {
 	conf := meta.DefaultConf()
 	conf.Retries = c.Int("io-retries")
@@ -376,6 +375,7 @@ func getMetaConf(c *cli.Context, mp string, readOnly bool) *meta.Config {
 	conf.SkipDirNlink = c.Int("skip-dir-nlink")
 	conf.ReadOnly = readOnly
 	conf.NoBGJob = c.Bool("no-bgjob")
+	// kaz: optional compaction modes, validated before the metadata client is built.
 	conf.CompactionGCMode = c.String("compaction-gc-mode")
 	conf.CompactionScheduler = c.String("compaction-scheduler")
 	if err := conf.ValidateCompactionGC(); err != nil {

@@ -3201,7 +3201,6 @@ func (m *kvMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error) {
 	return count, nil
 }
 
-// doCompactChunk validates and replaces chunk references before scheduling obsolete cleanup.
 func (m *kvMeta) doCompactChunk(inode Ino, indx uint32, buf []byte, ss []*slice, skipped int, pos uint32, id uint64, size uint32, delayed []byte) syscall.Errno {
 	st := errno(m.txn(Background(), func(tx *kvTxn) error {
 		buf2 := tx.get(m.chunkKey(inode, indx))
@@ -3255,6 +3254,7 @@ func (m *kvMeta) doCompactChunk(inode Ino, indx uint32, buf []byte, ss []*slice,
 					refs = tx.incrBy(m.sliceKey(s.id, s.size), 0)
 					return nil
 				}, 0) == nil && refs < 0 {
+					// kaz: cleanup of the replaced slices goes through the compaction delete queue.
 					m.enqueueCompactionDelete(s.id, s.size)
 				}
 			}

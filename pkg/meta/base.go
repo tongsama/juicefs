@@ -798,7 +798,6 @@ func (m *baseMeta) currentSessionInfo() []byte {
 	return m.newSessionInfo()
 }
 
-// NewSession attaches session workers and optional request-derived compaction scheduling.
 func (m *baseMeta) NewSession(record bool) error {
 	m.sessCtx = Background()
 	ctx := m.sessCtx
@@ -838,6 +837,7 @@ func (m *baseMeta) NewSession(record bool) error {
 	go m.flushDirStat(ctx)
 	go m.flushQuotas(ctx)
 	m.startDeleteSliceTasks() // start MaxDeletes tasks
+	// kaz: optional compaction scheduling derived from requests.
 	m.startPriorityCompactor()
 
 	if !m.conf.NoBGJob {
@@ -860,7 +860,6 @@ const (
 	bgJobCanceled = "canceled"
 )
 
-// startDeleteSliceTasks starts physical deletion workers and optional nonblocking GC hints.
 func (m *baseMeta) startDeleteSliceTasks() {
 	m.Lock()
 	defer m.Unlock()
@@ -887,11 +886,12 @@ func (m *baseMeta) startDeleteSliceTasks() {
 			}
 		}(m.dslices)
 	}
+	// kaz: optional nonblocking GC hints next to the deletion workers.
 	m.startCompactionGC()
 }
 
-// stopDeleteSliceTasks joins the hint dispatcher before closing its deletion transport.
 func (m *baseMeta) stopDeleteSliceTasks() {
+	// kaz: join the GC hint dispatcher before its deletion transport is closed.
 	if g := m.compactionGC.Swap(nil); g != nil {
 		g.close()
 	}
@@ -1021,7 +1021,6 @@ func (m *baseMeta) CleanStaleSessions(ctx Context) {
 	}
 }
 
-// CloseSession joins asynchronous metadata work before disconnecting session resources.
 func (m *baseMeta) CloseSession() error {
 	m.FlushSession()
 	m.sesMu.Lock()
@@ -1034,6 +1033,7 @@ func (m *baseMeta) CloseSession() error {
 	if m.sessCtx != nil {
 		m.sessCtx.Cancel()
 	}
+	// kaz: join the compaction scheduler before the session resources go away.
 	m.stopPriorityCompactor()
 	m.sessWG.Wait()
 	m.stopDeleteSliceTasks()
@@ -2136,7 +2136,6 @@ func (m *baseMeta) InvalidateChunkCache(ctx Context, inode Ino, indx uint32) sys
 	return 0
 }
 
-// Read resolves committed slices and requests advisory compaction from counts already fetched.
 func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (st syscall.Errno) {
 	defer func() {
 		if st == 0 {
@@ -2181,6 +2180,7 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 		if f != nil {
 			tierID = int(f.attr.Tier)
 		}
+		// kaz: request advisory compaction from the slice count already fetched.
 		m.requestCompactionFromRead(inode, indx, len(ss), tierID)
 	}
 	return 0
@@ -2991,8 +2991,8 @@ func (m *baseMeta) CompactAll(ctx Context, threads int, bar *utils.Bar) syscall.
 	return 0
 }
 
-// compactChunk rewrites fragmented slices, retaining durable object storage semantics.
 func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID int) {
+	// kaz: phase timing and slow-compaction logs.
 	start := time.Now()
 	// avoid too many or duplicated compaction
 	k := uint64(inode) + (uint64(indx) << 40)

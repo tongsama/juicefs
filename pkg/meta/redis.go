@@ -3240,7 +3240,6 @@ func (m *redisMeta) doWriteSlices(ctx Context, inode Ino, indx uint32, slices []
 	}, m.inodeKey(inode)))
 }
 
-// CopyFileRange copies only a watched source chunk snapshot and commits its shared references atomically.
 func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut uint64, size uint64, flags uint32, copied, outLength *uint64) syscall.Errno {
 	defer m.timeit("CopyFileRange", time.Now())
 	f := m.of.find(fout)
@@ -3859,7 +3858,6 @@ func (r *redisMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error)
 	return count, err
 }
 
-// doCompactChunk atomically replaces references before notifying obsolete-slice cleanup.
 func (m *redisMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*slice, skipped int, pos uint32, id uint64, size uint32, delayed []byte) syscall.Errno {
 	var rs []*redis.IntCmd // trash disabled: check reference of slices
 	if delayed == nil {
@@ -3922,6 +3920,7 @@ func (m *redisMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*
 		if delayed == nil {
 			for i, s := range ss {
 				if s.id > 0 && rs[i].Err() == nil && rs[i].Val() < 0 {
+					// kaz: cleanup of the replaced slices goes through the compaction delete queue.
 					m.enqueueCompactionDelete(s.id, s.size)
 				}
 			}
@@ -5364,7 +5363,6 @@ func (m *redisMeta) loadQuotasForDump(ctx Context, quotaKey string) map[uint64]*
 	return quotas
 }
 
-// doCloneEntry clones one entry while detecting concurrent source chunk replacement.
 func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, ino Ino, originAttr *Attr, cmode uint8, cumask uint16, top bool) syscall.Errno {
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
 		a, err := tx.Get(ctx, m.inodeKey(srcIno)).Bytes()
@@ -5505,7 +5503,6 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 	}, m.inodeKey(srcIno), m.xattrKey(srcIno)))
 }
 
-// doBatchClone clones a batch with watched source chunk snapshots and shared-reference updates.
 func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries []*Entry, cmode uint8, cumask uint16, result *batchCloneResult) syscall.Errno {
 	type cloneInfo struct {
 		entry   *Entry

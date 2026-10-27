@@ -555,7 +555,6 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 	return nil
 }
 
-// GenFuseOpt leaves request deadlines to the operation and preserves explicit kernel interrupts.
 func GenFuseOpt(conf *vfs.Config, options string, mt int, noxattr, noacl bool, maxWrite int) fuse.MountOptions {
 	var opt fuse.MountOptions
 	opt.FsName = "JuiceFS:" + conf.Format.Name
