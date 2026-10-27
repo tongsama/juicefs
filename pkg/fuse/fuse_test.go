@@ -102,8 +102,7 @@ func mount(url, mp string) {
 		Chunk:    &chunkConf,
 		FuseOpts: &vfs.FuseOptions{},
 		// JFS_TEST_WRITER_FLUSH_SCOPE=range reruns the suite with range barriers.
-		WriterFlushScope: os.Getenv("JFS_TEST_WRITER_FLUSH_SCOPE"),
-		MetaWriteBatch:   metaWriteBatchFromEnv(),
+		KazVfsConfig: vfs.KazVfsConfig{WriterFlushScope: os.Getenv("JFS_TEST_WRITER_FLUSH_SCOPE"), MetaWriteBatch: metaWriteBatchFromEnv()},
 	}
 
 	err = m.NewSession(true)

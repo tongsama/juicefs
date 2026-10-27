@@ -135,7 +135,7 @@ func (m *traceCountingMeta) Write(ctx meta.Context, inode Ino, indx, off uint32,
 
 // WriteSlices delegates persistence and counts the slices it committed.
 func (m *traceCountingMeta) WriteSlices(ctx meta.Context, inode Ino, indx uint32, slices []meta.SliceWrite, mtime time.Time) (int, syscall.Errno, bool) {
-	n, err, uncertain := m.Meta.WriteSlices(ctx, inode, indx, slices, mtime)
+	n, err, uncertain := m.Meta.(meta.KazSliceWriter).WriteSlices(ctx, inode, indx, slices, mtime)
 	m.writes.Add(int32(n))
 	return n, err, uncertain
 }

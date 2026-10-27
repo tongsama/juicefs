@@ -91,7 +91,7 @@ func (s *retireStorage) deleteCount(key string) int {
 }
 
 // newRetireFixture uses actual disk staging/checksums without unrelated disk-maintenance goroutines.
-func newRetireFixture(t *testing.T, delay time.Duration) (*cachedStore, *cacheStore, *retireStorage) {
+func newRetireFixture(t *testing.T, delay time.Duration) (*cachedStore, *kazDiskCache, *retireStorage) {
 	t.Helper()
 	blob, err := object.CreateStorage("mem", "", "", "", "")
 	require.NoError(t, err)
@@ -100,9 +100,9 @@ func newRetireFixture(t *testing.T, delay time.Duration) (*cachedStore, *cacheSt
 	metrics := newCacheManagerMetrics(nil)
 	index, err := NewKeyIndex(&conf)
 	require.NoError(t, err)
-	disk := &cacheStore{id: "retire-test", dir: conf.CacheDir + string(filepath.Separator), mode: 0600, capacity: int64(conf.CacheSize), maxItems: 1000, checksum: conf.CacheChecksum, keys: index, pages: make(map[string]*Page), m: metrics, opTs: make(map[time.Duration]func() error), scanned: true}
+	disk := &kazDiskCache{id: "retire-test", dir: conf.CacheDir + string(filepath.Separator), mode: 0600, capacity: int64(conf.CacheSize), maxItems: 1000, checksum: conf.CacheChecksum, keys: index, pages: make(map[string]*Page), m: metrics, opTs: make(map[time.Duration]func() error), scanned: true}
 	disk.state = newDCState(dcNormal, disk)
-	manager := &cacheManager{consistentMap: consistenthash.New(100, nil), storeMap: map[string]*cacheStore{disk.id: disk}, stores: []*cacheStore{disk}, metrics: metrics}
+	manager := &cacheManager{consistentMap: consistenthash.New(100, nil), storeMap: map[string]*kazDiskCache{disk.id: disk}, stores: []*kazDiskCache{disk}, metrics: metrics}
 	manager.consistentMap.Add(disk.id)
 	store := &cachedStore{storage: objectStore, conf: conf, bcache: manager, compressor: compress.NewCompressor(conf.Compress), currentUpload: make(chan struct{}, conf.MaxUpload), currentDownload: make(chan struct{}, conf.MaxDownload), pendingKeys: make(map[string]*pendingItem), pendingCh: make(chan *pendingItem, 100), group: NewController()}
 	store.initMetrics()

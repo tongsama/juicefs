@@ -38,13 +38,13 @@ func kazStoreKey(id uint64) string {
 	return fmt.Sprintf("chunks/0/0/%d_0_%d", id, kazStoreBlock)
 }
 
-// newKazTestStore builds a kaz-2q cacheStore without background goroutines.
-// newTestCacheStore bypasses newCacheStore, so the helper attaches the index
-// itself with the store's effective capacity, as newCacheStore does after
+// newKazTestStore builds a kaz-2q kazDiskCache without background goroutines.
+// newTestCacheStore bypasses kazNewDiskCache, so the helper attaches the index
+// itself with the store's effective capacity, as kazNewDiskCache does after
 // setLimitByFreeRatio (that path is covered by TestKaz2QStoreAttachEffectiveCapacity).
 // It fixes the index clock to the returned pointer. m may be shared by
 // several stores.
-func newKazTestStore(t *testing.T, m *cacheManagerMetrics) (*cacheStore, *kaz2QIndex, *uint32) {
+func newKazTestStore(t *testing.T, m *cacheManagerMetrics) (*kazDiskCache, *kaz2QIndex, *uint32) {
 	t.Helper()
 	conf := defaultConf
 	conf.CacheEviction = EvictionKaz2Q
@@ -55,7 +55,7 @@ func newKazTestStore(t *testing.T, m *cacheManagerMetrics) (*cacheStore, *kaz2QI
 	conf.CacheScanInterval = -1
 	s := newTestCacheStore(t.TempDir(), &conf, nil)
 	s.m = m
-	s.kazAttach(s.capacity)
+	s.kazAttach2Q(s.capacity)
 	idx, ok := s.keys.(*kaz2QIndex)
 	require.True(t, ok, "kaz-2q store must use kaz2QIndex")
 	clock := kazTestStart
@@ -71,7 +71,7 @@ func newKazTestMetrics() *cacheManagerMetrics {
 }
 
 // kazWriteBlock writes a block file of kazStoreBlock bytes at the cache path of key.
-func kazWriteBlock(t *testing.T, s *cacheStore, key string) {
+func kazWriteBlock(t *testing.T, s *kazDiskCache, key string) {
 	t.Helper()
 	path := s.cachePath(key)
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0700))
@@ -79,7 +79,7 @@ func kazWriteBlock(t *testing.T, s *cacheStore, key string) {
 }
 
 // kazLoad reads key through the store (a user hit) and closes the reader.
-func kazLoad(t *testing.T, s *cacheStore, key string) {
+func kazLoad(t *testing.T, s *kazDiskCache, key string) {
 	t.Helper()
 	rc, err := s.load(key)
 	require.NoError(t, err)
@@ -87,7 +87,7 @@ func kazLoad(t *testing.T, s *cacheStore, key string) {
 }
 
 // kazSeg returns the segment of key in the store index, failing if it is absent.
-func kazSeg(t *testing.T, s *cacheStore, idx *kaz2QIndex, key string) kazSegment {
+func kazSeg(t *testing.T, s *kazDiskCache, idx *kaz2QIndex, key string) kazSegment {
 	t.Helper()
 	s.Lock()
 	defer s.Unlock()
@@ -97,7 +97,7 @@ func kazSeg(t *testing.T, s *cacheStore, idx *kaz2QIndex, key string) kazSegment
 }
 
 // kazHas reports whether key is in the store index.
-func kazHas(s *cacheStore, idx *kaz2QIndex, key string) bool {
+func kazHas(s *kazDiskCache, idx *kaz2QIndex, key string) bool {
 	s.Lock()
 	defer s.Unlock()
 	_, ok := idx.kazSegmentOf(s.getCacheKey(key))
@@ -105,14 +105,14 @@ func kazHas(s *cacheStore, idx *kaz2QIndex, key string) bool {
 }
 
 // kazAtime returns the in-memory atime of key.
-func kazAtime(s *cacheStore, key string) uint32 {
+func kazAtime(s *kazDiskCache, key string) uint32 {
 	s.Lock()
 	defer s.Unlock()
 	return s.keys.peekAtime(s.getCacheKey(key))
 }
 
 // kazCleanup runs cleanupFull with the store lock held, as its callers do.
-func kazCleanup(s *cacheStore) {
+func kazCleanup(s *kazDiskCache) {
 	s.Lock()
 	s.cleanupFull()
 	s.Unlock()
@@ -330,7 +330,7 @@ func TestKaz2QMetricsRegister(t *testing.T) {
 	}
 }
 
-// TestKaz2QStoreAttachEffectiveCapacity checks that newCacheStore sizes the 2Q
+// TestKaz2QStoreAttachEffectiveCapacity checks that kazNewDiskCache sizes the 2Q
 // index from the capacity left by setLimitByFreeRatio, not from cacheSize.
 func TestKaz2QStoreAttachEffectiveCapacity(t *testing.T) {
 	conf := defaultConf
@@ -344,7 +344,7 @@ func TestKaz2QStoreAttachEffectiveCapacity(t *testing.T) {
 	dir, err := os.MkdirTemp("", "kaz-attach-")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
-	s := newCacheStore(newKazTestMetrics(), dir, cacheSize, 0, 1, &conf, nil)
+	s := kazNewDiskCache(newKazTestMetrics(), dir, cacheSize, 0, 1, &conf, nil)
 	idx, ok := s.keys.(*kaz2QIndex)
 	require.True(t, ok)
 	s.Lock()
@@ -361,7 +361,7 @@ func TestKaz2QMetricsReattach(t *testing.T) {
 	s.add(kazStoreKey(1), kazStoreBlock, *clock)
 	km := m.kaz2Q
 	require.Equal(t, 1.0, testutil.ToFloat64(km.blocks.WithLabelValues("probation")))
-	s.kazAttach(s.capacity)
+	s.kazAttach2Q(s.capacity)
 	require.Equal(t, 1.0, testutil.ToFloat64(km.blocks.WithLabelValues("probation")))
 	require.Equal(t, float64(kazStoreBlock), testutil.ToFloat64(km.bytes.WithLabelValues("probation")))
 }
@@ -400,7 +400,7 @@ func kazGhostGauges(m *cacheManagerMetrics) (float64, float64) {
 }
 
 // kazGhostOf returns the evicted-key list size of an index under the store lock.
-func kazGhostOf(s *cacheStore, idx *kaz2QIndex) (int, int64) {
+func kazGhostOf(s *kazDiskCache, idx *kaz2QIndex) (int, int64) {
 	s.Lock()
 	defer s.Unlock()
 	return idx.ghost.Len(), idx.ghostBytes
@@ -425,7 +425,7 @@ func TestKaz2QGhostMetrics(t *testing.T) {
 		b.add(k, kazStoreBlock, *clockB)
 	}
 	// evict two blocks of each store into the evicted-key lists
-	for _, s := range []*cacheStore{a, b} {
+	for _, s := range []*kazDiskCache{a, b} {
 		s.capacity = 6000
 		kazCleanup(s)
 	}

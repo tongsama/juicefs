@@ -30,7 +30,7 @@ func kazCompactionReadMinFromFlag(readMin int) (int, error) {
 	if readMin == 0 {
 		return 0, fmt.Errorf("invalid kaz-compaction-read-min 0 (want 5..2499)")
 	}
-	conf := meta.Config{KazCompactionReadMin: readMin}
+	conf := meta.Config{KazMetaConfig: meta.KazMetaConfig{KazCompactionReadMin: readMin}}
 	if err := conf.ValidateKazCompactionPolicy(); err != nil {
 		return 0, err
 	}
@@ -66,10 +66,10 @@ func kazBlockCompactionFromFlags(mode string, ratio float64, maxSlices, deltaTie
 	if deltaGap == 0 {
 		gapCfg = -1
 	}
-	conf := meta.Config{KazCompactionMode: mode, KazCompactionBlockHiddenRatio: ratio, KazCompactionBlockMaxSlices: maxSlices,
+	conf := meta.Config{KazMetaConfig: meta.KazMetaConfig{KazCompactionMode: mode, KazCompactionBlockHiddenRatio: ratio, KazCompactionBlockMaxSlices: maxSlices,
 		KazCompactionDeltaTiers: deltaTiers, KazCompactionDeltaMaxRecords: deltaMaxRecords,
 		KazCompactionDeltaGap: gapCfg, KazCompactionDeltaMinFileSize: deltaMinFileSize,
-		KazCompactionDeltaTrigger: deltaTrigger, KazCompactionDeltaBlockRatio: deltaBlockRatio}
+		KazCompactionDeltaTrigger: deltaTrigger, KazCompactionDeltaBlockRatio: deltaBlockRatio}}
 	if err := conf.ValidateKazBlockCompaction(); err != nil {
 		return meta.Config{}, err
 	}
@@ -79,6 +79,15 @@ func kazBlockCompactionFromFlags(mode string, ratio float64, maxSlices, deltaTie
 // applyKazCompactionPolicyFlags copies the kaz compaction policy and block
 // compaction flags into conf and exits on an invalid value, like the other compaction modes.
 func applyKazCompactionPolicyFlags(c *cli.Context, conf *meta.Config) {
+	// optional compaction modes, validated before the metadata client is built.
+	conf.CompactionGCMode = c.String("kaz-compaction-gc-mode")
+	conf.CompactionScheduler = c.String("kaz-compaction-scheduler")
+	if err := conf.ValidateCompactionGC(); err != nil {
+		logger.Fatalf("%s", err)
+	}
+	if err := conf.ValidateCompactionScheduler(); err != nil {
+		logger.Fatalf("%s", err)
+	}
 	readMin, err := kazCompactionReadMinFromFlag(c.Int("kaz-compaction-read-min"))
 	if err != nil {
 		logger.Fatalf("%s", err)

@@ -86,7 +86,7 @@ func (m *batchRecordingMeta) WriteSlices(ctx meta.Context, inode Ino, indx uint3
 			return n, st, uncertain
 		}
 	}
-	return m.Meta.WriteSlices(ctx, inode, indx, slices, mtime)
+	return m.Meta.(meta.KazSliceWriter).WriteSlices(ctx, inode, indx, slices, mtime)
 }
 
 // snapshot returns the recorded calls.

@@ -42,7 +42,7 @@ const kazCompSize = 64 << 10
 // each slice prepared before the store starts.
 type kazCompFixture struct {
 	store *cachedStore
-	cs    *cacheStore // nil for the memory cache
+	cs    *kazDiskCache // nil for the memory cache
 	data  map[uint64][]byte
 	keys  map[uint64]string
 }
@@ -56,7 +56,7 @@ func kazCompKey(conf Config, id uint64, size int) string {
 // storage and, when cached is set, the same bytes as the cached file in a
 // temporary cache dir, then starts a cachedStore with eviction and waits for
 // the first scan. dir "memory" selects the memory cache instead. The
-// tests avoid calling cacheStore.cache on a disk store: it reads rawFull
+// tests avoid calling kazDiskCache.cache on a disk store: it reads rawFull
 // without the lock, racing with checkFreeSpace under -race (upstream). The
 // prefetcher is replaced by one without workers so that queued keys can be
 // checked deterministically. Goroutines are left running (shutdownStore races
@@ -876,4 +876,16 @@ func TestKazWholeReadNotCacheable(t *testing.T) {
 	kazWholeReadAt(t, store, kazCompSize, data, 8<<10, 4<<10)
 	kazWholeReadAt(t, store, kazCompSize, data, 8<<10, 4<<10)
 	require.Equal(t, [][2]int64{{8 << 10, 4 << 10}, {8 << 10, 4 << 10}}, cnt.take())
+}
+
+// TestKazSliceKeysMatchesKeys checks that kazSliceKeys returns the same keys, in
+// the same order, as rSlice.keys() for empty, tiny, block-aligned and ragged slices.
+func TestKazSliceKeysMatchesKeys(t *testing.T) {
+	store := &cachedStore{conf: Config{BlockSize: 4 << 20}}
+	bs := store.conf.BlockSize
+	for _, length := range []int{0, 1, bs, 3*bs + 17} {
+		want := sliceForRead(7, length, store).keys()
+		got := kazSliceKeys(7, length, store)
+		require.Equal(t, want, got, "length=%d", length)
+	}
 }

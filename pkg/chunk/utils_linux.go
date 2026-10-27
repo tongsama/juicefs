@@ -38,8 +38,3 @@ func dropOSCache(r ReadCloser) {
 		_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
 	}
 }
-
-// fdatasyncFile flushes file data and the size needed to read it back, skipping unrelated metadata such as mtime.
-func fdatasyncFile(f *os.File) error {
-	return unix.Fdatasync(int(f.Fd()))
-}

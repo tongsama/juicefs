@@ -147,7 +147,7 @@ func TestKazCacheCompactionHotAgeFlag(t *testing.T) {
 		require.Equal(t, tc.want, conf.KazCacheCompactionHotAge, "%v", tc.args)
 	}
 	conf := chunk.Config{CacheDir: "/tmp/x", CacheSize: 1 << 30, CacheEviction: chunk.EvictionKaz2Q,
-		KazCacheProbationRatio: 0.4, KazCacheStateInterval: time.Minute, KazCacheCompactionHotAge: -5 * time.Minute}
+		KazChunkConfig: chunk.KazChunkConfig{KazCacheProbationRatio: 0.4, KazCacheStateInterval: time.Minute, KazCacheCompactionHotAge: -5 * time.Minute}}
 	conf.SelfCheck("uuid")
 	require.Equal(t, time.Duration(0), conf.KazCacheCompactionHotAge, "negative must become 0 under kaz-2q")
 }

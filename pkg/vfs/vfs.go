@@ -136,15 +136,9 @@ type Config struct {
 	ReaddirCache         bool
 	BackupMeta           time.Duration
 	BackupSkipTrash      bool
-	SliceFlushWait       time.Duration
-	SliceFlushIdle       time.Duration
-	WriterReuseWindow    int           // Distance before freezing nonmatching old slices; zero uses four.
-	WriterFlushTimeout   time.Duration // 0 waits without a deadline; AutoWriterFlushTimeout uses the legacy deadline.
-	WriterFlushScope     string        // WriterFlushScopeFile (default) or WriterFlushScopeRange for Read/Fallocate barriers.
-	MetaWriteBatch       int           // Maximum slices of one chunk committed per metadata transaction; 0 disables batching.
-	FastResolve          bool          `json:",omitempty"`
-	AccessLog            string        `json:",omitempty"`
-	Subdir               string        `json:",omitempty"`
+	FastResolve          bool   `json:",omitempty"`
+	AccessLog            string `json:",omitempty"`
+	Subdir               string `json:",omitempty"`
 	PrefixInternal       bool
 	HideInternal         bool
 	RootSquash           *AnonymousAccount `json:",omitempty"`
@@ -160,6 +154,9 @@ type Config struct {
 
 	// the mount point for current volume (to follow symlink)
 	Mountpoint string
+
+	// kaz: settings of the kaz features (config_kaz.go).
+	KazVfsConfig
 }
 
 type AnonymousAccount struct {
@@ -921,20 +918,9 @@ func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh ui
 		return
 	}
 	var length uint64
-	// Fallocate sets mtime to now; ordering it with slice commits keeps pending
-	// commits from moving it back.
-	err = v.writer.UpdateMeta(ino, func() syscall.Errno {
-		return v.Meta.Fallocate(ctx, ino, mode, uint64(off), uint64(size), &length)
-	})
+	err = v.kazMetaFallocate(ctx, ino, mode, uint64(off), uint64(size), &length)
 	if err == 0 {
-		if v.Conf.WriterFlushScope == WriterFlushScopeRange {
-			// Uncommitted appends outside the range are not in the metadata length yet,
-			// and fallocate never shrinks a file, so keep the larger writer length.
-			v.writer.GrowTo(ino, length)
-			length = max(length, v.writer.GetLength(ino))
-		} else {
-			v.writer.Truncate(ino, length)
-		}
+		length = v.kazSyncWriterLength(ino, length)
 		s := size
 		if off+size > int64(length) {
 			s = int64(length) - off
@@ -945,27 +931,6 @@ func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh ui
 		v.invalidateAttr(ino)
 	}
 	return
-}
-
-// flushForRange commits the pending writes a Read or Fallocate of [off, off+size)
-// depends on: only those of the touched chunks with --kaz-writer-flush-scope=range,
-// otherwise every pending write of the file. fsync, close, truncate and
-// copy_file_range keep using whole-file flushes.
-func (v *VFS) flushForRange(ctx meta.Context, ino Ino, off, size uint64) syscall.Errno {
-	if v.Conf.WriterFlushScope == WriterFlushScopeRange {
-		return v.writer.FlushRange(ctx, ino, off, size)
-	}
-	return v.writer.Flush(ctx, ino)
-}
-
-// prelockFlush runs a range barrier before the handle lock is taken, so the
-// barrier taken under the lock only waits for writes that arrive meanwhile.
-// It does nothing for whole-file barriers, whose flush already stops writes.
-func (v *VFS) prelockFlush(ctx meta.Context, ino Ino, off, size uint64) syscall.Errno {
-	if v.Conf.WriterFlushScope == WriterFlushScopeRange {
-		return v.writer.FlushRange(ctx, ino, off, size)
-	}
-	return 0
 }
 
 func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut Ino, fhOut, offOut, size uint64, flags uint32) (copied uint64, err syscall.Errno) {

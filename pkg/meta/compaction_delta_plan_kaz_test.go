@@ -586,7 +586,7 @@ func TestPlanKazDeltaPatternsVsBlock(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		large = append(large, [2]uint32{uint32(rng.Intn(16)) * bs, bs})
 	}
-	conf := (&Config{KazCompactionMode: KazCompactionModeDelta}).kazDeltaConf()
+	conf := (&Config{KazMetaConfig: KazMetaConfig{KazCompactionMode: KazCompactionModeDelta}}).kazDeltaConf()
 	// run replays writes (after the first initial ones) and plans every 99 writes.
 	run := func(writes [][2]uint32, initial int, delta bool) uint64 {
 		var ss []*slice

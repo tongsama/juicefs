@@ -18,6 +18,7 @@ package meta
 
 import (
 	"container/list"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -263,4 +264,12 @@ func (s *compactionScheduler) setObserver(f func(wait time.Duration, count int))
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.observe = f
+}
+
+// ValidateCompactionScheduler accepts only legacy and bounded advisory priority scheduling.
+func (c *Config) ValidateCompactionScheduler() error {
+	if c.CompactionScheduler == "" || c.CompactionScheduler == "legacy" || c.CompactionScheduler == "priority" {
+		return nil
+	}
+	return fmt.Errorf("invalid kaz-compaction-scheduler %q (want legacy or priority)", c.CompactionScheduler)
 }

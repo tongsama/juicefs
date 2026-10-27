@@ -171,7 +171,7 @@ func newSmallPutVFS(t *testing.T, compression string, writeback bool) (*VFS, *me
 		require.Equal(t, cc.BlockSize+1, cc.WritebackThresholdSize)
 	}
 	conf := &Config{Meta: mc, Format: f, Chunk: cc, FuseOpts: &FuseOptions{},
-		SliceFlushWait: 30 * time.Second, SliceFlushIdle: 10 * time.Second}
+		KazVfsConfig: KazVfsConfig{SliceFlushWait: 30 * time.Second, SliceFlushIdle: 10 * time.Second}}
 	reg := prometheus.NewRegistry()
 	store := chunk.NewCachedStore(s, *cc, reg)
 	if writeback {

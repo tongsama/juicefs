@@ -52,8 +52,10 @@ func TestKaz2QConfigSelfCheck(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			conf := Config{
 				CacheDir: c.dir, CacheSize: 1 << 30, CacheEviction: EvictionKaz2Q,
-				KazCacheProbationRatio: c.ratio, KazCachePromoteDelay: c.delay,
-				KazCacheGhostRatio: c.ghost, KazCacheStateInterval: c.interval,
+				KazChunkConfig: KazChunkConfig{
+					KazCacheProbationRatio: c.ratio, KazCachePromoteDelay: c.delay,
+					KazCacheGhostRatio: c.ghost, KazCacheStateInterval: c.interval,
+				},
 			}
 			conf.SelfCheck("uuid")
 			if conf.CacheEviction != c.wEvict || conf.KazCacheProbationRatio != c.wRatio ||
@@ -79,8 +81,8 @@ func TestKaz2QConfigSelfCheck(t *testing.T) {
 		{EvictionKaz2Q, "memory", "bogus", "bogus"},
 	} {
 		conf := Config{CacheDir: c.dir, CacheSize: 1 << 30, CacheEviction: c.evict,
-			KazCacheProbationRatio: 0.4, KazCacheStateInterval: time.Minute,
-			KazCacheCompactionPlacement: c.in}
+			KazChunkConfig: KazChunkConfig{KazCacheProbationRatio: 0.4, KazCacheStateInterval: time.Minute,
+				KazCacheCompactionPlacement: c.in}}
 		conf.SelfCheck("uuid")
 		if conf.KazCacheCompactionPlacement != c.want {
 			t.Fatalf("%s/%s placement %q: got %q, want %q", c.evict, c.dir, c.in,
@@ -104,8 +106,8 @@ func TestKaz2QConfigSelfCheck(t *testing.T) {
 		{Eviction2Random, KazPlacementShare, 1.5, 1.5},
 	} {
 		conf := Config{CacheDir: "/tmp/x", CacheSize: 1 << 30, CacheEviction: c.evict,
-			KazCacheProbationRatio: 0.4, KazCacheStateInterval: time.Minute,
-			KazCacheCompactionPlacement: c.placement, KazCacheCompactionPlacementShareRatio: c.in}
+			KazChunkConfig: KazChunkConfig{KazCacheProbationRatio: 0.4, KazCacheStateInterval: time.Minute,
+				KazCacheCompactionPlacement: c.placement, KazCacheCompactionPlacementShareRatio: c.in}}
 		conf.SelfCheck("uuid")
 		if conf.KazCacheCompactionPlacementShareRatio != c.want {
 			t.Fatalf("%s/%s share ratio %v: got %v, want %v", c.evict, c.placement, c.in,
@@ -130,7 +132,7 @@ func TestKazConfigSelfCheckOnlyForKaz2Q(t *testing.T) {
 		}
 	}
 	conf := Config{CacheDir: "/tmp/x", CacheSize: 1 << 30, CacheEviction: EvictionKaz2Q,
-		KazCacheProbationRatio: 0.4, KazCacheStateInterval: time.Minute}
+		KazChunkConfig: KazChunkConfig{KazCacheProbationRatio: 0.4, KazCacheStateInterval: time.Minute}}
 	conf.SelfCheck("uuid")
 	if conf.KazCachePromoteDelay != 0 || conf.KazCacheGhostRatio != 0 {
 		t.Fatalf("zero delay/ghost changed: %+v", conf)
@@ -142,7 +144,7 @@ func TestKazConfigSelfCheckOnlyForKaz2Q(t *testing.T) {
 // self-check and reset, and is ignored by other eviction policies, which do
 // not use a kaz-2q index.
 func TestKazDemoteUnreadFirstConfig(t *testing.T) {
-	conf := Config{CacheDir: "/tmp/x", CacheSize: 1 << 30, CacheEviction: EvictionKaz2Q, KazCacheDemoteUnreadFirst: true}
+	conf := Config{CacheDir: "/tmp/x", CacheSize: 1 << 30, CacheEviction: EvictionKaz2Q, KazChunkConfig: KazChunkConfig{KazCacheDemoteUnreadFirst: true}}
 	conf.SelfCheck("uuid")
 	require.True(t, conf.KazCacheDemoteUnreadFirst)
 	p := newKaz2QIndex(&conf)
@@ -177,12 +179,12 @@ func TestKazCompactionHotAgeConfig(t *testing.T) {
 		{Eviction2Random, -time.Second, -time.Second},
 	} {
 		conf := Config{CacheDir: "/tmp/x", CacheSize: 1 << 30, CacheEviction: c.evict,
-			KazCacheProbationRatio: 0.4, KazCacheStateInterval: time.Minute,
-			KazCacheCompactionHotAge: c.in}
+			KazChunkConfig: KazChunkConfig{KazCacheProbationRatio: 0.4, KazCacheStateInterval: time.Minute,
+				KazCacheCompactionHotAge: c.in}}
 		conf.SelfCheck("uuid")
 		require.Equal(t, c.want, conf.KazCacheCompactionHotAge, "%s %v", c.evict, c.in)
 	}
-	require.Equal(t, uint32(1800), newKaz2QIndex(&Config{KazCacheCompactionHotAge: 30 * time.Minute}).hotAge)
-	require.Equal(t, uint32(0), newKaz2QIndex(&Config{KazCacheCompactionHotAge: -time.Minute}).hotAge)
+	require.Equal(t, uint32(1800), newKaz2QIndex(&Config{KazChunkConfig: KazChunkConfig{KazCacheCompactionHotAge: 30 * time.Minute}}).hotAge)
+	require.Equal(t, uint32(0), newKaz2QIndex(&Config{KazChunkConfig: KazChunkConfig{KazCacheCompactionHotAge: -time.Minute}}).hotAge)
 	require.Equal(t, uint32(0), newKaz2QIndex(&Config{}).hotAge)
 }

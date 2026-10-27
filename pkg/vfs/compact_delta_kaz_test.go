@@ -51,7 +51,8 @@ func newKazDeltaTestVFS(t *testing.T, writeback bool) (*VFS, *sync.Map) {
 	t.Cleanup(func() { _ = m.Shutdown() })
 	cconf := &chunk.Config{
 		BlockSize: format.BlockSize * 1024, Compress: format.Compression, MaxUpload: 2, MaxDownload: 200,
-		BufferSize: 30 << 20, CacheSize: 10 << 20, CacheDir: "memory", KazWholeReadMax: 1 << 20,
+		BufferSize: 30 << 20, CacheSize: 10 << 20, CacheDir: "memory",
+		KazChunkConfig: chunk.KazChunkConfig{KazWholeReadMax: 1 << 20},
 	}
 	if writeback {
 		cconf.CacheDir = t.TempDir()

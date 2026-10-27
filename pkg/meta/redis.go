@@ -1141,7 +1141,6 @@ func replaceErrno(txf func(tx *redis.Tx) error) func(tx *redis.Tx) error {
 	}
 }
 
-// txn serializes watched keys and separates local lock contention from transaction time.
 func (m *redisMeta) txn(ctx Context, txf func(tx *redis.Tx) error, keys ...string) (result error) {
 	if m.conf.ReadOnly {
 		return syscall.EROFS
@@ -1158,20 +1157,11 @@ func (m *redisMeta) txn(ctx Context, txf func(tx *redis.Tx) error, keys ...strin
 	start := time.Now()
 	defer func() { m.txDist.Observe(time.Since(start).Seconds()) }()
 
-	logger.Debugf("metadata transaction key=%s phase=lock_wait", keys[0])
-	lockStart := time.Now()
+	tr := newKazTxnTrace(keys[0], start) // kaz: lock-wait and slow-transaction diagnostics (trace_kaz.go)
 	m.txLock(h)
-	lockWait := time.Since(lockStart)
-	activeStart := time.Now()
-	var attempts int
-	defer func() {
-		if total := time.Since(start); total >= time.Second {
-			logger.Warnf("slow metadata transaction key=%s total=%s lock_wait=%s active=%s attempts=%d err=%v",
-				keys[0], total, lockWait, time.Since(activeStart), attempts, result)
-		}
-	}()
+	tr.lockAcquired()
+	defer func() { tr.done(result) }()
 	defer m.txUnlock(h)
-	logger.Debugf("metadata transaction key=%s phase=active lock_wait=%s", keys[0], lockWait)
 	// TODO: enable retry for some of idempotent transactions
 	var (
 		retryOnFailure = false
@@ -1187,7 +1177,7 @@ func (m *redisMeta) txn(ctx Context, txf func(tx *redis.Tx) error, keys ...strin
 			logger.Warnf("Transaction %s interrupted after %s, tried %d, keys: %v", method.name(ctx), time.Since(start), i+1, keys)
 			return syscall.EINTR
 		}
-		attempts = i + 1
+		tr.attempt()
 		err := m.rdb.Watch(ctx, replaceErrno(txf), keys...)
 		if eno, ok := err.(errNo); ok {
 			if eno == 0 {
@@ -3178,59 +3168,6 @@ func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, sli
 				pipe.IncrBy(ctx, m.usedSpaceKey(), delta.space)
 			}
 			m.genLog(ctx, pipe, now, "WRITE(%d,%d,%d,%d,%d,%d,%d):%d", inode, indx, off, slice.Id, slice.Len, attr.Mtime, attr.Mtimensec, *numSlices)
-			return nil
-		})
-		if err == nil {
-			*numSlices = int(rpush.Val())
-		}
-		return err
-	}, m.inodeKey(inode)))
-}
-
-// doWriteSlices appends slices to one chunk and updates the inode in a single
-// transaction: one RPUSH with every slice, one SET of the attributes.
-func (m *redisMeta) doWriteSlices(ctx Context, inode Ino, indx uint32, slices []SliceWrite, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
-	return errno(m.txn(ctx, func(tx *redis.Tx) error {
-		*delta = dirStat{}
-		*attr = Attr{}
-		a, err := tx.Get(ctx, m.inodeKey(inode)).Bytes()
-		if err != nil {
-			return err
-		}
-		m.parseAttr(a, attr)
-		if attr.Typ != TypeFile {
-			return syscall.EPERM
-		}
-		oldLength := attr.Length
-		for _, w := range slices {
-			if newleng := uint64(indx)*ChunkSize + uint64(w.Off) + uint64(w.Slice.Len); newleng > attr.Length {
-				attr.Length = newleng
-			}
-		}
-		delta.length = int64(attr.Length - oldLength)
-		delta.space = align4K(attr.Length) - align4K(oldLength)
-		if err := m.checkQuota(ctx, delta.space, 0, attr.Uid, attr.Gid, m.getParents(ctx, tx, inode, attr.Parent)...); err != 0 {
-			return err
-		}
-		now := time.Now()
-		attr.Mtime = mtime.Unix()
-		attr.Mtimensec = uint32(mtime.Nanosecond())
-		attr.Ctime = now.Unix()
-		attr.Ctimensec = uint32(now.Nanosecond())
-		vals := make([]interface{}, len(slices))
-		for i, w := range slices {
-			vals[i] = marshalSlice(w.Off, w.Slice.Id, w.Slice.Size, w.Slice.Off, w.Slice.Len)
-		}
-		var rpush *redis.IntCmd
-		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			rpush = pipe.RPush(ctx, m.chunkKey(inode, indx), vals...)
-			pipe.Set(ctx, m.inodeKey(inode), m.marshal(attr), 0)
-			if delta.space > 0 {
-				pipe.IncrBy(ctx, m.usedSpaceKey(), delta.space)
-			}
-			for _, w := range slices {
-				m.genLog(ctx, pipe, now, "WRITE(%d,%d,%d,%d,%d,%d,%d):%d", inode, indx, w.Off, w.Slice.Id, w.Slice.Len, attr.Mtime, attr.Mtimensec, *numSlices)
-			}
 			return nil
 		})
 		if err == nil {

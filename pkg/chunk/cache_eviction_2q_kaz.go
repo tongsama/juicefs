@@ -214,7 +214,7 @@ func (h *kazHeap) Pop() any {
 // kaz2QIndex is the kaz-2q KeyIndex: a 2Q cache with a probation segment
 // (ordered by order), a protected segment (ordered by atime; unread items
 // first with --kaz-cache-demote-unread-first), an evicted-key
-// list and state kept across rescans. All methods run under the cacheStore
+// list and state kept across rescans. All methods run under the kazDiskCache
 // mutex, so it needs no locking of its own.
 type kaz2QIndex struct {
 	keys   map[cacheKey]*kazItem

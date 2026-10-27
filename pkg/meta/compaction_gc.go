@@ -17,10 +17,19 @@
 package meta
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
+)
+
+// RetireSlice is only an in-process message key (OnMsg) and is never sent
+// through .control; its value lies above upstream's message numbers (1000+), so
+// new upstream messages cannot collide with it.
+const (
+	// RetireSlice optionally cancels local staging after committed reference retirement, without remote I/O.
+	RetireSlice = 1<<16 + 1
 )
 
 const compactionGCHintCapacity = 1024
@@ -172,4 +181,19 @@ func (m *baseMeta) retireCompactionSlice(id uint64, size uint32) error {
 		return nil
 	}
 	return cb(id, size)
+}
+
+// ValidateCompactionGC rejects settings without durable-marker recovery and background deletion.
+func (c *Config) ValidateCompactionGC() error {
+	switch c.CompactionGCMode {
+	case "", "legacy":
+		return nil
+	case "deferred":
+		if c.MaxDeletes <= 0 || c.NoBGJob || c.ReadOnly {
+			return fmt.Errorf("deferred compaction GC requires positive max-deletes and writable session background recovery")
+		}
+		return nil
+	default:
+		return fmt.Errorf("invalid kaz-compaction-gc-mode %q (want legacy or deferred)", c.CompactionGCMode)
+	}
 }

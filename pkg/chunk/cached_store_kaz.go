@@ -16,7 +16,19 @@
 
 package chunk
 
-import "context"
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/sirupsen/logrus"
+)
 
 // KazFlushCacheState saves the kaz-2q state file of every disk cache store
 // (called at a normal umount). It does nothing for memory caches and other
@@ -111,7 +123,7 @@ func (store *cachedStore) kazCacheCompactionOutput(key string, block *Page, sour
 		return
 	}
 	// getCacheKey only parses the key, it does not use the store.
-	indx := (*cacheStore)(nil).getCacheKey(key).indx
+	indx := (*kazDiskCache)(nil).getCacheKey(key).indx
 	refs := sources(int(indx))
 	srcs := make([]kazPlacementSource, 0, len(refs))
 	var outBytes uint32 // the same in every ref; max guards hand-made refs
@@ -155,4 +167,253 @@ func (store *cachedStore) KazCacheState(key string) (segment string, cached bool
 func (store *cachedStore) kazWholeRead(ctx context.Context, bs int) bool {
 	return store.conf.KazWholeReadMax > 0 && bs <= store.conf.KazWholeReadMax &&
 		store.shouldCache(bs) && !store.kazCompactionRead(ctx)
+}
+
+// headerTimeoutMemory is how long a key cut by GetHeaderTimeout is remembered.
+var headerTimeoutMemory = 5 * time.Minute
+
+// maxHeaderTimedOut bounds the number of remembered keys.
+const maxHeaderTimedOut = 4096
+
+// headerTimedOutRecently reports whether key was cut by GetHeaderTimeout within
+// headerTimeoutMemory, forgetting it once that has passed.
+func (store *cachedStore) headerTimedOutRecently(key string) bool {
+	store.headerTimedOutMu.Lock()
+	defer store.headerTimedOutMu.Unlock()
+	t, ok := store.headerTimedOut[key]
+	if ok && time.Since(t) > headerTimeoutMemory {
+		delete(store.headerTimedOut, key)
+		return false
+	}
+	return ok
+}
+
+// rememberHeaderTimeout records that key was cut by GetHeaderTimeout.
+// When too many keys are remembered, the expired ones are dropped first and,
+// if that is not enough, all of them.
+func (store *cachedStore) rememberHeaderTimeout(key string) {
+	store.headerTimedOutMu.Lock()
+	defer store.headerTimedOutMu.Unlock()
+	if store.headerTimedOut == nil {
+		store.headerTimedOut = make(map[string]time.Time)
+	}
+	if len(store.headerTimedOut) >= maxHeaderTimedOut {
+		for k, t := range store.headerTimedOut {
+			if time.Since(t) > headerTimeoutMemory {
+				delete(store.headerTimedOut, k)
+			}
+		}
+		if len(store.headerTimedOut) >= maxHeaderTimedOut {
+			clear(store.headerTimedOut)
+		}
+	}
+	store.headerTimedOut[key] = time.Now()
+}
+
+// forgetHeaderTimeout drops key once it has been downloaded.
+func (store *cachedStore) forgetHeaderTimeout(key string) {
+	store.headerTimedOutMu.Lock()
+	defer store.headerTimedOutMu.Unlock()
+	delete(store.headerTimedOut, key)
+}
+
+// errGetHeaderTimeout reports a full-block GET abandoned by GetHeaderTimeout.
+var errGetHeaderTimeout = errors.New("no response headers within --kaz-get-header-timeout")
+
+// readBlockDetached reads p from a full block fetched by a GET that is not tied to ctx.
+// If ctx is canceled first, the caller returns at once while the GET goes on in the
+// background and caches the block (see loadDetached). The fetch always uses its own
+// page, so nothing writes into the caller's buffer after it has returned.
+func (s *rSlice) readBlockDetached(ctx context.Context, p []byte, key string, boff, blockSize int) (int, error) {
+	type result struct {
+		block *Page
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		block, err := s.store.group.Execute(key, func() (*Page, error) {
+			tmp := NewOffPage(blockSize)
+			return tmp, s.store.loadDetached(ctx, key, tmp)
+		})
+		done <- result{block, err}
+	}()
+	select {
+	case r := <-done:
+		defer r.block.Release()
+		if r.err != nil {
+			return 0, r.err
+		}
+		copy(p, r.block.Data[boff:])
+		return len(p), nil
+	case <-ctx.Done():
+		go func() { (<-done).block.Release() }()
+		return 0, ctx.Err()
+	}
+}
+
+// loadDetached downloads a full block into page and caches it, for readBlockDetached.
+// It gives up while waiting for a download slot if ctx ends, because no request has
+// been sent yet. Once the GET has started, a cancel of ctx no longer stops it, as long
+// as fewer than detachedFetches GETs are already running this way; above that limit
+// the GET is canceled as before. GetTimeout still applies.
+func (store *cachedStore) loadDetached(ctx context.Context, key string, page *Page) error {
+	select {
+	case store.currentDownload <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-store.currentDownload }()
+
+	gctx, gcancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer gcancel()
+	const (
+		running = iota
+		detached
+		finished
+	)
+	var mu sync.Mutex
+	state := running
+	stop := context.AfterFunc(ctx, func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if state != running {
+			return
+		}
+		select {
+		case store.detachedFetches <- struct{}{}:
+			state = detached
+		default:
+			store.canceledGetDropped.Inc()
+			gcancel()
+		}
+	})
+	defer stop()
+
+	err := store.fetchBlock(gctx, key, page, true, false)
+
+	mu.Lock()
+	wasDetached := state == detached
+	state = finished
+	mu.Unlock()
+	if wasDetached {
+		<-store.detachedFetches
+		if err == nil {
+			store.canceledGetFinished.Inc()
+			logger.Debugf("finished GET %s after its reader was canceled, block cached", key)
+		}
+	}
+	return err
+}
+
+// cancelOnClose ends the request context of a GET when its body is closed.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+// Close closes the body and then releases its request context.
+func (c *cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
+}
+
+// getWithHeaderTimeout gets the whole object key, giving up with errGetHeaderTimeout
+// when Get (which returns once the response headers arrive) takes longer than
+// GetHeaderTimeout. After the headers, the body is read under ctx only, so a slow body
+// is still bounded by GetTimeout alone. Abandoned GETs are retried by the caller's
+// usual retry path.
+//
+// A key cut within headerTimeoutMemory is fetched again without the header timeout:
+// some objects (e.g. on Google Drive) always take longer than it to answer, and
+// cutting every retry would use up the read retries and fail the read with EIO.
+func (store *cachedStore) getWithHeaderTimeout(ctx context.Context, key string, getters ...object.AttrGetter) (io.ReadCloser, error) {
+	timeout := store.conf.GetHeaderTimeout
+	if timeout <= 0 {
+		return store.storage.Get(ctx, key, 0, -1, getters...)
+	}
+	if store.headerTimedOutRecently(key) {
+		in, err := store.storage.Get(ctx, key, 0, -1, getters...)
+		if err == nil {
+			store.forgetHeaderTimeout(key)
+		}
+		return in, err
+	}
+	hctx, cancel := context.WithCancel(ctx)
+	var fired atomic.Bool
+	timer := time.AfterFunc(timeout, func() {
+		fired.Store(true)
+		cancel()
+	})
+	in, err := store.storage.Get(hctx, key, 0, -1, getters...)
+	if !timer.Stop() && fired.Load() {
+		if in != nil {
+			_ = in.Close()
+		}
+		cancel()
+		if ctx.Err() != nil { // the caller gave up first; report that instead
+			return nil, ctx.Err()
+		}
+		store.getHeaderTimeouts.Inc()
+		store.rememberHeaderTimeout(key)
+		logger.Warnf("GET %s: %s (%s), will retry without it", key, errGetHeaderTimeout, timeout)
+		return nil, fmt.Errorf("%w (%s)", errGetHeaderTimeout, timeout)
+	}
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return &cancelOnClose{in, cancel}, nil
+}
+
+// kazInitMetrics creates the kaz counters of the cached store; it is called at
+// the end of initMetrics.
+func (store *cachedStore) kazInitMetrics() {
+	store.canceledGetFinished = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "kaz_canceled_get_finished",
+		Help: "Full-block GETs finished and cached after their reader was canceled.",
+	})
+	store.canceledGetDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "kaz_canceled_get_dropped",
+		Help: "Full-block GETs aborted on cancel because too many were already kept running.",
+	})
+	store.getHeaderTimeouts = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "kaz_get_header_timeouts",
+		Help: "Full-block GETs abandoned because no response headers arrived within --kaz-get-header-timeout.",
+	})
+}
+
+// kazRegMetrics registers the kaz counters. It is called from regMetrics at the
+// place where they were registered before, so the registration order is kept.
+func (store *cachedStore) kazRegMetrics(reg prometheus.Registerer) {
+	reg.MustRegister(store.canceledGetFinished)
+	reg.MustRegister(store.canceledGetDropped)
+	reg.MustRegister(store.getHeaderTimeouts)
+}
+
+// kazPutParam returns the param of the PUT request log: the payload length, which
+// differs from the raw length in the key. It is empty unless the request is slow or
+// debug logging is enabled. The string is the head of the logRequest param, and
+// scripts that parse the log depend on it.
+func (store *cachedStore) kazPutParam(payload int, used time.Duration) string {
+	param := ""
+	if used > SlowRequest || logger.IsLevelEnabled(logrus.DebugLevel) {
+		param = fmt.Sprintf("payload_bytes=%d ", payload)
+	}
+	return param
+}
+
+// kazSliceKeys returns the object keys of every block of slice id with the given
+// length, in block order. It replaces rSlice.keys(), which upstream removed.
+func kazSliceKeys(id uint64, length int, store *cachedStore) []string {
+	if length <= 0 {
+		return nil
+	}
+	r := rSlice{id: id, length: length, store: store}
+	lastIndx := (length - 1) / store.conf.BlockSize
+	keys := make([]string, lastIndx+1)
+	for i := 0; i <= lastIndx; i++ {
+		keys[i] = r.key(i)
+	}
+	return keys
 }

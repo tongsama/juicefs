@@ -19,7 +19,110 @@ package chunk
 import (
 	"errors"
 	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
 )
+
+// kazDiskCache and kazNewDiskCache are the names kaz code uses for the local
+// disk cache store, so that upstream's kazDiskCache -> diskCache rename only
+// needs to change these two definitions.
+type kazDiskCache = cacheStore
+
+var kazNewDiskCache = newCacheStore
+
+// flushPageOpt is a copy of upstream's flushPage with kaz's durable handling added.
+// With durable set, the data is synced before the rename publishes the name, and the
+// rename plus the directory chain are synced afterwards, so an OS crash cannot leave a
+// published block with missing contents or lose its name. When upstream changes
+// flushPage, apply the same fix here.
+func (cache *kazDiskCache) flushPageOpt(path string, data []byte, dropCache bool, tierID uint8, durable bool) (err error) {
+	if !cache.available() {
+		return errCacheDown
+	}
+
+	start := time.Now()
+	cache.m.cacheWrites.Add(1)
+	cache.m.cacheWriteBytes.Add(float64(len(data)))
+	defer func() {
+		cache.m.cacheWriteHist.Observe(time.Since(start).Seconds())
+	}()
+	dir := filepath.Dir(path)
+	cache.createDir(dir)
+	tmp := path + ".tmp"
+
+	var f *os.File
+	err = cache.checkErr(func() error {
+		f, err = os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE, cache.mode)
+		return err
+	})
+	if err != nil {
+		logger.Warnf("Can't create cache file %s: %s", tmp, err)
+		return err
+	}
+
+	defer func() {
+		if err != nil {
+			_ = cache.removeFile(tmp)
+		}
+	}()
+
+	if err = cache.writeFile(f, data); err != nil {
+		logger.Warnf("Write to cache file %s failed: %s", tmp, err)
+		_ = f.Close()
+		return
+	}
+	if cache.checksum != CsNone {
+		if err = cache.writeFile(f, checksum(data)); err != nil {
+			logger.Warnf("Write checksum to cache file %s failed: %s", tmp, err)
+			_ = f.Close()
+			return
+		}
+	}
+	if tierID != 0 {
+		// only staged file has a footer
+		footer := stageFooter{Tier: tierID}
+		var fData []byte
+		fData, err = (&footer).marshal(cache.checksum != CsNone)
+		if err != nil {
+			logger.Warnf("Marshal stage footer for cache file %s failed: %s", tmp, err)
+			_ = f.Close()
+			return
+		}
+		if err = cache.writeFile(f, fData); err != nil {
+			logger.Warnf("Write stage footer to cache file %s failed: %s", tmp, err)
+			_ = f.Close()
+			return
+		}
+	}
+	if durable {
+		if err = cache.checkErr(func() error { return syncStagingFile(f) }); err != nil {
+			logger.Warnf("Sync cache file %s failed: %s", tmp, err)
+			_ = f.Close()
+			return
+		}
+	}
+	if dropCache {
+		dropOSCache(f)
+	}
+	if err = cache.closeFile(f); err != nil {
+		logger.Warnf("Close cache file %s failed: %s", tmp, err)
+		return
+	}
+	if err = cache.renameFile(tmp, path); err != nil {
+		logger.Warnf("Rename cache file %s -> %s failed: %s", tmp, path, err)
+		return
+	}
+	if durable {
+		if err = cache.syncDirs(dir); err != nil {
+			logger.Warnf("Sync directory of cache file %s failed: %s", path, err)
+			// The name may not survive a crash; withdraw it so the caller falls back to a direct upload.
+			_ = cache.removeFile(path)
+		}
+	}
+	return
+}
 
 // kazPeeker is implemented by key indexes that can look up a key without
 // counting it as a user read (the kaz-2q index).
@@ -38,13 +141,31 @@ func kazLookupNoTouch(keys KeyIndex, k cacheKey) *cacheItem {
 	return keys.get(k)
 }
 
-// kazAttach gives a kaz-2q index the effective store capacity (after the
+// kazDiskState holds the cacheStore state added by kaz for staging
+// durability. It is embedded in cacheStore and initialized by kazAttach; it
+// holds a lock, so it must not be copied.
+type kazDiskState struct {
+	stagingSync bool // make staged blocks durable before acknowledging writeback
+	durableMu   sync.Mutex
+	durableDirs map[string]struct{} // staging dirs whose entries in their parents were synced by this process
+}
+
+// kazAttach initializes the kaz state of a new store from config and attaches
+// the kaz-2q index (kazAttach2Q). newCacheStore calls it once after the
+// capacity is limited by the free ratio, before the store goroutines start.
+func (cache *kazDiskCache) kazAttach(config *Config) {
+	cache.stagingSync = !config.StagingNoSync
+	cache.durableDirs = make(map[string]struct{})
+	cache.kazAttach2Q(cache.capacity)
+}
+
+// kazAttach2Q gives a kaz-2q index the effective store capacity (after the
 // free-ratio limit; it sizes the protected limit and the evicted-key list
 // cap) and the shared metrics, imports the state file (so that the first
 // scan restores the segments) and starts the periodic state saver. It does
 // nothing for other eviction policies. It must run before the store
 // goroutines start.
-func (cache *cacheStore) kazAttach(capacity int64) {
+func (cache *kazDiskCache) kazAttach2Q(capacity int64) {
 	idx, ok := cache.keys.(*kaz2QIndex)
 	if !ok {
 		return
@@ -61,7 +182,7 @@ func (cache *cacheStore) kazAttach(capacity int64) {
 // exactly as load does (pending pages, the scanned check, removing an index
 // entry whose file cannot be opened) but looks the key up without counting
 // it as a user read, so that neither atime nor the 2Q segment changes.
-func (cache *cacheStore) kazLoadNoTouch(key string) (ReadCloser, error) {
+func (cache *kazDiskCache) kazLoadNoTouch(key string) (ReadCloser, error) {
 	cache.Lock()
 	defer cache.Unlock()
 	if p, ok := cache.pages[key]; ok {
@@ -93,7 +214,7 @@ func (cache *cacheStore) kazLoadNoTouch(key string) (ReadCloser, error) {
 }
 
 // kazLoadNoTouch is cacheManager.load for a compaction read: the same store
-// routing and legacy-store fallback, using cacheStore.kazLoadNoTouch.
+// routing and legacy-store fallback, using kazDiskCache.kazLoadNoTouch.
 func (m *cacheManager) kazLoadNoTouch(key string) (ReadCloser, error) {
 	store := m.getStore(key)
 	if store == nil {
@@ -260,3 +381,83 @@ func (m *cacheManager) kazCacheState(key string) (string, bool) {
 	_, pending := s.pages[key]
 	return "", pending
 }
+
+// syncDirs persists the entry renamed into dir, then the entry of dir and each ancestor below cache.dir in
+// its parent, stopping at the first dir this process already made durable. A dir is recorded only after its
+// whole chain is synced, so a concurrent writer never skips a parent sync that is still in progress.
+func (cache *kazDiskCache) syncDirs(dir string) error {
+	if err := cache.checkErr(func() error { return syncStagingDir(dir) }); err != nil {
+		return err
+	}
+	root := filepath.Clean(cache.dir)
+	var chain []string
+	cache.durableMu.Lock()
+	for d := filepath.Clean(dir); d != root && strings.HasPrefix(d, root+string(filepath.Separator)); d = filepath.Dir(d) {
+		if _, ok := cache.durableDirs[d]; ok {
+			break
+		}
+		chain = append(chain, d)
+	}
+	cache.durableMu.Unlock()
+	for _, d := range chain {
+		parent := filepath.Dir(d)
+		if err := cache.checkErr(func() error { return syncStagingDir(parent) }); err != nil {
+			return err
+		}
+	}
+	cache.durableMu.Lock()
+	for _, d := range chain {
+		cache.durableDirs[d] = struct{}{}
+	}
+	cache.durableMu.Unlock()
+	return nil
+}
+
+// forgetDurableDir drops dir after it is removed, so a recreated dir is synced into its parent again.
+func (cache *kazDiskCache) forgetDurableDir(dir string) {
+	cache.durableMu.Lock()
+	delete(cache.durableDirs, filepath.Clean(dir))
+	cache.durableMu.Unlock()
+}
+
+// removeLocal returns unlink failures and retries staged paths even after index removal.
+func (cache *kazDiskCache) removeLocal(key string, staging bool) error {
+	cache.Lock()
+	delete(cache.pages, key)
+	path := cache.cachePath(key)
+	k := cache.getCacheKey(key)
+	if it := cache.keys.remove(k, staging); it != nil {
+		if it.size > 0 {
+			cache.used -= int64(it.size + 4096)
+		}
+	} else if !staging {
+		path = ""
+	}
+	cache.Unlock()
+	var err error
+	if path != "" {
+		if e := cache.removeFile(path); e != nil && !os.IsNotExist(e) {
+			err = e
+		}
+	}
+	// Stage files may survive a previous unlink failure even when the cache index is gone.
+	if staging {
+		err = errors.Join(err, cache.removeStage(key))
+	}
+	return err
+}
+
+// retire returns local cache/stage cleanup errors for durably obsolete slices.
+func (m *cacheManager) retire(key string) error {
+	store := m.getStore(key)
+	if store == nil {
+		return errCacheDown
+	}
+	return store.removeLocal(key, true)
+}
+
+// syncStagingFile and syncStagingDir make staged writeback blocks durable; tests replace them to observe ordering.
+var (
+	syncStagingFile = fdatasyncFile
+	syncStagingDir  = fsyncDir
+)

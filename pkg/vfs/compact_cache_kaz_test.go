@@ -198,9 +198,9 @@ func TestKazCompactInheritsCache(t *testing.T) {
 		BlockSize: bs, Compress: "lz4", MaxUpload: 2, MaxDownload: 200, MaxRetries: 1,
 		BufferSize: 30 << 20, CacheSize: 64 << 20, CacheDir: t.TempDir(), CacheMode: 0600,
 		CacheChecksum: chunk.CsNone, CacheScanInterval: time.Hour, CacheLargeWrite: true,
-		CacheEviction: chunk.EvictionKaz2Q, KazCacheProbationRatio: 0.4,
-		KazCacheGhostRatio: 4, KazCacheStateInterval: time.Hour,
-		PutTimeout: 10 * time.Second, GetTimeout: 10 * time.Second,
+		CacheEviction: chunk.EvictionKaz2Q, PutTimeout: 10 * time.Second, GetTimeout: 10 * time.Second,
+		KazChunkConfig: chunk.KazChunkConfig{KazCacheProbationRatio: 0.4,
+			KazCacheGhostRatio: 4, KazCacheStateInterval: time.Hour},
 	}
 	blob, _ := object.CreateStorage("mem", "", "", "", "")
 	store := chunk.NewCachedStore(blob, cconf, nil)
