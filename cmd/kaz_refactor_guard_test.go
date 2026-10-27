@@ -71,13 +71,26 @@ var kazGuardNonDefaultArgs = []string{
 	"--kaz-cache-compaction-hot-age", "2m",
 }
 
-// kazGuardVolatileKeys are the JSON keys whose values change on every run
-// (Pid and PPid are the process IDs; the others are listen addresses that depend
-// on the run); only their presence is compared. StartTime-like fields do not
-// exist in vfs.Config today, so the list is also a safeguard.
-var kazGuardVolatileKeys = map[string]bool{
-	"Pid": true, "PPid": true, "StartTime": true, "PrometheusAgent": true,
-	"DebugAgent": true, "PyroscopeAddr": true, "ConsulAddr": true,
+// kazGuardVolatileKeys are the JSON paths (from the root, exact match) whose
+// values change between runs: Pid and PPid are process IDs, Version depends on
+// the build and the upstream version. Only their presence is compared.
+var kazGuardVolatileKeys = map[string]bool{"Pid": true, "PPid": true, "Version": true}
+
+// kazGuardNotInConfig lists the value-taking --kaz-* flags that are not in
+// kazGuardNonDefaultArgs, with the reason.
+var kazGuardNotInConfig = map[string]string{
+	"kaz-upgrade-busy": "read by the mount command only; it never reaches a config",
+}
+
+// kazGuardPrepare fixes the environment the flag defaults depend on. The default
+// cache dir comes from HOME, except for root on linux, where it is another path;
+// the golden files are made for the non-root case, so the tests skip as root.
+func kazGuardPrepare(t *testing.T) {
+	t.Helper()
+	if os.Getuid() == 0 {
+		t.Skip("the default cache-dir differs for root; golden files are for non-root")
+	}
+	t.Setenv("HOME", "/kaz-guard-home")
 }
 
 // flattenKazJSON appends "path=value" lines for every leaf of v, with nested
@@ -90,10 +103,6 @@ func flattenKazJSON(prefix string, v interface{}, out *[]string) {
 			if prefix != "" {
 				p = prefix + "." + k
 			}
-			if kazGuardVolatileKeys[k] {
-				*out = append(*out, p+"=<volatile>")
-				continue
-			}
 			flattenKazJSON(p, e, out)
 		}
 	case []interface{}:
@@ -101,6 +110,9 @@ func flattenKazJSON(prefix string, v interface{}, out *[]string) {
 			flattenKazJSON(fmt.Sprintf("%s[%d]", prefix, i), e, out)
 		}
 	default:
+		if kazGuardVolatileKeys[prefix] {
+			x = "<volatile>"
+		}
 		*out = append(*out, fmt.Sprintf("%s=%v", prefix, x))
 	}
 }
@@ -123,6 +135,21 @@ func checkKazGolden(t *testing.T, file string, lines []string) {
 // TestKazConfigJSONKeys pins the keys and values of the vfs.Config JSON (the
 // .config file) when every kaz flag has a non-default value.
 func TestKazConfigJSONKeys(t *testing.T) {
+	kazGuardPrepare(t)
+	// Every value-taking --kaz-* flag must be given a value above (or be listed
+	// with a reason), so a newly added flag is not forgotten.
+	given := map[string]bool{}
+	for _, a := range kazGuardNonDefaultArgs {
+		given[strings.TrimPrefix(strings.SplitN(a, "=", 2)[0], "--")] = true
+	}
+	for _, f := range cmdMount().Flags {
+		name := f.Names()[0]
+		if _, isBool := f.(*cli.BoolFlag); isBool || !strings.HasPrefix(name, "kaz-") {
+			continue
+		}
+		_, skipped := kazGuardNotInConfig[name]
+		require.True(t, given[name] || skipped, "flag --%s has no value in kazGuardNonDefaultArgs", name)
+	}
 	var conf interface{}
 	app := &cli.App{Flags: cmdMount().Flags, Action: func(c *cli.Context) error {
 		metaConf := getMetaConf(c, "/kaz-guard", false)
@@ -143,13 +170,12 @@ func TestKazConfigJSONKeys(t *testing.T) {
 // TestKazFlagSetUnchanged pins every mount flag: all its names (aliases
 // included) and its default value.
 func TestKazFlagSetUnchanged(t *testing.T) {
+	kazGuardPrepare(t)
 	var lines []string
 	for _, f := range cmdMount().Flags {
-		def := ""
-		if d, ok := f.(cli.DocGenerationFlag); ok {
-			def = d.GetValue()
-		}
-		lines = append(lines, strings.Join(f.Names(), ",")+" default="+def)
+		d, ok := f.(cli.DocGenerationFlag)
+		require.True(t, ok, "flag %v has no default text", f.Names())
+		lines = append(lines, strings.Join(f.Names(), ",")+" default="+d.GetValue())
 	}
 	checkKazGolden(t, "testdata/kaz_mount_flags.golden", lines)
 }
