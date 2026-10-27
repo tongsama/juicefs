@@ -27,6 +27,8 @@ const (
 	EvictionNone    = "none"
 	Eviction2Random = "2-random"
 	EvictionLRU     = "lru"
+	// EvictionKaz2Q is the kaz 2Q-style policy (probation/protected segments).
+	EvictionKaz2Q = "kaz-2q"
 )
 
 const notInLru = math.MinInt // to trigger panic when misused
@@ -65,6 +67,8 @@ func NewKeyIndex(config *Config) (KeyIndex, error) {
 			keys:    make(map[cacheKey]*lruItem),
 			lruHeap: atimeHeap{},
 		}, nil
+	case EvictionKaz2Q:
+		return newKaz2QIndex(config), nil
 	default:
 		return nil, fmt.Errorf("unknown cache eviction policy: %q", config.CacheEviction)
 	}

@@ -61,3 +61,16 @@ func inRootVolume(dir string) bool {
 	}
 	return dstat.Sys().(*syscall.Stat_t).Dev == rstat.Sys().(*syscall.Stat_t).Dev
 }
+
+// fsyncDir makes entries created or renamed in dir durable.
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if cerr := d.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}

@@ -35,6 +35,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juju/ratelimit"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/sirupsen/logrus"
 )
 
 const chunkSize = 1 << 26 // 64M
@@ -130,7 +131,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	key := s.key(indx)
 	if s.store.conf.CacheEnabled() {
 		start := time.Now()
-		r, err := s.store.bcache.load(key)
+		r, err := s.store.kazLoadForRead(ctx, key)
 		if err == nil {
 			n, err = r.ReadAt(p, int64(boff))
 			if !s.store.conf.OSCache {
@@ -152,11 +153,15 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	s.store.cacheMissBytes.Add(float64(len(p)))
 
 	if s.store.seekable &&
-		(!s.store.conf.CacheEnabled() || (boff > 0 && len(p) <= blockSize/4)) {
+		(!s.store.conf.CacheEnabled() || (boff > 0 && len(p) <= blockSize/4 && !s.store.kazWholeRead(ctx, blockSize))) {
 		n, err = s.store.loadRange(ctx, key, page, boff)
 		if err == nil || !errors.Is(err, errTryFullRead) {
 			return n, err
 		}
+	}
+
+	if s.store.conf.FinishCanceledGet && s.store.conf.CacheEnabled() && s.store.shouldCache(blockSize) && !s.store.kazCompactionRead(ctx) {
+		return s.readBlockDetached(ctx, p, key, boff, blockSize)
 	}
 
 	block, err := s.store.group.Execute(key, func() (*Page, error) {
@@ -166,7 +171,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		} else {
 			tmp.Acquire()
 		}
-		err = s.store.load(ctx, key, tmp, s.store.shouldCache(blockSize), false)
+		err = s.store.load(ctx, key, tmp, s.store.shouldCache(blockSize) && !s.store.kazCompactionRead(ctx), false)
 		return tmp, err
 	})
 	defer block.Release()
@@ -184,26 +189,15 @@ func (s *rSlice) delete(indx int) error {
 	return s.store.delete(key)
 }
 
+// Remove retires local data first and refuses physical deletion while a staging PUT is active.
 func (s *rSlice) Remove() error {
-	if s.length == 0 {
-		// no block
-		return nil
+	if err := s.store.Retire(s.id, s.length); err != nil {
+		return err
 	}
-
-	lastIndx := (s.length - 1) / s.store.conf.BlockSize
-	for i := 0; i <= lastIndx; i++ {
-		// there could be multiple clients try to remove the same chunk in the same time,
-		// any of them should succeed if any blocks is removed
-		key := s.key(i)
-		s.store.removePending(key)
-		s.store.bcache.remove(key, true)
-	}
-
 	var err error
-	for i := 0; i <= lastIndx; i++ {
-		if e := s.delete(i); e != nil {
-			err = e
-		}
+	keys := s.keys()
+	for i := range keys {
+		err = errors.Join(err, s.delete(i))
 	}
 	return err
 }
@@ -244,6 +238,7 @@ type wSlice struct {
 	pendings    int
 	writeback   bool
 	tierID      uint8
+	kazSources  func(indx int) []KazBlockRef // kaz-2q: source blocks of a compaction output (cached_store_kaz.go)
 }
 
 func sliceForWrite(id uint64, store *cachedStore, tierID uint8) *wSlice {
@@ -309,6 +304,7 @@ func (s *wSlice) WriteAt(p []byte, off int64) (n int, err error) {
 	return n, nil
 }
 
+// put sends a compressed block and reports its payload length separately from the raw key suffix.
 func (store *cachedStore) put(ctx context.Context, key string, p *Page) error {
 	if store.upLimit != nil {
 		store.upLimit.Wait(int64(len(p.Data)))
@@ -323,7 +319,11 @@ func (store *cachedStore) put(ctx context.Context, key string, p *Page) error {
 		st := time.Now()
 		err := store.storage.Put(ctx, key, bytes.NewReader(p.Data), object.WithRequestID(&reqID), object.WithStorageClass(&sc))
 		used := time.Since(st)
-		logRequest("PUT", key, "", reqID, err, used)
+		param := ""
+		if used > SlowRequest || logger.IsLevelEnabled(logrus.DebugLevel) {
+			param = fmt.Sprintf("payload_bytes=%d ", len(p.Data))
+		}
+		logRequest("PUT", key, param, reqID, err, used)
 		store.objectDataBytes.WithLabelValues("PUT", sc).Add(float64(len(p.Data)))
 		store.objectReqsHistogram.WithLabelValues("PUT", sc).Observe(used.Seconds())
 		if err != nil {
@@ -365,7 +365,9 @@ func (store *cachedStore) upload(ctx context.Context, key string, block *Page, s
 		buf.Acquire()
 	}
 	defer buf.Release()
-	if sync && (blen < store.conf.BlockSize || store.conf.CacheLargeWrite) {
+	if sync && s.kazSources != nil {
+		store.kazCacheCompactionOutput(key, block, s.kazSources)
+	} else if sync && (blen < store.conf.BlockSize || store.conf.CacheLargeWrite) {
 		// block will be freed after written into disk
 		store.bcache.cache(key, block, false, false)
 	}
@@ -397,6 +399,7 @@ func (store *cachedStore) upload(ctx context.Context, key string, block *Page, s
 	return err
 }
 
+// upload stages writeback blocks before acknowledgment and tracks deferred cloud I/O through cleanup.
 func (s *wSlice) upload(indx int) {
 	blen := s.blockSize(indx)
 	key := s.key(indx)
@@ -423,42 +426,64 @@ func (s *wSlice) upload(indx int) {
 		ctx := context.WithValue(context.Background(), object.TierKey{}, s.tierID)
 		if s.writeback && blen < s.store.conf.WritebackThresholdSize {
 			stagingPath := "unknown"
+			var stageMu sync.Mutex
 			stageFailed := false
+			stageCompleted := false
 			block.Acquire()
-			err := utils.WithTimeout(context.TODO(), func(context.Context) (err error) { // In case it hangs for more than 5 minutes(see fileWriter.flush), fallback to uploading directly to avoid `EIO`
+			s.store.beginStageWrite(key)
+			err := utils.WithTimeout(context.TODO(), func(context.Context) (err error) {
 				defer block.Release()
-				stagingPath, err = s.store.bcache.stage(key, block.Data, s.tierID)
-				if err == nil && stageFailed { // upload thread already marked me as failed because of timeout
-					_ = s.store.bcache.removeStage(key)
+				defer s.store.endStageWrite(key)
+				path, err := s.store.bcache.stage(key, block.Data, s.tierID)
+				stageMu.Lock()
+				stagingPath = path
+				stageCompleted = true
+				discard := stageFailed && err == nil
+				stageMu.Unlock()
+				if discard {
+					if cleanupErr := s.store.retireCache(key); cleanupErr != nil {
+						logger.Warnf("retire timed-out stage %s: %s", key, cleanupErr)
+					}
 				}
 				return err
 			}, s.store.conf.PutTimeout)
 			if err != nil {
+				stageMu.Lock()
 				stageFailed = true
+				completed := stageCompleted
+				stageMu.Unlock()
+				// A callback may have completed just as the timeout selected the fallback.
+				if completed {
+					if cleanupErr := s.store.retireCache(key); cleanupErr != nil {
+						logger.Warnf("retire failed stage %s: %s", key, cleanupErr)
+					}
+				}
 				if !errors.Is(err, errStageConcurrency) {
 					s.store.stageBlockErrors.Add(1)
 					logger.Warnf("write %s to disk: %s, upload it directly", key, err)
 				}
 			} else {
-				s.errors <- nil
 				if s.store.conf.UploadDelay == 0 && s.store.canUpload() {
 					select {
 					case s.store.currentUpload <- struct{}{}:
-						defer func() { <-s.store.currentUpload }()
-						if err = s.store.upload(ctx, key, block, nil); err == nil {
-							s.store.bcache.uploaded(key, blen)
-							if err := s.store.bcache.removeStage(key); err != nil {
-								logger.Warnf("failed to remove stage %s in upload", stagingPath)
+						item := s.store.beginImmediateStaging(key, stagingPath, time.Now())
+						if item != nil {
+							s.errors <- nil
+							defer func() { s.store.endStagingUpload(key, item); <-s.store.currentUpload }()
+							if err = s.store.upload(ctx, key, block, nil); err == nil {
+								s.store.finishStagingUpload(key, item, blen)
 							}
-						} else { // add to delay list and wait for later scanning
-							s.store.addDelayedStaging(key, stagingPath, time.Now(), false)
+							// Failed canceled uploads must not recreate pending entries. Live entries remain for retry.
+							return
 						}
-						return
+						<-s.store.currentUpload
 					default:
 					}
 				}
-				block.Release()
+				// Pending intent must be visible before metadata can commit and retire the slice.
 				s.store.addDelayedStaging(key, stagingPath, time.Now(), false)
+				s.errors <- nil
+				block.Release()
 				return
 			}
 		}
@@ -546,6 +571,7 @@ type Config struct {
 	DownloadLimit          int64 // bytes per second
 	Writeback              bool
 	WritebackThresholdSize int
+	StagingNoSync          bool // skip fdatasync/directory fsync of staged writeback blocks (unsafe on OS crash)
 	UploadDelay            time.Duration
 	UploadHours            string
 	HashPrefix             bool
@@ -557,6 +583,32 @@ type Config struct {
 	BufferSize             uint64
 	Readahead              int
 	Prefetch               int
+	// FinishCanceledGet keeps a full-block GET running after its reader is canceled,
+	// and stores the block in the disk cache instead of discarding the download.
+	FinishCanceledGet bool
+	// GetHeaderTimeout bounds only the wait for the response headers of a full-block GET
+	// (0 disables it). GetTimeout still bounds the whole GET, headers and body together.
+	GetHeaderTimeout time.Duration
+
+	// kaz-2q cache eviction options (used only when CacheEviction is kaz-2q).
+	// KazCacheProbationRatio is the share of the cache capacity for newly cached blocks (0 < x < 1).
+	KazCacheProbationRatio float64
+	// KazCachePromoteDelay is the correlated-reference period before a block can be promoted.
+	KazCachePromoteDelay time.Duration
+	// KazCacheGhostRatio is the evicted-key list capacity as a multiple of the cache capacity (0 disables).
+	KazCacheGhostRatio float64
+	// KazCacheStateInterval is the save interval of the kaz-cache-state.v1 file.
+	KazCacheStateInterval time.Duration
+	// KazCacheCompactionPlacement selects the segment of a compaction output (inherit, probation, replace, share).
+	KazCacheCompactionPlacement string
+	// KazCacheCompactionPlacementShareRatio is the protected share threshold of the share placement (0 < x <= 1).
+	KazCacheCompactionPlacementShareRatio float64
+	// KazCacheDemoteUnreadFirst demotes protected blocks without the read mark before those with it.
+	KazCacheDemoteUnreadFirst bool
+	// KazCacheCompactionHotAge keeps protected compaction outputs younger than this out of protected placement (0 disables).
+	KazCacheCompactionHotAge time.Duration
+	// KazWholeReadMax makes a cache-enabled read of a block of at most this many bytes fetch the whole object instead of a range (0 disables).
+	KazWholeReadMax int
 }
 
 func (c *Config) SelfCheck(uuid string) {
@@ -620,13 +672,20 @@ func (c *Config) SelfCheck(uuid string) {
 	}
 	if c.CacheEviction == "" {
 		c.CacheEviction = Eviction2Random
-	} else if c.CacheEviction != Eviction2Random && c.CacheEviction != EvictionNone && c.CacheEviction != EvictionLRU {
-		logger.Warnf("cache-eviction should be one of [%s, %s, %s]", EvictionNone, Eviction2Random, EvictionLRU)
+	} else if c.CacheEviction != Eviction2Random && c.CacheEviction != EvictionNone && c.CacheEviction != EvictionLRU && c.CacheEviction != EvictionKaz2Q {
+		logger.Warnf("cache-eviction should be one of [%s, %s, %s, %s]", EvictionNone, Eviction2Random, EvictionLRU, EvictionKaz2Q)
 		c.CacheEviction = Eviction2Random
 	}
 	if c.CacheDir == "memory" && c.CacheEviction == EvictionLRU {
 		logger.Warnf("LRU eviction is not supported in memory cache mode yet, setting it to 2-random")
 		c.CacheEviction = Eviction2Random
+	}
+	if c.CacheDir == "memory" && c.CacheEviction == EvictionKaz2Q {
+		logger.Warnf("kaz-2q eviction is not supported in memory cache mode, setting it to 2-random")
+		c.CacheEviction = Eviction2Random
+	}
+	if c.CacheEviction == EvictionKaz2Q {
+		c.kazCacheSelfCheck()
 	}
 	if c.CacheExpire > 0 && c.CacheExpire < time.Second {
 		logger.Warnf("cache-expire it too short, setting it to 1 second")
@@ -664,22 +723,24 @@ func (c *Config) CacheEnabled() bool {
 }
 
 type cachedStore struct {
-	storage         object.ObjectStorage
-	bcache          CacheManager
-	fetcher         *prefetcher
-	conf            Config
-	group           *Controller
-	currentUpload   chan struct{}
-	currentDownload chan struct{}
-	pendingCh       chan *pendingItem
-	pendingKeys     map[string]*pendingItem
-	pendingMutex    sync.Mutex
-	startHour       int
-	endHour         int
-	compressor      compress.Compressor
-	seekable        bool
-	upLimit         *ratelimit.Bucket
-	downLimit       *ratelimit.Bucket
+	storage           object.ObjectStorage
+	bcache            CacheManager
+	fetcher           *prefetcher
+	conf              Config
+	group             *Controller
+	currentUpload     chan struct{}
+	currentDownload   chan struct{}
+	pendingCh         chan *pendingItem
+	pendingKeys       map[string]*pendingItem
+	activeStaging     map[string]int // Protected by pendingMutex; bounded by currentUpload slots.
+	activeStageWrites map[string]int // Actual stage callbacks, including callbacks surviving their timeout.
+	pendingMutex      sync.Mutex
+	startHour         int
+	endHour           int
+	compressor        compress.Compressor
+	seekable          bool
+	upLimit           *ratelimit.Bucket
+	downLimit         *ratelimit.Bucket
 
 	cacheHits           prometheus.Counter
 	cacheMiss           prometheus.Counter
@@ -691,6 +752,16 @@ type cachedStore struct {
 	objectDataBytes     *prometheus.CounterVec
 	stageBlockDelay     prometheus.Counter
 	stageBlockErrors    prometheus.Counter
+
+	// detachedFetches bounds the GETs kept running for canceled readers (FinishCanceledGet).
+	detachedFetches     chan struct{}
+	canceledGetFinished prometheus.Counter
+	canceledGetDropped  prometheus.Counter
+	getHeaderTimeouts   prometheus.Counter
+
+	// headerTimedOut remembers keys recently cut by GetHeaderTimeout (key -> time).
+	headerTimedOutMu sync.Mutex
+	headerTimedOut   map[string]time.Time
 }
 
 func logRequest(typeStr, key, param, reqID string, err error, used time.Duration) {
@@ -703,12 +774,71 @@ func logRequest(typeStr, key, param, reqID string, err error, used time.Duration
 
 var errTryFullRead = errors.New("try full read")
 
+// headerTimeoutMemory is how long a key cut by GetHeaderTimeout is remembered.
+var headerTimeoutMemory = 5 * time.Minute
+
+// maxHeaderTimedOut bounds the number of remembered keys.
+const maxHeaderTimedOut = 4096
+
+// headerTimedOutRecently reports whether key was cut by GetHeaderTimeout within
+// headerTimeoutMemory, forgetting it once that has passed.
+func (store *cachedStore) headerTimedOutRecently(key string) bool {
+	store.headerTimedOutMu.Lock()
+	defer store.headerTimedOutMu.Unlock()
+	t, ok := store.headerTimedOut[key]
+	if ok && time.Since(t) > headerTimeoutMemory {
+		delete(store.headerTimedOut, key)
+		return false
+	}
+	return ok
+}
+
+// rememberHeaderTimeout records that key was cut by GetHeaderTimeout.
+// When too many keys are remembered, the expired ones are dropped first and,
+// if that is not enough, all of them.
+func (store *cachedStore) rememberHeaderTimeout(key string) {
+	store.headerTimedOutMu.Lock()
+	defer store.headerTimedOutMu.Unlock()
+	if store.headerTimedOut == nil {
+		store.headerTimedOut = make(map[string]time.Time)
+	}
+	if len(store.headerTimedOut) >= maxHeaderTimedOut {
+		for k, t := range store.headerTimedOut {
+			if time.Since(t) > headerTimeoutMemory {
+				delete(store.headerTimedOut, k)
+			}
+		}
+		if len(store.headerTimedOut) >= maxHeaderTimedOut {
+			clear(store.headerTimedOut)
+		}
+	}
+	store.headerTimedOut[key] = time.Now()
+}
+
+// forgetHeaderTimeout drops key once it has been downloaded.
+func (store *cachedStore) forgetHeaderTimeout(key string) {
+	store.headerTimedOutMu.Lock()
+	defer store.headerTimedOutMu.Unlock()
+	delete(store.headerTimedOut, key)
+}
+
+// errGetHeaderTimeout reports a full-block GET abandoned by GetHeaderTimeout.
+var errGetHeaderTimeout = errors.New("no response headers within --kaz-get-header-timeout")
+
+// getResult holds what one GET callback produced. The callback fills its own
+// copy and the caller adopts it only when utils.WithTimeout reports success, so
+// a callback abandoned by a timeout or cancel can neither race with the caller
+// nor turn a failed read into a success (upstream #7500).
 type getResult struct {
 	n     int
 	reqID string
 	sc    string
 }
 
+// loadRange reads len(page.Data) bytes of key at off with a range GET.
+// It returns errTryFullRead only for failures after which a full read is safe;
+// a timeout is returned as is, because the abandoned GET may still be writing
+// into page (upstream #7509/#7520).
 func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page, off int) (int, error) {
 	p := page.Data
 	fullPage, err := store.group.TryPiggyback(key)
@@ -751,7 +881,9 @@ func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page,
 	store.objectDataBytes.WithLabelValues("GET", res.sc).Add(float64(res.n))
 	store.objectReqsHistogram.WithLabelValues("GET", res.sc).Observe(used.Seconds())
 	if err == nil {
-		store.fetcher.fetch(key)
+		if !store.kazCompactionRead(ctx) {
+			store.fetcher.fetch(key)
+		}
 		return res.n, nil
 	}
 	store.objectReqErrors.Add(1)
@@ -762,15 +894,167 @@ func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page,
 	return 0, errTryFullRead
 }
 
+// readBlockDetached reads p from a full block fetched by a GET that is not tied to ctx.
+// If ctx is canceled first, the caller returns at once while the GET goes on in the
+// background and caches the block (see loadDetached). The fetch always uses its own
+// page, so nothing writes into the caller's buffer after it has returned.
+func (s *rSlice) readBlockDetached(ctx context.Context, p []byte, key string, boff, blockSize int) (int, error) {
+	type result struct {
+		block *Page
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		block, err := s.store.group.Execute(key, func() (*Page, error) {
+			tmp := NewOffPage(blockSize)
+			return tmp, s.store.loadDetached(ctx, key, tmp)
+		})
+		done <- result{block, err}
+	}()
+	select {
+	case r := <-done:
+		defer r.block.Release()
+		if r.err != nil {
+			return 0, r.err
+		}
+		copy(p, r.block.Data[boff:])
+		return len(p), nil
+	case <-ctx.Done():
+		go func() { (<-done).block.Release() }()
+		return 0, ctx.Err()
+	}
+}
+
+// loadDetached downloads a full block into page and caches it, for readBlockDetached.
+// It gives up while waiting for a download slot if ctx ends, because no request has
+// been sent yet. Once the GET has started, a cancel of ctx no longer stops it, as long
+// as fewer than detachedFetches GETs are already running this way; above that limit
+// the GET is canceled as before. GetTimeout still applies.
+func (store *cachedStore) loadDetached(ctx context.Context, key string, page *Page) error {
+	select {
+	case store.currentDownload <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-store.currentDownload }()
+
+	gctx, gcancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer gcancel()
+	const (
+		running = iota
+		detached
+		finished
+	)
+	var mu sync.Mutex
+	state := running
+	stop := context.AfterFunc(ctx, func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if state != running {
+			return
+		}
+		select {
+		case store.detachedFetches <- struct{}{}:
+			state = detached
+		default:
+			store.canceledGetDropped.Inc()
+			gcancel()
+		}
+	})
+	defer stop()
+
+	err := store.fetchBlock(gctx, key, page, true, false)
+
+	mu.Lock()
+	wasDetached := state == detached
+	state = finished
+	mu.Unlock()
+	if wasDetached {
+		<-store.detachedFetches
+		if err == nil {
+			store.canceledGetFinished.Inc()
+			logger.Debugf("finished GET %s after its reader was canceled, block cached", key)
+		}
+	}
+	return err
+}
+
+// cancelOnClose ends the request context of a GET when its body is closed.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+// Close closes the body and then releases its request context.
+func (c *cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
+}
+
+// getWithHeaderTimeout gets the whole object key, giving up with errGetHeaderTimeout
+// when Get (which returns once the response headers arrive) takes longer than
+// GetHeaderTimeout. After the headers, the body is read under ctx only, so a slow body
+// is still bounded by GetTimeout alone. Abandoned GETs are retried by the caller's
+// usual retry path.
+//
+// A key cut within headerTimeoutMemory is fetched again without the header timeout:
+// some objects (e.g. on Google Drive) always take longer than it to answer, and
+// cutting every retry would use up the read retries and fail the read with EIO.
+func (store *cachedStore) getWithHeaderTimeout(ctx context.Context, key string, getters ...object.AttrGetter) (io.ReadCloser, error) {
+	timeout := store.conf.GetHeaderTimeout
+	if timeout <= 0 {
+		return store.storage.Get(ctx, key, 0, -1, getters...)
+	}
+	if store.headerTimedOutRecently(key) {
+		in, err := store.storage.Get(ctx, key, 0, -1, getters...)
+		if err == nil {
+			store.forgetHeaderTimeout(key)
+		}
+		return in, err
+	}
+	hctx, cancel := context.WithCancel(ctx)
+	var fired atomic.Bool
+	timer := time.AfterFunc(timeout, func() {
+		fired.Store(true)
+		cancel()
+	})
+	in, err := store.storage.Get(hctx, key, 0, -1, getters...)
+	if !timer.Stop() && fired.Load() {
+		if in != nil {
+			_ = in.Close()
+		}
+		cancel()
+		if ctx.Err() != nil { // the caller gave up first; report that instead
+			return nil, ctx.Err()
+		}
+		store.getHeaderTimeouts.Inc()
+		store.rememberHeaderTimeout(key)
+		logger.Warnf("GET %s: %s (%s), will retry without it", key, errGetHeaderTimeout, timeout)
+		return nil, fmt.Errorf("%w (%s)", errGetHeaderTimeout, timeout)
+	}
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return &cancelOnClose{in, cancel}, nil
+}
+
 func (store *cachedStore) load(ctx context.Context, key string, page *Page, cache bool, forceCache bool) (err error) {
+	store.currentDownload <- struct{}{}
+	defer func() { <-store.currentDownload }()
+	return store.fetchBlock(ctx, key, page, cache, forceCache)
+}
+
+// fetchBlock downloads the whole object key into page and optionally caches it.
+// The caller must hold a currentDownload slot.
+func (store *cachedStore) fetchBlock(ctx context.Context, key string, page *Page, cache bool, forceCache bool) (err error) {
 	defer func() {
 		e := recover()
 		if e != nil {
 			err = fmt.Errorf("recovered from %s", e)
 		}
 	}()
-	store.currentDownload <- struct{}{}
-	defer func() { <-store.currentDownload }()
 	needed := store.compressor.CompressBound(len(page.Data))
 	compressed := needed > len(page.Data)
 	// we don't know the actual size for compressed block
@@ -793,7 +1077,7 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 	err = utils.WithTimeout(ctx, func(cCtx context.Context) error {
 		defer p.Release()
 		// it will be retried in the upper layer.
-		in, getErr := store.storage.Get(cCtx, key, 0, -1, object.WithRequestID(&tmp.reqID), object.WithStorageClass(&tmp.sc))
+		in, getErr := store.getWithHeaderTimeout(cCtx, key, object.WithRequestID(&tmp.reqID), object.WithStorageClass(&tmp.sc))
 		if getErr == nil {
 			tmp.n, getErr = io.ReadFull(in, p.Data)
 			_ = in.Close()
@@ -819,7 +1103,7 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 	store.objectReqsHistogram.WithLabelValues("GET", res.sc).Observe(used.Seconds())
 	if err != nil {
 		store.objectReqErrors.Add(1)
-		return fmt.Errorf("get %s: %s", key, err)
+		return fmt.Errorf("get %s: %w", key, err)
 	}
 	if compressed {
 		res.n, err = store.compressor.Decompress(page.Data, p.Data[:res.n])
@@ -849,15 +1133,18 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		config.PutTimeout = time.Second * 60
 	}
 	store := &cachedStore{
-		storage:         storage,
-		conf:            config,
-		currentUpload:   make(chan struct{}, config.MaxUpload),
-		currentDownload: make(chan struct{}, config.MaxDownload),
-		compressor:      compressor,
-		seekable:        compressor.CompressBound(0) == 0,
-		pendingCh:       make(chan *pendingItem, 100*config.MaxUpload),
-		pendingKeys:     make(map[string]*pendingItem),
-		group:           NewController(),
+		storage:           storage,
+		conf:              config,
+		currentUpload:     make(chan struct{}, config.MaxUpload),
+		currentDownload:   make(chan struct{}, config.MaxDownload),
+		detachedFetches:   make(chan struct{}, max(1, config.MaxDownload/2)),
+		compressor:        compressor,
+		seekable:          compressor.CompressBound(0) == 0,
+		pendingCh:         make(chan *pendingItem, 100*config.MaxUpload),
+		pendingKeys:       make(map[string]*pendingItem),
+		activeStaging:     make(map[string]int),
+		activeStageWrites: make(map[string]int),
+		group:             NewController(),
 	}
 	if config.UploadLimit > 0 {
 		// there are overheads coming from HTTP/TCP/IP
@@ -982,6 +1269,18 @@ func (store *cachedStore) initMetrics() {
 		Name: "staging_block_errors",
 		Help: "Total errors when staging blocks",
 	})
+	store.canceledGetFinished = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "kaz_canceled_get_finished",
+		Help: "Full-block GETs finished and cached after their reader was canceled.",
+	})
+	store.canceledGetDropped = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "kaz_canceled_get_dropped",
+		Help: "Full-block GETs aborted on cancel because too many were already kept running.",
+	})
+	store.getHeaderTimeouts = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "kaz_get_header_timeouts",
+		Help: "Full-block GETs abandoned because no response headers arrived within --kaz-get-header-timeout.",
+	})
 }
 
 func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
@@ -996,6 +1295,9 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(store.objectReqsHistogram)
 	reg.MustRegister(store.objectReqErrors)
 	reg.MustRegister(store.objectDataBytes)
+	reg.MustRegister(store.canceledGetFinished)
+	reg.MustRegister(store.canceledGetDropped)
+	reg.MustRegister(store.getHeaderTimeouts)
 	reg.MustRegister(store.stageBlockDelay)
 	reg.MustRegister(store.stageBlockErrors)
 	reg.MustRegister(prometheus.NewGaugeFunc(
@@ -1036,22 +1338,19 @@ func parseObjOrigSize(key string) int {
 	return l
 }
 
+// uploadStagingFile checks pending intent and keeps actual PUT/cleanup visible to durable GC.
 func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 	store.currentUpload <- struct{}{}
 	defer func() {
 		<-store.currentUpload
 	}()
 
-	store.pendingMutex.Lock()
-	item, ok := store.pendingKeys[key]
-	store.pendingMutex.Unlock()
-	if !ok {
+	item := store.beginStagingUpload(key)
+	if item == nil {
 		logger.Debugf("Key %s is not needed, drop it", key)
 		return
 	}
-	defer func() {
-		item.uploading.Store(false)
-	}()
+	defer store.endStagingUpload(key, item)
 
 	if !store.canUpload() {
 		return
@@ -1084,7 +1383,7 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 		logger.Errorf("Read staging file %s: %s", stagingPath, err)
 		return
 	}
-	if !store.isPendingValid(key) {
+	if !store.isPendingItem(key, item) {
 		block.Release()
 		logger.Debugf("Key %s is not needed, drop it", key)
 		return
@@ -1092,27 +1391,119 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 	ctx := context.WithValue(context.Background(), object.TierKey{}, tierID)
 	store.stageBlockDelay.Add(time.Since(item.ts).Seconds())
 	if err = store.upload(ctx, key, block, nil); err == nil {
-		if !store.isPendingValid(key) { // Delete leaked objects if it's already deleted by other goroutines
-			err := store.delete(key)
-			logger.Infof("Key %s is not needed, abandoned, err: %v", key, err)
-		} else {
-			store.bcache.uploaded(key, blen)
-			store.removePending(key)
-			if err := store.bcache.removeStage(key); err != nil {
-				logger.Warnf("failed to remove stage %s, in upload staging file", stagingPath)
-			}
-		}
+		store.finishStagingUpload(key, item, blen)
 	}
 }
 
+// beginStageWrite keeps a late local stage callback visible to durable GC retirement.
+func (store *cachedStore) beginStageWrite(key string) {
+	store.pendingMutex.Lock()
+	defer store.pendingMutex.Unlock()
+	if store.activeStageWrites == nil {
+		store.activeStageWrites = make(map[string]int)
+	}
+	store.activeStageWrites[key]++
+}
+
+// endStageWrite drops tracking only after a late callback's local cleanup has completed.
+func (store *cachedStore) endStageWrite(key string) {
+	store.pendingMutex.Lock()
+	defer store.pendingMutex.Unlock()
+	if store.activeStageWrites[key] <= 1 {
+		delete(store.activeStageWrites, key)
+	} else {
+		store.activeStageWrites[key]--
+	}
+}
+
+// beginStagingUpload registers actual I/O before retirement can remove its pending entry.
+// The caller owns a currentUpload slot before calling this method.
+func (store *cachedStore) beginStagingUpload(key string) *pendingItem {
+	store.pendingMutex.Lock()
+	defer store.pendingMutex.Unlock()
+	item := store.pendingKeys[key]
+	if item != nil {
+		if store.activeStaging == nil {
+			store.activeStaging = make(map[string]int)
+		}
+		store.activeStaging[key]++
+	}
+	return item
+}
+
+// beginImmediateStaging publishes pending and active state before a writeback writer acknowledges staging.
+func (store *cachedStore) beginImmediateStaging(key, path string, added time.Time) *pendingItem {
+	store.pendingMutex.Lock()
+	defer store.pendingMutex.Unlock()
+	item := store.pendingKeys[key]
+	if item == nil {
+		item = &pendingItem{key: key, fpath: path, ts: added}
+		store.pendingKeys[key] = item
+	}
+	if !item.uploading.CompareAndSwap(false, true) {
+		return nil
+	}
+	if store.activeStaging == nil {
+		store.activeStaging = make(map[string]int)
+	}
+	store.activeStaging[key]++
+	return item
+}
+
+// endStagingUpload releases bounded active bookkeeping after upload and cleanup have finished.
+func (store *cachedStore) endStagingUpload(key string, item *pendingItem) {
+	store.pendingMutex.Lock()
+	defer store.pendingMutex.Unlock()
+	if store.activeStaging[key] <= 1 {
+		delete(store.activeStaging, key)
+	} else {
+		store.activeStaging[key]--
+	}
+	item.uploading.Store(false)
+}
+
+// isPendingItem distinguishes the current upload from a canceled older generation.
+func (store *cachedStore) isPendingItem(key string, item *pendingItem) bool {
+	store.pendingMutex.Lock()
+	defer store.pendingMutex.Unlock()
+	return store.pendingKeys[key] == item
+}
+
+// finishStagingUpload keeps abandoned cleanup inside the active-I/O guard.
+func (store *cachedStore) finishStagingUpload(key string, item *pendingItem, blen int) {
+	if !store.isPendingItem(key, item) {
+		err := store.delete(key)
+		logger.Infof("Key %s is not needed, abandoned, err: %v", key, err)
+		return
+	}
+	store.bcache.uploaded(key, blen)
+	store.pendingMutex.Lock()
+	if store.pendingKeys[key] == item {
+		delete(store.pendingKeys, key)
+	}
+	store.pendingMutex.Unlock()
+	if err := store.bcache.removeStage(key); err != nil {
+		logger.Warnf("failed to remove stage %s after upload: %s", key, err)
+	}
+}
+
+// addDelayedStaging drops known absent files and retains intent when file presence is uncertain.
 func (store *cachedStore) addDelayedStaging(key, stagingPath string, added time.Time, force bool) bool {
 	store.pendingMutex.Lock()
+	_, statErr := os.Stat(stagingPath)
+	if os.IsNotExist(statErr) {
+		store.pendingMutex.Unlock()
+		return false
+	}
 	item := store.pendingKeys[key]
 	if item == nil {
 		item = &pendingItem{key, stagingPath, added, atomic.Bool{}}
 		store.pendingKeys[key] = item
 	}
 	store.pendingMutex.Unlock()
+	if statErr != nil {
+		logger.Warnf("staging admission could not stat %s: %s; pending intent retained", key, statErr)
+	}
 	if force || store.canUpload() && time.Since(added) > store.conf.UploadDelay {
 		if item.uploading.CompareAndSwap(false, true) {
 			select {
@@ -1180,6 +1571,49 @@ func (store *cachedStore) NewWriter(id uint64, tierID uint8) Writer {
 	return sliceForWrite(id, store, tierID)
 }
 
+// ErrSliceUploadInFlight means persisted GC intent must remain until staging writes/uploads finish.
+var ErrSliceUploadInFlight = errors.New("slice has an in-flight staging upload")
+
+// retireCache cancels cache/stage files without object storage I/O and propagates unlink failures.
+func (store *cachedStore) retireCache(key string) error {
+	if cache, ok := store.bcache.(interface{ retire(string) error }); ok {
+		return cache.retire(key)
+	}
+	store.bcache.remove(key, true)
+	return store.bcache.removeStage(key)
+}
+
+// Retire cancels local data only for slice references already durably retired by metadata.
+// An in-flight error is retryable: the caller must retain its durable dead marker and
+// must not hand physical deletion off as completed while a PUT can recreate the object.
+func (store *cachedStore) Retire(id uint64, length int) error {
+	keys := sliceForRead(id, length, store).keys()
+	var err error
+	busy := false
+	cancel := func() {
+		store.pendingMutex.Lock()
+		defer store.pendingMutex.Unlock()
+		for _, key := range keys {
+			delete(store.pendingKeys, key)
+			if store.activeStaging[key] > 0 || store.activeStageWrites[key] > 0 {
+				busy = true
+			}
+		}
+	}
+	cancel()
+	for _, key := range keys {
+		err = errors.Join(err, store.retireCache(key))
+	}
+	// A scanner can register and start between initial cancellation and local unlink.
+	// Rechecking after unlink sees that I/O; later admission rejects the absent stage file.
+	cancel()
+	if busy {
+		err = errors.Join(err, ErrSliceUploadInFlight)
+	}
+	return err
+}
+
+// Remove retires local staging and then deletes cloud blocks after active uploads finish.
 func (store *cachedStore) Remove(id uint64, length int) error {
 	r := sliceForRead(id, length, store)
 	return r.Remove()

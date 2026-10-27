@@ -121,6 +121,7 @@ type SecurityConfig struct {
 	EnableSELinux bool
 }
 
+// Config controls VFS caching, write scheduling and flush completion policy.
 type Config struct {
 	Meta *meta.Config
 	// Format is the startup snapshot; Meta.GetFormat returns the current one
@@ -136,9 +137,15 @@ type Config struct {
 	ReaddirCache         bool
 	BackupMeta           time.Duration
 	BackupSkipTrash      bool
-	FastResolve          bool   `json:",omitempty"`
-	AccessLog            string `json:",omitempty"`
-	Subdir               string `json:",omitempty"`
+	SliceFlushWait       time.Duration
+	SliceFlushIdle       time.Duration
+	WriterReuseWindow    int           // Distance before freezing nonmatching old slices; zero uses four.
+	WriterFlushTimeout   time.Duration // 0 waits without a deadline; AutoWriterFlushTimeout uses the legacy deadline.
+	WriterFlushScope     string        // WriterFlushScopeFile (default) or WriterFlushScopeRange for Read/Fallocate barriers.
+	MetaWriteBatch       int           // Maximum slices of one chunk committed per metadata transaction; 0 disables batching.
+	FastResolve          bool          `json:",omitempty"`
+	AccessLog            string        `json:",omitempty"`
+	Subdir               string        `json:",omitempty"`
 	PrefixInternal       bool
 	HideInternal         bool
 	RootSquash           *AnonymousAccount `json:",omitempty"`
@@ -601,6 +608,7 @@ func (v *VFS) marshalConf() []byte {
 	return data
 }
 
+// Truncate flushes pending writes before changing file length.
 func (v *VFS) Truncate(ctx Context, ino Ino, size int64, fh uint64, attr *Attr) (err syscall.Errno) {
 	// defer func() { logit(ctx, "truncate (%d,%d): %s", ino, size, strerr(err)) }()
 	if IsSpecialNode(ino) {
@@ -624,7 +632,7 @@ func (v *VFS) Truncate(ctx Context, ino Ino, size int64, fh uint64, attr *Attr) 
 		}
 		defer func(h *handle) { h.Wunlock() }(h)
 	}
-	_ = v.writer.Flush(ctx, ino)
+	_ = v.writer.Flush(WithWriterFlushOrigin(ctx, "vfs.Truncate"), ino)
 	if fh == 0 {
 		err = v.Meta.Truncate(ctx, ino, 0, uint64(size), attr, false)
 	} else {
@@ -652,6 +660,7 @@ func (v *VFS) ReleaseHandler(ino Ino, fh uint64) {
 	v.releaseFileHandle(ino, fh)
 }
 
+// Release flushes pending writes before releasing the file handle.
 func (v *VFS) Release(ctx Context, ino Ino, fh uint64) {
 	var err syscall.Errno
 	defer func() { logit(ctx, "release", err, "(%d,%d)", ino, fh) }()
@@ -679,7 +688,7 @@ func (v *VFS) Release(ctx Context, ino Ino, fh uint64) {
 			powner := f.ofdOwner
 			f.Unlock()
 			if f.writer != nil {
-				_ = f.writer.Flush(ctx)
+				_ = f.writer.Flush(WithWriterFlushOrigin(ctx, "vfs.Release"))
 				v.invalidateAttr(ino)
 			}
 			if locks&1 != 0 {
@@ -698,6 +707,7 @@ func hasReadPerm(flag uint32) bool {
 	return (flag & O_ACCMODE) != syscall.O_WRONLY
 }
 
+// Read flushes pending writes before fetching data and preserves preflush failures.
 func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n int, err syscall.Errno) {
 	size := uint32(len(buf))
 	if IsSpecialNode(ino) {
@@ -783,13 +793,23 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 		err = syscall.EBADF
 		return
 	}
+	// With range barriers, do most of the waiting before taking the handle lock so
+	// writes through the same handle are not blocked; the barrier below then only
+	// has to commit writes that completed in the meantime.
+	if err = v.prelockFlush(WithWriterFlushOrigin(ctx, "vfs.Read.prelock"), ino, off, uint64(len(buf))); err != 0 {
+		return
+	}
 	if !h.Rlock(ctx) {
 		err = syscall.EINTR
 		return
 	}
 	defer h.Runlock()
+	defer h.removeOp(ctx)
 
-	_ = v.writer.Flush(ctx, ino)
+	// Reads must not expose old metadata when pending writes could not be committed.
+	if err = v.flushForRange(WithWriterFlushOrigin(ctx, "vfs.Read"), ino, off, uint64(len(buf))); err != 0 {
+		return
+	}
 	n, err = h.reader.Read(ctx, off, buf)
 	for err == syscall.EAGAIN {
 		n, err = h.reader.Read(ctx, off, buf)
@@ -797,7 +817,6 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 	if err == syscall.ENOENT {
 		err = syscall.EBADF
 	}
-	h.removeOp(ctx)
 	return
 }
 
@@ -865,6 +884,7 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 	return
 }
 
+// Fallocate flushes pending writes before changing allocated file ranges.
 func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh uint64) (err syscall.Errno) {
 	defer func() { logit(ctx, "fallocate", err, "(%d,%d,%d,%d)", ino, mode, off, size) }()
 	if off < 0 || size <= 0 {
@@ -888,6 +908,10 @@ func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh ui
 		err = syscall.EBADF
 		return
 	}
+	// As in Read: wait for in-range commits before locking the handle.
+	if err = v.prelockFlush(WithWriterFlushOrigin(ctx, "vfs.Fallocate.prelock"), ino, uint64(off), uint64(size)); err != 0 {
+		return
+	}
 	if !h.Wlock(ctx) {
 		err = syscall.EINTR
 		return
@@ -895,14 +919,25 @@ func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh ui
 	defer h.Wunlock()
 	defer h.removeOp(ctx)
 
-	err = v.writer.Flush(ctx, ino)
+	err = v.flushForRange(WithWriterFlushOrigin(ctx, "vfs.Fallocate"), ino, uint64(off), uint64(size))
 	if err != 0 {
 		return
 	}
 	var length uint64
-	err = v.Meta.Fallocate(ctx, ino, mode, uint64(off), uint64(size), &length)
+	// Fallocate sets mtime to now; ordering it with slice commits keeps pending
+	// commits from moving it back.
+	err = v.writer.UpdateMeta(ino, func() syscall.Errno {
+		return v.Meta.Fallocate(ctx, ino, mode, uint64(off), uint64(size), &length)
+	})
 	if err == 0 {
-		v.writer.Truncate(ino, length)
+		if v.Conf.WriterFlushScope == WriterFlushScopeRange {
+			// Uncommitted appends outside the range are not in the metadata length yet,
+			// and fallocate never shrinks a file, so keep the larger writer length.
+			v.writer.GrowTo(ino, length)
+			length = max(length, v.writer.GetLength(ino))
+		} else {
+			v.writer.Truncate(ino, length)
+		}
 		s := size
 		if off+size > int64(length) {
 			s = int64(length) - off
@@ -915,6 +950,28 @@ func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh ui
 	return
 }
 
+// flushForRange commits the pending writes a Read or Fallocate of [off, off+size)
+// depends on: only those of the touched chunks with --writer-flush-scope=range,
+// otherwise every pending write of the file. fsync, close, truncate and
+// copy_file_range keep using whole-file flushes.
+func (v *VFS) flushForRange(ctx meta.Context, ino Ino, off, size uint64) syscall.Errno {
+	if v.Conf.WriterFlushScope == WriterFlushScopeRange {
+		return v.writer.FlushRange(ctx, ino, off, size)
+	}
+	return v.writer.Flush(ctx, ino)
+}
+
+// prelockFlush runs a range barrier before the handle lock is taken, so the
+// barrier taken under the lock only waits for writes that arrive meanwhile.
+// It does nothing for whole-file barriers, whose flush already stops writes.
+func (v *VFS) prelockFlush(ctx meta.Context, ino Ino, off, size uint64) syscall.Errno {
+	if v.Conf.WriterFlushScope == WriterFlushScopeRange {
+		return v.writer.FlushRange(ctx, ino, off, size)
+	}
+	return 0
+}
+
+// CopyFileRange flushes both files before copying committed slices.
 func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut Ino, fhOut, offOut, size uint64, flags uint32) (copied uint64, err syscall.Errno) {
 	defer func() {
 		logit(ctx, "copy_file_range", err, "(%d,%d,%d,%d,%d,%d)", nodeIn, offIn, nodeOut, offOut, size, flags)
@@ -973,11 +1030,11 @@ func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut
 		defer hi.removeOp(ctx)
 	}
 
-	err = v.writer.Flush(ctx, nodeIn)
+	err = v.writer.Flush(WithWriterFlushOrigin(ctx, "vfs.CopyFileRange.source"), nodeIn)
 	if err != 0 {
 		return
 	}
-	err = v.writer.Flush(ctx, nodeOut)
+	err = v.writer.Flush(WithWriterFlushOrigin(ctx, "vfs.CopyFileRange.destination"), nodeOut)
 	if err != 0 {
 		return
 	}
@@ -991,6 +1048,7 @@ func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut
 	return
 }
 
+// Flush waits for pending writer data and metadata.
 func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err syscall.Errno) {
 	if ino == controlInode && runtime.GOOS == "darwin" {
 		fh = v.getControlHandle(ctx.Pid())
@@ -1014,7 +1072,7 @@ func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err sysc
 			h.cancelOp(ctx.Pid())
 		}
 
-		err = h.writer.Flush(ctx)
+		err = h.writer.Flush(WithWriterFlushOrigin(ctx, "vfs.Flush"))
 		if err == syscall.ENOENT || err == syscall.EPERM || err == syscall.EINVAL {
 			err = syscall.EBADF
 		}
@@ -1036,6 +1094,7 @@ func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err sysc
 	return
 }
 
+// Fsync waits for pending writer data and metadata.
 func (v *VFS) Fsync(ctx Context, ino Ino, datasync int, fh uint64) (err syscall.Errno) {
 	defer func() { logit(ctx, "fsync", err, "(%d,%d)", ino, datasync) }()
 	if IsSpecialNode(ino) {
@@ -1053,7 +1112,7 @@ func (v *VFS) Fsync(ctx Context, ino Ino, datasync int, fh uint64) (err syscall.
 		defer h.Wunlock()
 		defer h.removeOp(ctx)
 
-		err = h.writer.Flush(ctx)
+		err = h.writer.Flush(WithWriterFlushOrigin(ctx, "vfs.Fsync"))
 		if err == syscall.ENOENT || err == syscall.EPERM || err == syscall.EINVAL {
 			err = syscall.EBADF
 		}

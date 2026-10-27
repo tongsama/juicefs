@@ -1339,6 +1339,7 @@ func (f *File) Pread(ctx meta.Context, b []byte, offset int64) (n int, err error
 	return
 }
 
+// pread flushes pending writes before reading committed contents.
 func (f *File) pread(ctx meta.Context, b []byte, offset int64) (n int, err error) {
 	if offset >= f.info.Size() {
 		return 0, io.EOF
@@ -1351,7 +1352,7 @@ func (f *File) pread(ctx meta.Context, b []byte, offset int64) (n int, err error
 		return n, nil
 	}
 	if f.wdata != nil {
-		eno := f.wdata.Flush(ctx)
+		eno := f.wdata.Flush(vfs.WithWriterFlushOrigin(ctx, "fs.pread"))
 		if eno != 0 {
 			err = eno
 			return
@@ -1397,13 +1398,14 @@ func (f *File) Pwrite(ctx meta.Context, b []byte, offset int64) (n int, err sysc
 	return
 }
 
+// pwrite writes buffered file data and closes the writer on failure.
 func (f *File) pwrite(ctx meta.Context, b []byte, offset int64) (n int, err syscall.Errno) {
 	if f.wdata == nil {
 		f.wdata = f.fs.writer.Open(f.inode, uint64(f.info.Size()), f.info.attr.Tier)
 	}
 	err = f.wdata.Write(ctx, uint64(offset), b)
 	if err != 0 {
-		_ = f.wdata.Close(meta.Background())
+		_ = f.wdata.Close(vfs.WithWriterFlushOrigin(meta.Background(), "fs.pwrite"))
 		f.wdata = nil
 		return
 	}
@@ -1414,6 +1416,7 @@ func (f *File) pwrite(ctx meta.Context, b []byte, offset int64) (n int, err sysc
 	return len(b), 0
 }
 
+// Truncate flushes pending writes before changing file length.
 func (f *File) Truncate(ctx meta.Context, length uint64) (err syscall.Errno) {
 	defer trace.StartRegion(context.TODO(), "fs.Truncate").End()
 	f.Lock()
@@ -1421,7 +1424,7 @@ func (f *File) Truncate(ctx meta.Context, length uint64) (err syscall.Errno) {
 	l := vfs.NewLogContext(ctx)
 	defer func() { f.fs.log(l, "Truncate (%s,%d): %s", f.path, length, errstr(err)) }()
 	if f.wdata != nil {
-		err = f.wdata.Flush(ctx)
+		err = f.wdata.Flush(vfs.WithWriterFlushOrigin(ctx, "fs.Truncate"))
 		if err != 0 {
 			return
 		}
@@ -1437,6 +1440,7 @@ func (f *File) Truncate(ctx meta.Context, length uint64) (err syscall.Errno) {
 	return
 }
 
+// Flush waits for pending writer data and metadata.
 func (f *File) Flush(ctx meta.Context) (err syscall.Errno) {
 	defer trace.StartRegion(context.TODO(), "fs.Flush").End()
 	f.Lock()
@@ -1446,11 +1450,12 @@ func (f *File) Flush(ctx meta.Context) (err syscall.Errno) {
 	}
 	l := vfs.NewLogContext(ctx)
 	defer func() { f.fs.log(l, "Flush (%s): %s", f.path, errstr(err)) }()
-	err = f.wdata.Flush(ctx)
+	err = f.wdata.Flush(vfs.WithWriterFlushOrigin(ctx, "fs.Flush"))
 	f.fs.InvalidateAttr(f.inode)
 	return
 }
 
+// Fsync waits for pending writer data and metadata.
 func (f *File) Fsync(ctx meta.Context) (err syscall.Errno) {
 	defer trace.StartRegion(context.TODO(), "fs.Fsync").End()
 	f.Lock()
@@ -1460,11 +1465,12 @@ func (f *File) Fsync(ctx meta.Context) (err syscall.Errno) {
 	}
 	l := vfs.NewLogContext(ctx)
 	defer func() { f.fs.log(l, "Fsync (%s): %s", f.path, errstr(err)) }()
-	err = f.wdata.Flush(ctx)
+	err = f.wdata.Flush(vfs.WithWriterFlushOrigin(ctx, "fs.Fsync"))
 	f.fs.InvalidateAttr(f.inode)
 	return
 }
 
+// Close flushes pending writes before closing the file.
 func (f *File) Close(ctx meta.Context) (err syscall.Errno) {
 	l := vfs.NewLogContext(ctx)
 	defer func() { f.fs.log(l, "Close (%s): %s", f.path, errstr(err)) }()
@@ -1480,7 +1486,7 @@ func (f *File) Close(ctx meta.Context) (err syscall.Errno) {
 			})
 		}
 		if f.wdata != nil {
-			err = f.wdata.Close(meta.Background())
+			err = f.wdata.Close(vfs.WithWriterFlushOrigin(meta.Background(), "fs.Close"))
 			f.fs.InvalidateAttr(f.inode)
 			f.wdata = nil
 		}
