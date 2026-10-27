@@ -101,7 +101,7 @@ func TestCompactionGCValidation(t *testing.T) {
 		{"deferred", 0, false, false, false}, {"deferred", -1, false, false, false},
 		{"deferred", 1, true, false, false}, {"deferred", 1, false, true, false}, {"unknown", 1, false, false, false},
 	} {
-		c := &Config{CompactionGCMode: tc.mode, MaxDeletes: tc.deletes, NoBGJob: tc.noBG, ReadOnly: tc.readOnly}
+		c := &Config{MaxDeletes: tc.deletes, NoBGJob: tc.noBG, ReadOnly: tc.readOnly, KazMetaConfig: KazMetaConfig{CompactionGCMode: tc.mode}}
 		if got := c.ValidateCompactionGC() == nil; got != tc.valid {
 			t.Fatalf("%+v valid=%v", tc, got)
 		}

@@ -30,7 +30,7 @@ func kazCompactionReadMinFromFlag(readMin int) (int, error) {
 	if readMin == 0 {
 		return 0, fmt.Errorf("invalid kaz-compaction-read-min 0 (want 5..2499)")
 	}
-	conf := meta.Config{KazCompactionReadMin: readMin}
+	conf := meta.Config{KazMetaConfig: meta.KazMetaConfig{KazCompactionReadMin: readMin}}
 	if err := conf.ValidateKazCompactionPolicy(); err != nil {
 		return 0, err
 	}
@@ -66,10 +66,10 @@ func kazBlockCompactionFromFlags(mode string, ratio float64, maxSlices, deltaTie
 	if deltaGap == 0 {
 		gapCfg = -1
 	}
-	conf := meta.Config{KazCompactionMode: mode, KazCompactionBlockHiddenRatio: ratio, KazCompactionBlockMaxSlices: maxSlices,
+	conf := meta.Config{KazMetaConfig: meta.KazMetaConfig{KazCompactionMode: mode, KazCompactionBlockHiddenRatio: ratio, KazCompactionBlockMaxSlices: maxSlices,
 		KazCompactionDeltaTiers: deltaTiers, KazCompactionDeltaMaxRecords: deltaMaxRecords,
 		KazCompactionDeltaGap: gapCfg, KazCompactionDeltaMinFileSize: deltaMinFileSize,
-		KazCompactionDeltaTrigger: deltaTrigger, KazCompactionDeltaBlockRatio: deltaBlockRatio}
+		KazCompactionDeltaTrigger: deltaTrigger, KazCompactionDeltaBlockRatio: deltaBlockRatio}}
 	if err := conf.ValidateKazBlockCompaction(); err != nil {
 		return meta.Config{}, err
 	}

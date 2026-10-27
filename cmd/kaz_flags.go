@@ -66,7 +66,7 @@ func kazStorageFlags(upstream []cli.Flag) []cli.Flag {
 			Aliases: []string{"compaction-gc-mode"}, // deprecated old name
 			Usage:   "[kaz] obsolete-slice cleanup notification: legacy waits for queue space; deferred uses durable references and bounded asynchronous hints (--compaction-gc-mode is a deprecated alias)",
 			Action: func(c *cli.Context, value string) error {
-				return (&meta.Config{CompactionGCMode: value, MaxDeletes: c.Int("max-deletes"), NoBGJob: c.Bool("no-bgjob"), ReadOnly: c.Bool("read-only")}).ValidateCompactionGC()
+				return (&meta.Config{MaxDeletes: c.Int("max-deletes"), NoBGJob: c.Bool("no-bgjob"), ReadOnly: c.Bool("read-only"), KazMetaConfig: meta.KazMetaConfig{CompactionGCMode: value}}).ValidateCompactionGC()
 			},
 		},
 		&cli.StringFlag{
@@ -74,7 +74,7 @@ func kazStorageFlags(upstream []cli.Flag) []cli.Flag {
 			Aliases: []string{"compaction-scheduler"}, // deprecated old name
 			Usage:   "[kaz] background compaction admission: legacy or bounded advisory priority scheduling (--compaction-scheduler is a deprecated alias)",
 			Action: func(_ *cli.Context, value string) error {
-				return (&meta.Config{CompactionScheduler: value}).ValidateCompactionScheduler()
+				return (&meta.Config{KazMetaConfig: meta.KazMetaConfig{CompactionScheduler: value}}).ValidateCompactionScheduler()
 			},
 		},
 		&cli.IntFlag{

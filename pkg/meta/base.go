@@ -298,12 +298,8 @@ type baseMeta struct {
 	sessCtx Context
 	sessWG  sync.WaitGroup
 
-	dSliceMu          sync.Mutex
-	dSliceWG          sync.WaitGroup
-	compactionGC      atomic.Pointer[compactionGC]
-	priorityCompactor atomic.Pointer[compactionScheduler]
-	kazCompact        atomic.Pointer[compactionPolicy]
-	kazDeltaBases     kazDeltaBaseTable // kaz: per-chunk base counts of delta compaction
+	dSliceMu sync.Mutex
+	dSliceWG sync.WaitGroup
 
 	dirStatsLock sync.RWMutex
 	dirStats     map[Ino]dirStat
@@ -359,12 +355,13 @@ type baseMeta struct {
 	groupQuotaUsedSpaceG  *prometheus.GaugeVec
 	groupQuotaUsedInodesG *prometheus.GaugeVec
 
-	compactionGCEvents *prometheus.CounterVec
-	kazCompactMetrics  *kazCompactionMetrics
-	bgjobDels          *prometheus.CounterVec
-	bgjobDuration      *prometheus.HistogramVec
+	bgjobDels     *prometheus.CounterVec
+	bgjobDuration *prometheus.HistogramVec
 
 	en engine
+
+	// kaz: state of the kaz features (config_kaz.go).
+	kazMetaState
 }
 
 func newBaseMeta(addr string, conf *Config) *baseMeta {
@@ -538,12 +535,7 @@ func newBaseMeta(addr string, conf *Config) *baseMeta {
 			},
 			[]string{"job"},
 		),
-
-		compactionGCEvents: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "compaction_gc_events_total",
-			Help: "Compaction GC phase outcomes; local success counts callbacks, not removed files; deferred remote intent remains durable.",
-		}, []string{"event"}),
-		kazCompactMetrics: newKazCompactionMetrics(),
+		kazMetaState: kazMetaState{compactionGCEvents: newCompactionGCEvents(), kazCompactMetrics: newKazCompactionMetrics()},
 
 		dirQuotaMetricKeys:   make(map[uint64]bool),
 		userQuotaMetricKeys:  make(map[uint64]bool),

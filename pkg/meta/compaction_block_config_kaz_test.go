@@ -30,19 +30,19 @@ func TestKazBlockCompactionConfig(t *testing.T) {
 	require.Equal(t, 0.5, zero.kazBlockHiddenRatio())
 	require.Equal(t, 17, zero.kazBlockMaxSlices(16))
 
-	c := Config{KazCompactionMode: KazCompactionModeBlock, KazCompactionBlockHiddenRatio: 0.25, KazCompactionBlockMaxSlices: 9}
+	c := Config{KazMetaConfig: KazMetaConfig{KazCompactionMode: KazCompactionModeBlock, KazCompactionBlockHiddenRatio: 0.25, KazCompactionBlockMaxSlices: 9}}
 	require.NoError(t, c.ValidateKazBlockCompaction())
 	require.True(t, c.kazBlockCompactionEnabled())
 	require.Equal(t, 0.25, c.kazBlockHiddenRatio())
 	require.Equal(t, 9, c.kazBlockMaxSlices(16))
-	require.NoError(t, (&Config{KazCompactionMode: KazCompactionModeUpstream}).ValidateKazBlockCompaction())
+	require.NoError(t, (&Config{KazMetaConfig: KazMetaConfig{KazCompactionMode: KazCompactionModeUpstream}}).ValidateKazBlockCompaction())
 
 	for _, bad := range []Config{
-		{KazCompactionMode: "blocks"},
-		{KazCompactionBlockHiddenRatio: -0.1},
-		{KazCompactionBlockHiddenRatio: 1.5},
-		{KazCompactionBlockHiddenRatio: math.NaN()},
-		{KazCompactionBlockMaxSlices: -1},
+		{KazMetaConfig: KazMetaConfig{KazCompactionMode: "blocks"}},
+		{KazMetaConfig: KazMetaConfig{KazCompactionBlockHiddenRatio: -0.1}},
+		{KazMetaConfig: KazMetaConfig{KazCompactionBlockHiddenRatio: 1.5}},
+		{KazMetaConfig: KazMetaConfig{KazCompactionBlockHiddenRatio: math.NaN()}},
+		{KazMetaConfig: KazMetaConfig{KazCompactionBlockMaxSlices: -1}},
 	} {
 		require.Error(t, bad.ValidateKazBlockCompaction(), "%+v", bad)
 	}

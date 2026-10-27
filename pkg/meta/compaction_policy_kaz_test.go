@@ -40,7 +40,7 @@ func TestKazCompactionPolicyConfig(t *testing.T) {
 		t.Fatal("zero config must keep the upstream behavior")
 	}
 	for _, v := range []int{5, 100, 2499} {
-		c := Config{KazCompactionReadMin: v}
+		c := Config{KazMetaConfig: KazMetaConfig{KazCompactionReadMin: v}}
 		if err := c.ValidateKazCompactionPolicy(); err != nil {
 			t.Errorf("read-min %d rejected: %v", v, err)
 		}
@@ -49,12 +49,12 @@ func TestKazCompactionPolicyConfig(t *testing.T) {
 		}
 	}
 	for _, v := range []int{-1, 4, 2500} {
-		c := Config{KazCompactionReadMin: v}
+		c := Config{KazMetaConfig: KazMetaConfig{KazCompactionReadMin: v}}
 		if err := c.ValidateKazCompactionPolicy(); err == nil {
 			t.Errorf("read-min %d accepted", v)
 		}
 	}
-	bad := Config{KazCompactionReadMin: 3, MaxDeletes: 1}
+	bad := Config{MaxDeletes: 1, KazMetaConfig: KazMetaConfig{KazCompactionReadMin: 3}}
 	bad.SelfCheck()
 	if bad.KazCompactionReadMin != 0 {
 		t.Fatalf("SelfCheck kept invalid read-min: %+v", bad)

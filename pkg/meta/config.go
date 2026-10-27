@@ -36,53 +36,27 @@ import (
 
 // Config for clients.
 type Config struct {
-	Retries             int
-	MaxDeletes          int
-	CompactionGCMode    string // empty or legacy keeps synchronous notification; deferred requires recovery
-	CompactionScheduler string // empty or legacy keeps opportunistic admission; priority uses bounded hints
-	SkipDirNlink        int
-	CaseInsensi         bool
-	ReadOnly            bool
-	NoBGJob             bool // disable background jobs like clean-up, backup, etc.
-	OpenCache           time.Duration
-	OpenCacheLimit      uint64 // max number of files to cache (soft limit)
-	Heartbeat           time.Duration
-	MountPoint          string
-	Subdir              string
-	AtimeMode           string
-	DirStatFlushPeriod  time.Duration
-	SkipDirMtime        time.Duration
-	Sid                 uint64
-	SortDir             bool
-	FastStatfs          bool
-	NetworkInterfaces   []string // list of network interfaces to use for IP discovery (empty means all)
+	Retries            int
+	MaxDeletes         int
+	SkipDirNlink       int
+	CaseInsensi        bool
+	ReadOnly           bool
+	NoBGJob            bool // disable background jobs like clean-up, backup, etc.
+	OpenCache          time.Duration
+	OpenCacheLimit     uint64 // max number of files to cache (soft limit)
+	Heartbeat          time.Duration
+	MountPoint         string
+	Subdir             string
+	AtimeMode          string
+	DirStatFlushPeriod time.Duration
+	SkipDirMtime       time.Duration
+	Sid                uint64
+	SortDir            bool
+	FastStatfs         bool
+	NetworkInterfaces  []string // list of network interfaces to use for IP discovery (empty means all)
 
-	// [kaz] compaction policy; zero keeps the upstream trigger.
-	// KazCompactionReadMin: when Read reloads a chunk's slice list from the engine
-	// (open-file chunk cache miss), background compaction of that chunk is queued
-	// only if it has at least this many slice records. Commit-triggered compaction
-	// is unchanged. 0 means 5, the upstream threshold.
-	KazCompactionReadMin int
-	// [kaz] block compaction; "" or "upstream" keeps upstream compaction.
-	// KazCompactionMode "block" rewrites only the blocks changed since the last
-	// background compaction, one new slice per block. The two thresholds switch a
-	// chunk back to a whole rewrite (still one slice per block); 0 means the default.
-	KazCompactionMode             string
-	KazCompactionBlockHiddenRatio float64
-	KazCompactionBlockMaxSlices   int
-	// [kaz] delta compaction knobs, used with KazCompactionMode "delta"; 0 means the default.
-	// Tiers: max delta tiers (default 8); MaxRecords: chunk record limit before
-	// folding (default 500); Gap: bytes, gaps up to this are joined (0 = default 16 KiB, -1 = no joining, other negatives invalid);
-	// MinFileSize: bytes, shorter files use block mode (default 0, no limit);
-	// Trigger: new records that start a compaction (default 99, 10..400);
-	// BlockRatio: share of the block size a delta may reach before the block is
-	// rewritten whole (default 0.5, 0 < ratio <= 1).
-	KazCompactionDeltaTiers       int
-	KazCompactionDeltaMaxRecords  int
-	KazCompactionDeltaGap         int
-	KazCompactionDeltaMinFileSize uint64
-	KazCompactionDeltaTrigger     int
-	KazCompactionDeltaBlockRatio  float64
+	// kaz: settings of the kaz features (config_kaz.go).
+	KazMetaConfig
 }
 
 func DefaultConf() *Config {
