@@ -603,44 +603,6 @@ func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool, tie
 	return
 }
 
-// syncDirs persists the entry renamed into dir, then the entry of dir and each ancestor below cache.dir in
-// its parent, stopping at the first dir this process already made durable. A dir is recorded only after its
-// whole chain is synced, so a concurrent writer never skips a parent sync that is still in progress.
-func (cache *cacheStore) syncDirs(dir string) error {
-	if err := cache.checkErr(func() error { return syncStagingDir(dir) }); err != nil {
-		return err
-	}
-	root := filepath.Clean(cache.dir)
-	var chain []string
-	cache.durableMu.Lock()
-	for d := filepath.Clean(dir); d != root && strings.HasPrefix(d, root+string(filepath.Separator)); d = filepath.Dir(d) {
-		if _, ok := cache.durableDirs[d]; ok {
-			break
-		}
-		chain = append(chain, d)
-	}
-	cache.durableMu.Unlock()
-	for _, d := range chain {
-		parent := filepath.Dir(d)
-		if err := cache.checkErr(func() error { return syncStagingDir(parent) }); err != nil {
-			return err
-		}
-	}
-	cache.durableMu.Lock()
-	for _, d := range chain {
-		cache.durableDirs[d] = struct{}{}
-	}
-	cache.durableMu.Unlock()
-	return nil
-}
-
-// forgetDurableDir drops dir after it is removed, so a recreated dir is synced into its parent again.
-func (cache *cacheStore) forgetDurableDir(dir string) {
-	cache.durableMu.Lock()
-	delete(cache.durableDirs, filepath.Clean(dir))
-	cache.durableMu.Unlock()
-}
-
 func (cache *cacheStore) createDir(dir string) {
 	// who can read the cache, should be able to access the directories and add new file.
 	_ = cache.checkErr(func() error {
@@ -707,33 +669,6 @@ func (cache *cacheStore) remove(key string, staging bool) {
 	if err := cache.removeLocal(key, staging); err != nil {
 		logger.Warnf("remove local block %s failed: %s", key, err)
 	}
-}
-
-// removeLocal returns unlink failures and retries staged paths even after index removal.
-func (cache *cacheStore) removeLocal(key string, staging bool) error {
-	cache.Lock()
-	delete(cache.pages, key)
-	path := cache.cachePath(key)
-	k := cache.getCacheKey(key)
-	if it := cache.keys.remove(k, staging); it != nil {
-		if it.size > 0 {
-			cache.used -= int64(it.size + 4096)
-		}
-	} else if !staging {
-		path = ""
-	}
-	cache.Unlock()
-	var err error
-	if path != "" {
-		if e := cache.removeFile(path); e != nil && !os.IsNotExist(e) {
-			err = e
-		}
-	}
-	// Stage files may survive a previous unlink failure even when the cache index is gone.
-	if staging {
-		err = errors.Join(err, cache.removeStage(key))
-	}
-	return err
 }
 
 func (cache *cacheStore) load(key string) (ReadCloser, error) {
@@ -1393,15 +1328,6 @@ func (m *cacheManager) exist(key string) (string, bool) {
 	return loc, existed
 }
 
-// retire returns local cache/stage cleanup errors for durably obsolete slices.
-func (m *cacheManager) retire(key string) error {
-	store := m.getStore(key)
-	if store == nil {
-		return errCacheDown
-	}
-	return store.removeLocal(key, true)
-}
-
 func (m *cacheManager) remove(key string, staging bool) {
 	store := m.getStore(key)
 	if store != nil {
@@ -1662,9 +1588,3 @@ func (cf *cacheFile) ReadAt(b []byte, off int64) (n int, err error) {
 	}
 	return
 }
-
-// syncStagingFile and syncStagingDir make staged writeback blocks durable; tests replace them to observe ordering.
-var (
-	syncStagingFile = fdatasyncFile
-	syncStagingDir  = fsyncDir
-)

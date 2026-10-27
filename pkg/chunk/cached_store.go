@@ -35,7 +35,6 @@ import (
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juju/ratelimit"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/sirupsen/logrus"
 )
 
 const chunkSize = 1 << 26 // 64M
@@ -320,11 +319,7 @@ func (store *cachedStore) put(ctx context.Context, key string, p *Page) error {
 		err := store.storage.Put(ctx, key, bytes.NewReader(p.Data), object.WithRequestID(&reqID), object.WithStorageClass(&sc))
 		used := time.Since(st)
 		// kaz: log the payload length separately from the raw length in the key.
-		param := ""
-		if used > SlowRequest || logger.IsLevelEnabled(logrus.DebugLevel) {
-			param = fmt.Sprintf("payload_bytes=%d ", len(p.Data))
-		}
-		logRequest("PUT", key, param, reqID, err, used)
+		logRequest("PUT", key, store.kazPutParam(len(p.Data), used), reqID, err, used)
 		store.objectDataBytes.WithLabelValues("PUT", sc).Add(float64(len(p.Data)))
 		store.objectReqsHistogram.WithLabelValues("PUT", sc).Observe(used.Seconds())
 		if err != nil {
@@ -775,57 +770,6 @@ func logRequest(typeStr, key, param, reqID string, err error, used time.Duration
 
 var errTryFullRead = errors.New("try full read")
 
-// headerTimeoutMemory is how long a key cut by GetHeaderTimeout is remembered.
-var headerTimeoutMemory = 5 * time.Minute
-
-// maxHeaderTimedOut bounds the number of remembered keys.
-const maxHeaderTimedOut = 4096
-
-// headerTimedOutRecently reports whether key was cut by GetHeaderTimeout within
-// headerTimeoutMemory, forgetting it once that has passed.
-func (store *cachedStore) headerTimedOutRecently(key string) bool {
-	store.headerTimedOutMu.Lock()
-	defer store.headerTimedOutMu.Unlock()
-	t, ok := store.headerTimedOut[key]
-	if ok && time.Since(t) > headerTimeoutMemory {
-		delete(store.headerTimedOut, key)
-		return false
-	}
-	return ok
-}
-
-// rememberHeaderTimeout records that key was cut by GetHeaderTimeout.
-// When too many keys are remembered, the expired ones are dropped first and,
-// if that is not enough, all of them.
-func (store *cachedStore) rememberHeaderTimeout(key string) {
-	store.headerTimedOutMu.Lock()
-	defer store.headerTimedOutMu.Unlock()
-	if store.headerTimedOut == nil {
-		store.headerTimedOut = make(map[string]time.Time)
-	}
-	if len(store.headerTimedOut) >= maxHeaderTimedOut {
-		for k, t := range store.headerTimedOut {
-			if time.Since(t) > headerTimeoutMemory {
-				delete(store.headerTimedOut, k)
-			}
-		}
-		if len(store.headerTimedOut) >= maxHeaderTimedOut {
-			clear(store.headerTimedOut)
-		}
-	}
-	store.headerTimedOut[key] = time.Now()
-}
-
-// forgetHeaderTimeout drops key once it has been downloaded.
-func (store *cachedStore) forgetHeaderTimeout(key string) {
-	store.headerTimedOutMu.Lock()
-	defer store.headerTimedOutMu.Unlock()
-	delete(store.headerTimedOut, key)
-}
-
-// errGetHeaderTimeout reports a full-block GET abandoned by GetHeaderTimeout.
-var errGetHeaderTimeout = errors.New("no response headers within --kaz-get-header-timeout")
-
 type getResult struct {
 	n     int
 	reqID string
@@ -886,152 +830,6 @@ func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page,
 	}
 	// fall back to full read
 	return 0, errTryFullRead
-}
-
-// readBlockDetached reads p from a full block fetched by a GET that is not tied to ctx.
-// If ctx is canceled first, the caller returns at once while the GET goes on in the
-// background and caches the block (see loadDetached). The fetch always uses its own
-// page, so nothing writes into the caller's buffer after it has returned.
-func (s *rSlice) readBlockDetached(ctx context.Context, p []byte, key string, boff, blockSize int) (int, error) {
-	type result struct {
-		block *Page
-		err   error
-	}
-	done := make(chan result, 1)
-	go func() {
-		block, err := s.store.group.Execute(key, func() (*Page, error) {
-			tmp := NewOffPage(blockSize)
-			return tmp, s.store.loadDetached(ctx, key, tmp)
-		})
-		done <- result{block, err}
-	}()
-	select {
-	case r := <-done:
-		defer r.block.Release()
-		if r.err != nil {
-			return 0, r.err
-		}
-		copy(p, r.block.Data[boff:])
-		return len(p), nil
-	case <-ctx.Done():
-		go func() { (<-done).block.Release() }()
-		return 0, ctx.Err()
-	}
-}
-
-// loadDetached downloads a full block into page and caches it, for readBlockDetached.
-// It gives up while waiting for a download slot if ctx ends, because no request has
-// been sent yet. Once the GET has started, a cancel of ctx no longer stops it, as long
-// as fewer than detachedFetches GETs are already running this way; above that limit
-// the GET is canceled as before. GetTimeout still applies.
-func (store *cachedStore) loadDetached(ctx context.Context, key string, page *Page) error {
-	select {
-	case store.currentDownload <- struct{}{}:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	defer func() { <-store.currentDownload }()
-
-	gctx, gcancel := context.WithCancel(context.WithoutCancel(ctx))
-	defer gcancel()
-	const (
-		running = iota
-		detached
-		finished
-	)
-	var mu sync.Mutex
-	state := running
-	stop := context.AfterFunc(ctx, func() {
-		mu.Lock()
-		defer mu.Unlock()
-		if state != running {
-			return
-		}
-		select {
-		case store.detachedFetches <- struct{}{}:
-			state = detached
-		default:
-			store.canceledGetDropped.Inc()
-			gcancel()
-		}
-	})
-	defer stop()
-
-	err := store.fetchBlock(gctx, key, page, true, false)
-
-	mu.Lock()
-	wasDetached := state == detached
-	state = finished
-	mu.Unlock()
-	if wasDetached {
-		<-store.detachedFetches
-		if err == nil {
-			store.canceledGetFinished.Inc()
-			logger.Debugf("finished GET %s after its reader was canceled, block cached", key)
-		}
-	}
-	return err
-}
-
-// cancelOnClose ends the request context of a GET when its body is closed.
-type cancelOnClose struct {
-	io.ReadCloser
-	cancel context.CancelFunc
-}
-
-// Close closes the body and then releases its request context.
-func (c *cancelOnClose) Close() error {
-	err := c.ReadCloser.Close()
-	c.cancel()
-	return err
-}
-
-// getWithHeaderTimeout gets the whole object key, giving up with errGetHeaderTimeout
-// when Get (which returns once the response headers arrive) takes longer than
-// GetHeaderTimeout. After the headers, the body is read under ctx only, so a slow body
-// is still bounded by GetTimeout alone. Abandoned GETs are retried by the caller's
-// usual retry path.
-//
-// A key cut within headerTimeoutMemory is fetched again without the header timeout:
-// some objects (e.g. on Google Drive) always take longer than it to answer, and
-// cutting every retry would use up the read retries and fail the read with EIO.
-func (store *cachedStore) getWithHeaderTimeout(ctx context.Context, key string, getters ...object.AttrGetter) (io.ReadCloser, error) {
-	timeout := store.conf.GetHeaderTimeout
-	if timeout <= 0 {
-		return store.storage.Get(ctx, key, 0, -1, getters...)
-	}
-	if store.headerTimedOutRecently(key) {
-		in, err := store.storage.Get(ctx, key, 0, -1, getters...)
-		if err == nil {
-			store.forgetHeaderTimeout(key)
-		}
-		return in, err
-	}
-	hctx, cancel := context.WithCancel(ctx)
-	var fired atomic.Bool
-	timer := time.AfterFunc(timeout, func() {
-		fired.Store(true)
-		cancel()
-	})
-	in, err := store.storage.Get(hctx, key, 0, -1, getters...)
-	if !timer.Stop() && fired.Load() {
-		if in != nil {
-			_ = in.Close()
-		}
-		cancel()
-		if ctx.Err() != nil { // the caller gave up first; report that instead
-			return nil, ctx.Err()
-		}
-		store.getHeaderTimeouts.Inc()
-		store.rememberHeaderTimeout(key)
-		logger.Warnf("GET %s: %s (%s), will retry without it", key, errGetHeaderTimeout, timeout)
-		return nil, fmt.Errorf("%w (%s)", errGetHeaderTimeout, timeout)
-	}
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	return &cancelOnClose{in, cancel}, nil
 }
 
 func (store *cachedStore) load(ctx context.Context, key string, page *Page, cache bool, forceCache bool) (err error) {
@@ -1263,18 +1061,7 @@ func (store *cachedStore) initMetrics() {
 		Name: "staging_block_errors",
 		Help: "Total errors when staging blocks",
 	})
-	store.canceledGetFinished = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "kaz_canceled_get_finished",
-		Help: "Full-block GETs finished and cached after their reader was canceled.",
-	})
-	store.canceledGetDropped = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "kaz_canceled_get_dropped",
-		Help: "Full-block GETs aborted on cancel because too many were already kept running.",
-	})
-	store.getHeaderTimeouts = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "kaz_get_header_timeouts",
-		Help: "Full-block GETs abandoned because no response headers arrived within --kaz-get-header-timeout.",
-	})
+	store.kazInitMetrics()
 }
 
 func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
@@ -1289,9 +1076,7 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(store.objectReqsHistogram)
 	reg.MustRegister(store.objectReqErrors)
 	reg.MustRegister(store.objectDataBytes)
-	reg.MustRegister(store.canceledGetFinished)
-	reg.MustRegister(store.canceledGetDropped)
-	reg.MustRegister(store.getHeaderTimeouts)
+	store.kazRegMetrics(reg)
 	reg.MustRegister(store.stageBlockDelay)
 	reg.MustRegister(store.stageBlockErrors)
 	reg.MustRegister(prometheus.NewGaugeFunc(
@@ -1389,98 +1174,6 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 	}
 }
 
-// beginStageWrite keeps a late local stage callback visible to durable GC retirement.
-func (store *cachedStore) beginStageWrite(key string) {
-	store.pendingMutex.Lock()
-	defer store.pendingMutex.Unlock()
-	if store.activeStageWrites == nil {
-		store.activeStageWrites = make(map[string]int)
-	}
-	store.activeStageWrites[key]++
-}
-
-// endStageWrite drops tracking only after a late callback's local cleanup has completed.
-func (store *cachedStore) endStageWrite(key string) {
-	store.pendingMutex.Lock()
-	defer store.pendingMutex.Unlock()
-	if store.activeStageWrites[key] <= 1 {
-		delete(store.activeStageWrites, key)
-	} else {
-		store.activeStageWrites[key]--
-	}
-}
-
-// beginStagingUpload registers actual I/O before retirement can remove its pending entry.
-// The caller owns a currentUpload slot before calling this method.
-func (store *cachedStore) beginStagingUpload(key string) *pendingItem {
-	store.pendingMutex.Lock()
-	defer store.pendingMutex.Unlock()
-	item := store.pendingKeys[key]
-	if item != nil {
-		if store.activeStaging == nil {
-			store.activeStaging = make(map[string]int)
-		}
-		store.activeStaging[key]++
-	}
-	return item
-}
-
-// beginImmediateStaging publishes pending and active state before a writeback writer acknowledges staging.
-func (store *cachedStore) beginImmediateStaging(key, path string, added time.Time) *pendingItem {
-	store.pendingMutex.Lock()
-	defer store.pendingMutex.Unlock()
-	item := store.pendingKeys[key]
-	if item == nil {
-		item = &pendingItem{key: key, fpath: path, ts: added}
-		store.pendingKeys[key] = item
-	}
-	if !item.uploading.CompareAndSwap(false, true) {
-		return nil
-	}
-	if store.activeStaging == nil {
-		store.activeStaging = make(map[string]int)
-	}
-	store.activeStaging[key]++
-	return item
-}
-
-// endStagingUpload releases bounded active bookkeeping after upload and cleanup have finished.
-func (store *cachedStore) endStagingUpload(key string, item *pendingItem) {
-	store.pendingMutex.Lock()
-	defer store.pendingMutex.Unlock()
-	if store.activeStaging[key] <= 1 {
-		delete(store.activeStaging, key)
-	} else {
-		store.activeStaging[key]--
-	}
-	item.uploading.Store(false)
-}
-
-// isPendingItem distinguishes the current upload from a canceled older generation.
-func (store *cachedStore) isPendingItem(key string, item *pendingItem) bool {
-	store.pendingMutex.Lock()
-	defer store.pendingMutex.Unlock()
-	return store.pendingKeys[key] == item
-}
-
-// finishStagingUpload keeps abandoned cleanup inside the active-I/O guard.
-func (store *cachedStore) finishStagingUpload(key string, item *pendingItem, blen int) {
-	if !store.isPendingItem(key, item) {
-		err := store.delete(key)
-		logger.Infof("Key %s is not needed, abandoned, err: %v", key, err)
-		return
-	}
-	store.bcache.uploaded(key, blen)
-	store.pendingMutex.Lock()
-	if store.pendingKeys[key] == item {
-		delete(store.pendingKeys, key)
-	}
-	store.pendingMutex.Unlock()
-	if err := store.bcache.removeStage(key); err != nil {
-		logger.Warnf("failed to remove stage %s after upload: %s", key, err)
-	}
-}
-
 func (store *cachedStore) addDelayedStaging(key, stagingPath string, added time.Time, force bool) bool {
 	store.pendingMutex.Lock()
 	// kaz: drop a staging file known to be absent and keep the intent when its presence is uncertain.
@@ -1563,48 +1256,6 @@ func (store *cachedStore) NewReader(id uint64, length int) Reader {
 
 func (store *cachedStore) NewWriter(id uint64, tierID uint8) Writer {
 	return sliceForWrite(id, store, tierID)
-}
-
-// ErrSliceUploadInFlight means persisted GC intent must remain until staging writes/uploads finish.
-var ErrSliceUploadInFlight = errors.New("slice has an in-flight staging upload")
-
-// retireCache cancels cache/stage files without object storage I/O and propagates unlink failures.
-func (store *cachedStore) retireCache(key string) error {
-	if cache, ok := store.bcache.(interface{ retire(string) error }); ok {
-		return cache.retire(key)
-	}
-	store.bcache.remove(key, true)
-	return store.bcache.removeStage(key)
-}
-
-// Retire cancels local data only for slice references already durably retired by metadata.
-// An in-flight error is retryable: the caller must retain its durable dead marker and
-// must not hand physical deletion off as completed while a PUT can recreate the object.
-func (store *cachedStore) Retire(id uint64, length int) error {
-	keys := sliceForRead(id, length, store).keys()
-	var err error
-	busy := false
-	cancel := func() {
-		store.pendingMutex.Lock()
-		defer store.pendingMutex.Unlock()
-		for _, key := range keys {
-			delete(store.pendingKeys, key)
-			if store.activeStaging[key] > 0 || store.activeStageWrites[key] > 0 {
-				busy = true
-			}
-		}
-	}
-	cancel()
-	for _, key := range keys {
-		err = errors.Join(err, store.retireCache(key))
-	}
-	// A scanner can register and start between initial cancellation and local unlink.
-	// Rechecking after unlink sees that I/O; later admission rejects the absent stage file.
-	cancel()
-	if busy {
-		err = errors.Join(err, ErrSliceUploadInFlight)
-	}
-	return err
 }
 
 func (store *cachedStore) Remove(id uint64, length int) error {
