@@ -38,7 +38,7 @@ import (
 func TestGenFuseOptHasNoRequestDeadline(t *testing.T) {
 	for _, deadline := range []time.Duration{0, vfs.AutoWriterFlushTimeout, time.Hour} {
 		t.Run(deadline.String(), func(t *testing.T) {
-			conf := &vfs.Config{WriterFlushTimeout: deadline}
+			conf := &vfs.Config{KazVfsConfig: vfs.KazVfsConfig{WriterFlushTimeout: deadline}}
 			opt := GenFuseOpt(conf, "allow_other", 1, false, false, 128<<10)
 			if opt.Timeout != 0 {
 				t.Fatalf("FUSE request watchdog=%s with writer deadline=%s; watchdog can reply EINTR before storage/metadata commit completes", opt.Timeout, deadline)

@@ -81,9 +81,8 @@ func createTestVFS(applyMetaConfOption func(metaConfig *meta.Config), metaUri st
 		},
 		FuseOpts: &FuseOptions{},
 		// JFS_TEST_WRITER_FLUSH_SCOPE=range reruns the suite with range barriers.
-		WriterFlushScope: os.Getenv("JFS_TEST_WRITER_FLUSH_SCOPE"),
 		// JFS_TEST_META_WRITE_BATCH=N reruns the suite with batched slice commits.
-		MetaWriteBatch: testMetaWriteBatch(),
+		KazVfsConfig: KazVfsConfig{WriterFlushScope: os.Getenv("JFS_TEST_WRITER_FLUSH_SCOPE"), MetaWriteBatch: testMetaWriteBatch()},
 	}
 	blob, _ := object.CreateStorage("mem", "", "", "", "")
 	registry := prometheus.NewRegistry() // replace default so only JuiceFS metrics are exposed

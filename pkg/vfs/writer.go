@@ -283,13 +283,11 @@ type fileWriter struct {
 	tierID       uint8
 	err          syscall.Errno
 	flushwaiting uint16
-	rangewaiting uint16 // range barriers in progress; they never block writes
 	writewaiting uint16
 	refs         uint16
 	chunks       map[uint32]*chunkWriter
-	mtimeFloor   time.Time  // newest mtime this writer has recorded; later commits never go below it
-	mtimeGen     uint64     // bumped by explicit mtime updates so in-flight commits do not restore the floor
-	commitMu     sync.Mutex // orders mtime choice with metadata updates; taken before the file lock
+	// kaz: writer state of the kaz features (writer_kaz.go).
+	kazFileWriterState
 
 	flushcond  *utils.Cond // wait for chunks==nil (flush) or committed slices (flushRange)
 	writecond  *utils.Cond // wait for flushwaiting==0 (write)

@@ -18,11 +18,21 @@ package vfs
 
 import (
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 )
+
+// kazFileWriterState holds the fileWriter state added by kaz. It is embedded
+// in fileWriter and starts zero; it holds a lock, so it must not be copied.
+type kazFileWriterState struct {
+	rangewaiting uint16     // range barriers in progress; they never block writes
+	mtimeFloor   time.Time  // newest mtime this writer has recorded; later commits never go below it
+	mtimeGen     uint64     // bumped by explicit mtime updates so in-flight commits do not restore the floor
+	commitMu     sync.Mutex // orders mtime choice with metadata updates; taken before the file lock
+}
 
 const (
 	defaultSliceFlushWait = flushDuration

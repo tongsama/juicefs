@@ -136,15 +136,9 @@ type Config struct {
 	ReaddirCache         bool
 	BackupMeta           time.Duration
 	BackupSkipTrash      bool
-	SliceFlushWait       time.Duration
-	SliceFlushIdle       time.Duration
-	WriterReuseWindow    int           // Distance before freezing nonmatching old slices; zero uses four.
-	WriterFlushTimeout   time.Duration // 0 waits without a deadline; AutoWriterFlushTimeout uses the legacy deadline.
-	WriterFlushScope     string        // WriterFlushScopeFile (default) or WriterFlushScopeRange for Read/Fallocate barriers.
-	MetaWriteBatch       int           // Maximum slices of one chunk committed per metadata transaction; 0 disables batching.
-	FastResolve          bool          `json:",omitempty"`
-	AccessLog            string        `json:",omitempty"`
-	Subdir               string        `json:",omitempty"`
+	FastResolve          bool   `json:",omitempty"`
+	AccessLog            string `json:",omitempty"`
+	Subdir               string `json:",omitempty"`
 	PrefixInternal       bool
 	HideInternal         bool
 	RootSquash           *AnonymousAccount `json:",omitempty"`
@@ -160,6 +154,9 @@ type Config struct {
 
 	// the mount point for current volume (to follow symlink)
 	Mountpoint string
+
+	// kaz: settings of the kaz features (config_kaz.go).
+	KazVfsConfig
 }
 
 type AnonymousAccount struct {

@@ -207,7 +207,7 @@ func TestWriterFlushTimeoutModes(t *testing.T) {
 		{AutoWriterFlushTimeout, 150000, time.Duration(1<<63 - 1)},
 		{AutoWriterFlushTimeout, ^uint32(0), time.Duration(1<<63 - 1)},
 	} {
-		w := &dataWriter{conf: &Config{WriterFlushTimeout: tc.timeout}, maxRetries: tc.retries}
+		w := &dataWriter{conf: &Config{KazVfsConfig: KazVfsConfig{WriterFlushTimeout: tc.timeout}}, maxRetries: tc.retries}
 		if got := w.flushTimeout(); got != tc.want {
 			t.Errorf("timeout=%s retries=%d: got %s want %s", tc.timeout, tc.retries, got, tc.want)
 		}
@@ -258,7 +258,7 @@ func TestFlushDefaultSurvivesLegacyDeadline(t *testing.T) {
 
 // TestWriterFlushNegativeTimeout diagnoses invalid Go configuration and uses the safe wait policy.
 func TestWriterFlushNegativeTimeout(t *testing.T) {
-	conf := &Config{Meta: meta.DefaultConf(), Chunk: &chunk.Config{}, WriterFlushTimeout: -time.Second}
+	conf := &Config{Meta: meta.DefaultConf(), Chunk: &chunk.Config{}, KazVfsConfig: KazVfsConfig{WriterFlushTimeout: -time.Second}}
 	w := NewDataWriter(conf, nil, nil, nil).(*dataWriter)
 	if conf.WriterFlushTimeout != 0 || w.flushTimeout() != 0 {
 		t.Fatal("unsupported negative timeout must be normalized to the no-deadline policy")
