@@ -496,6 +496,7 @@ func mountFlags() []cli.Flag {
 			Usage: "disable transparent huge page to avoid latency spikes caused by kernel's memory compaction",
 		})
 	}
+	selfFlags = append(selfFlags, kazUpgradeFlags()...)
 	return append(selfFlags, fuseFlags()...)
 }
 
@@ -986,6 +987,9 @@ func launchMount(c *cli.Context, mp string, conf *vfs.Config) error {
 
 	if canShutdownGracefully(mp, conf) {
 		shutdownGraceful(mp)
+	}
+	if err := kazCheckStackedMount(c, mp); err != nil {
+		return err
 	}
 	os.Setenv("_FUSE_FD_COMM", serverAddress)
 	serveFuseFD(serverAddress)
