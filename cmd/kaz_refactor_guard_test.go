@@ -91,6 +91,11 @@ func kazGuardPrepare(t *testing.T) {
 		t.Skip("the default cache-dir differs for root; golden files are for non-root")
 	}
 	t.Setenv("HOME", "/kaz-guard-home")
+	// Main (run by other tests in the package) sets the global debugAgent, which
+	// getVfsConf copies into Port.DebugAgent; clear it for a stable result.
+	saved := debugAgent
+	debugAgent = ""
+	t.Cleanup(func() { debugAgent = saved })
 }
 
 // flattenKazJSON appends "path=value" lines for every leaf of v, with nested
