@@ -169,6 +169,30 @@ func (e *kazPackTestEnv) packEvents(t *testing.T, event string) float64 {
 	return 0
 }
 
+// counter returns the value of the unlabeled counter name.
+func (e *kazPackTestEnv) counter(t *testing.T, name string) float64 {
+	t.Helper()
+	mfs, err := e.reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() == name && len(mf.Metric) > 0 {
+			return mf.Metric[0].GetCounter().GetValue()
+		}
+	}
+	return 0
+}
+
+// indexed reports whether the pack index holds slice id.
+func (e *kazPackTestEnv) indexed(t *testing.T, id uint64) bool {
+	t.Helper()
+	idx := e.v.Conf.kazPackIndex()
+	require.NotNil(t, idx)
+	idx.Lock()
+	defer idx.Unlock()
+	_, ok := idx.byID[id]
+	return ok
+}
+
 // referenced returns the slice ids referenced by any chunk record.
 func (e *kazPackTestEnv) referenced(t *testing.T) map[uint64]bool {
 	t.Helper()
@@ -289,7 +313,7 @@ func TestKazStagingPackUnknownUploads(t *testing.T) {
 	e := newKazPackTestVFS(t, true, false)
 	ctx := NewLogContext(meta.NewContext(10, 1, []uint32{2, 3}))
 	f := e.writeScattered(t, ctx, "f", 6)
-	idx := e.v.Conf.kazPackIdx
+	idx := e.v.Conf.kazPackIndex()
 	require.NotNil(t, idx)
 	idx.reset()
 	e.blob.open()
@@ -355,11 +379,21 @@ func TestKazStagingPackWithSkipDelete(t *testing.T) {
 		}
 		return true
 	}, 10*time.Second, 10*time.Millisecond, "leaked objects")
-	e.blob.mu.Lock()
+	var gone []uint64
 	for _, id := range before {
 		if !after[id] {
-			require.Zero(t, e.blob.dels[id], "DELETE of packed slice %d", id)
+			gone = append(gone, id)
 		}
+	}
+	require.NotEmpty(t, gone)
+	// Wait until every packed-away slice was removed (its DELETE skipped) before
+	// checking that no DELETE was sent.
+	require.Eventually(t, func() bool {
+		return e.counter(t, "kaz_delete_skipped_total") >= float64(len(gone))
+	}, 10*time.Second, 10*time.Millisecond)
+	e.blob.mu.Lock()
+	for _, id := range gone {
+		require.Zero(t, e.blob.dels[id], "DELETE of packed slice %d", id)
 	}
 	e.blob.mu.Unlock()
 	e.checkRead(t, ctx, f)
@@ -370,10 +404,145 @@ func TestKazStagingPackDisabled(t *testing.T) {
 	e := newKazPackTestVFS(t, false, false)
 	ctx := NewLogContext(meta.NewContext(10, 1, []uint32{2, 3}))
 	f := e.writeScattered(t, ctx, "f", 6)
-	require.Nil(t, e.v.Conf.kazPackIdx)
+	require.Nil(t, e.v.Conf.kazPackIndex())
 	e.blob.open()
 	e.waitStored(t)
 	require.Eventually(t, func() bool { return e.blob.totalPuts() == 6 }, 10*time.Second, 10*time.Millisecond)
 	require.Zero(t, e.packEvents(t, "packed"))
 	e.checkRead(t, ctx, f)
+}
+
+// TestKazStagingPackIndexImmediateUpload: a slice uploaded at once through a
+// free upload slot (PUT started at commit) is never recorded in the index.
+func TestKazStagingPackIndexImmediateUpload(t *testing.T) {
+	e := newKazPackTestVFS(t, true, false)
+	e.blob.open()
+	ctx := NewLogContext(meta.NewContext(10, 1, []uint32{2, 3}))
+	f := e.writeScattered(t, ctx, "f", 1)
+	ids := e.recordIDs(t, f.inode)
+	require.Len(t, ids, 1)
+	require.False(t, e.indexed(t, ids[0]))
+	e.waitStored(t)
+	e.checkRead(t, ctx, f)
+}
+
+// TestKazStagingPackIndexForgetOnUpload: a deferred slice is recorded while it
+// waits and leaves the index when its plain upload completes.
+func TestKazStagingPackIndexForgetOnUpload(t *testing.T) {
+	e := newKazPackTestVFS(t, true, false)
+	ctx := NewLogContext(meta.NewContext(10, 1, []uint32{2, 3}))
+	f := e.writeScattered(t, ctx, "f", 2) // the first takes the slot, the second waits
+	ids := e.recordIDs(t, f.inode)
+	require.Len(t, ids, 2)
+	var waiting uint64
+	for _, id := range ids {
+		if e.indexed(t, id) {
+			require.Zero(t, waiting, "only the deferred slice is recorded")
+			waiting = id
+		}
+	}
+	require.NotZero(t, waiting)
+	// Keep the forget callback but stop packing, so the slice is uploaded plainly.
+	e.v.Store.(kazStagingPackStore).KazSetStagingPacker(nil)
+	e.blob.open()
+	e.waitStored(t)
+	require.Eventually(t, func() bool { return !e.indexed(t, waiting) }, 10*time.Second, 10*time.Millisecond)
+	require.Zero(t, e.packEvents(t, "packed"))
+	e.checkRead(t, ctx, f)
+}
+
+// TestKazStagingPackIndexForgetOnRetire: retiring a pending slice removes it
+// from the index.
+func TestKazStagingPackIndexForgetOnRetire(t *testing.T) {
+	e := newKazPackTestVFS(t, true, false)
+	ctx := NewLogContext(meta.NewContext(10, 1, []uint32{2, 3}))
+	f := e.writeScattered(t, ctx, "f", 2)
+	var waiting uint64
+	for _, id := range e.recordIDs(t, f.inode) {
+		if e.indexed(t, id) {
+			waiting = id
+		}
+	}
+	require.NotZero(t, waiting)
+	retirer, ok := e.v.Store.(interface {
+		Retire(id uint64, length int) error
+	})
+	require.True(t, ok)
+	require.NoError(t, retirer.Retire(waiting, 700))
+	require.False(t, e.indexed(t, waiting))
+}
+
+// TestKazPackIndexEviction: above the bound the oldest entries are dropped and
+// both maps stay consistent; removed ids do not count toward the bound.
+func TestKazPackIndexEviction(t *testing.T) {
+	x := newKazPackIndex(3)
+	all := func(refs []chunk.KazStagedRef) []bool {
+		r := make([]bool, len(refs))
+		for i := range r {
+			r[i] = true
+		}
+		return r
+	}
+	for id := uint64(1); id <= 5; id++ {
+		x.addPending(Ino(id%2+2), 0, []chunk.KazStagedRef{{ID: id, Length: 100}}, all)
+	}
+	require.Len(t, x.byID, 3)
+	for _, id := range []uint64{3, 4, 5} {
+		require.Contains(t, x.byID, id)
+	}
+	n := 0
+	for _, ids := range x.byChunk {
+		n += len(ids)
+	}
+	require.Equal(t, 3, n)
+	x.remove(4)
+	x.addPending(9, 0, []chunk.KazStagedRef{{ID: 6, Length: 100}}, all)
+	require.Len(t, x.byID, 3)
+	for _, id := range []uint64{3, 5, 6} {
+		require.Contains(t, x.byID, id)
+	}
+	_, refs, ok := x.candidates(3, 4096)
+	require.True(t, ok)
+	require.Equal(t, []chunk.KazStagedRef{{ID: 3, Length: 100}, {ID: 5, Length: 100}}, refs)
+	x.addPending(9, 0, []chunk.KazStagedRef{{ID: 7, Length: 100}, {ID: 8, Length: 100}},
+		func(refs []chunk.KazStagedRef) []bool { return []bool{false, true} })
+	require.NotContains(t, x.byID, uint64(7), "not pending: not recorded")
+	require.Contains(t, x.byID, uint64(8))
+}
+
+// kazPendingAllStore is a chunk store whose staged blocks are all pending.
+type kazPendingAllStore struct {
+	chunk.ChunkStore
+	kazStagingPackStore
+}
+
+// KazStagedPending reports every ref as pending.
+func (kazPendingAllStore) KazStagedPending(refs []chunk.KazStagedRef) []bool {
+	r := make([]bool, len(refs))
+	for i := range r {
+		r[i] = true
+	}
+	return r
+}
+
+// TestKazRememberStagedFilters: only single-block slices are recorded, and
+// nothing is recorded with writeback off.
+func TestKazRememberStagedFilters(t *testing.T) {
+	newWriter := func(writeback bool) (*dataWriter, *kazPackIndex) {
+		conf := &Config{Chunk: &chunk.Config{BlockSize: 4096, Writeback: writeback}}
+		conf.KazStagingPack = true
+		kazNormalizeWriterConf(conf)
+		idx := newKazPackIndex(kazPackIndexMax)
+		conf.kazPack.idx.Store(idx)
+		return &dataWriter{conf: conf, store: kazPendingAllStore{}}, idx
+	}
+	ss := []*sliceWriter{{id: 1, length: 100}, {id: 2, length: 4095}, {id: 3, length: 4096}, {id: 4, length: 8192}, {id: 5, length: 0}}
+	w, idx := newWriter(true)
+	w.kazRememberStaged(2, 0, ss)
+	require.Len(t, idx.byID, 2)
+	require.Contains(t, idx.byID, uint64(1))
+	require.Contains(t, idx.byID, uint64(2))
+	w, idx = newWriter(false)
+	w.kazRememberStaged(2, 0, ss)
+	require.Empty(t, idx.byID)
 }

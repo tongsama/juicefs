@@ -19,6 +19,7 @@ package vfs
 import (
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
@@ -45,18 +46,33 @@ type kazChunkKey struct {
 	indx  uint32
 }
 
+// kazPackState holds the staging-pack runtime state of one Config.
+type kazPackState struct {
+	idx atomic.Pointer[kazPackIndex] // nil until kazInitStagingPack registers the packer
+}
+
+// kazPackIndex returns the pack index, or nil when packing is off.
+func (c *Config) kazPackIndex() *kazPackIndex {
+	if c.kazPack == nil {
+		return nil
+	}
+	return c.kazPack.idx.Load()
+}
+
 // kazPackIndex maps committed single-block staged slices to their chunk and
-// keeps, per chunk, the ids with their lengths so peers can be found.
+// keeps, per chunk, the ids with their lengths so peers can be found. Entries
+// leave on pack, upload completion, retire, absence at claim time, or eviction.
 type kazPackIndex struct {
 	sync.Mutex
+	max     int // entry bound; the oldest entries are dropped above it
 	byID    map[uint64]kazPackLoc
 	byChunk map[kazChunkKey]map[uint64]int // chunk -> id -> length
 	order   []uint64                       // insertion order; may hold removed ids
 }
 
-// newKazPackIndex returns an empty index.
-func newKazPackIndex() *kazPackIndex {
-	x := &kazPackIndex{}
+// newKazPackIndex returns an empty index holding at most max entries.
+func newKazPackIndex(max int) *kazPackIndex {
+	x := &kazPackIndex{max: max}
 	x.reset()
 	return x
 }
@@ -70,10 +86,24 @@ func (x *kazPackIndex) reset() {
 	x.order = nil
 }
 
-// add remembers slice id at loc and drops the oldest entries above the bound.
-func (x *kazPackIndex) add(id uint64, loc kazPackLoc) {
+// addPending remembers the slices refs of one chunk for which pending reports
+// true. pending runs under the index lock, so a forget for a slice that leaves
+// the pending set concurrently either happens before the check (not added) or
+// waits and removes it after the add.
+func (x *kazPackIndex) addPending(inode Ino, indx uint32, refs []chunk.KazStagedRef, pending func([]chunk.KazStagedRef) []bool) {
 	x.Lock()
 	defer x.Unlock()
+	ok := pending(refs)
+	for i, r := range refs {
+		if i < len(ok) && ok[i] {
+			x.addLocked(r.ID, kazPackLoc{inode: inode, indx: indx, length: r.Length})
+		}
+	}
+}
+
+// addLocked remembers slice id at loc and drops the oldest entries above the
+// bound; the caller holds the lock.
+func (x *kazPackIndex) addLocked(id uint64, loc kazPackLoc) {
 	if _, ok := x.byID[id]; ok {
 		return
 	}
@@ -86,12 +116,12 @@ func (x *kazPackIndex) add(id uint64, loc kazPackLoc) {
 	}
 	ids[id] = loc.length
 	x.order = append(x.order, id)
-	for len(x.byID) > kazPackIndexMax && len(x.order) > 0 {
+	for len(x.byID) > x.max && len(x.order) > 0 {
 		old := x.order[0]
 		x.order = x.order[1:]
 		x.removeLocked(old)
 	}
-	if len(x.order) >= 2*kazPackIndexMax {
+	if len(x.order) >= 2*x.max {
 		// Removed ids stay in order until here; keep only the live ones.
 		live := make([]uint64, 0, len(x.byID))
 		for _, o := range x.order {
@@ -169,16 +199,32 @@ type kazStagingPackStore interface {
 	KazReleaseStaged(ids []uint64, packed map[uint64]bool)
 	KazStagingPackEvent(event string, n int)
 	KazPutStaged(id uint64, data []byte, tier uint8) error
+	KazSetStagingForget(f func(id uint64))
+	KazStagedPending(refs []chunk.KazStagedRef) []bool
 }
 
-// kazRememberStaged records a committed (or possibly committed) slice in the
-// pack index when packing is on, writeback stages it, and it is one block.
-func (w *dataWriter) kazRememberStaged(inode Ino, indx uint32, s *sliceWriter) {
-	idx := w.conf.kazPackIdx
-	if idx == nil || !w.conf.Chunk.Writeback || s.length == 0 || int(s.length) >= w.conf.Chunk.BlockSize {
+// kazRememberStaged records committed (or possibly committed) slices of one
+// chunk in the pack index when packing is on and writeback is on, keeping only
+// single-block slices whose staged block still waits unput (one immediately
+// uploaded is never recorded).
+func (w *dataWriter) kazRememberStaged(inode Ino, indx uint32, ss []*sliceWriter) {
+	idx := w.conf.kazPackIndex()
+	if idx == nil || !w.conf.Chunk.Writeback {
 		return
 	}
-	idx.add(s.id, kazPackLoc{inode: inode, indx: indx, length: int(s.length)})
+	st, ok := w.store.(kazStagingPackStore)
+	if !ok {
+		return
+	}
+	var refs []chunk.KazStagedRef
+	for _, s := range ss {
+		if s.length > 0 && int(s.length) < w.conf.Chunk.BlockSize {
+			refs = append(refs, chunk.KazStagedRef{ID: s.id, Length: int(s.length)})
+		}
+	}
+	if len(refs) > 0 {
+		idx.addPending(inode, indx, refs, st.KazStagedPending)
+	}
 }
 
 // kazInitStagingPack registers the staging packer when --kaz-staging-pack is on
@@ -196,7 +242,13 @@ func (v *VFS) kazInitStagingPack() {
 		logger.Warnf("kaz staging pack: the metadata client does not support it; disabled")
 		return
 	}
-	v.Conf.kazPackIdx = newKazPackIndex()
+	if v.Conf.kazPack == nil {
+		logger.Warnf("kaz staging pack: the writer was not prepared for it; disabled")
+		return
+	}
+	idx := newKazPackIndex(kazPackIndexMax)
+	v.Conf.kazPack.idx.Store(idx)
+	st.KazSetStagingForget(func(id uint64) { idx.remove(id) })
 	st.KazSetStagingPacker(v.kazPackStaged)
 }
 
@@ -206,7 +258,7 @@ func (v *VFS) kazInitStagingPack() {
 // packed; the others go back to the upload queue. It reports whether id itself
 // was packed (its own object is then never put).
 func (v *VFS) kazPackStaged(id uint64, length int) bool {
-	idx := v.Conf.kazPackIdx
+	idx := v.Conf.kazPackIndex()
 	st, sok := v.Store.(kazStagingPackStore)
 	pk, mok := v.Meta.(meta.KazStagingPacker)
 	if idx == nil || !sok || !mok {

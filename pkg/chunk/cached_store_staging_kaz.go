@@ -116,10 +116,15 @@ func (store *cachedStore) finishStagingUpload(key string, item *pendingItem, ble
 	}
 	store.bcache.uploaded(key, blen)
 	store.pendingMutex.Lock()
-	if store.pendingKeys[key] == item {
+	removed := store.pendingKeys[key] == item
+	if removed {
 		delete(store.pendingKeys, key)
 	}
 	store.pendingMutex.Unlock()
+	if removed {
+		// kaz: the uploaded slice can no longer be packed.
+		store.kazForgetStaged(key)
+	}
 	if err := store.bcache.removeStage(key); err != nil {
 		logger.Warnf("failed to remove stage %s after upload: %s", key, err)
 	}
@@ -144,7 +149,7 @@ func (store *cachedStore) Retire(id uint64, length int) error {
 	keys := kazSliceKeys(id, length, store)
 	var err error
 	busy := false
-	var marked []string
+	var marked, removed []string
 	first := true
 	cancel := func() {
 		store.pendingMutex.Lock()
@@ -156,6 +161,9 @@ func (store *cachedStore) Retire(id uint64, length int) error {
 					marked = append(marked, key)
 				}
 			}
+			if store.pendingKeys[key] != nil {
+				removed = append(removed, key)
+			}
 			delete(store.pendingKeys, key)
 			if store.activeStaging[key] > 0 || store.activeStageWrites[key] > 0 {
 				busy = true
@@ -164,12 +172,20 @@ func (store *cachedStore) Retire(id uint64, length int) error {
 	}
 	cancel()
 	first = false
+	// kaz: retired slices leave the staging pack index (outside pendingMutex).
+	for _, key := range removed {
+		store.kazForgetStaged(key)
+	}
+	removed = nil
 	for _, key := range keys {
 		err = errors.Join(err, store.retireCache(key))
 	}
 	// A scanner can register and start between initial cancellation and local unlink.
 	// Rechecking after unlink sees that I/O; later admission rejects the absent stage file.
 	cancel()
+	for _, key := range removed {
+		store.kazForgetStaged(key)
+	}
 	if busy {
 		err = errors.Join(err, ErrSliceUploadInFlight)
 	}

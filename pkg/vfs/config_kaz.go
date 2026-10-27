@@ -30,7 +30,8 @@ type KazVfsConfig struct {
 	MetaWriteBatch     int           // Maximum slices of one chunk committed per metadata transaction; 0 disables batching.
 	KazStagingPack     bool          // Pack staged small slices of one chunk when they are uploaded (--kaz-staging-pack).
 
-	// kazPackIdx is runtime state, not a setting: the slice -> chunk index of the
-	// staging packer, set by kazInitStagingPack (nil when packing is off).
-	kazPackIdx *kazPackIndex
+	// kazPack is runtime state, not a setting: allocated before the writer starts
+	// any goroutine when KazStagingPack is on, so plain reads of the pointer are
+	// safe; the index inside is published atomically by kazInitStagingPack.
+	kazPack *kazPackState
 }

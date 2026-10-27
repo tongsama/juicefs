@@ -84,6 +84,8 @@ type kazStoreState struct {
 	kazClaimedKeys map[uint64]string
 	// kazPacker is the staging packer registered by the vfs layer (nil when off).
 	kazPacker atomic.Pointer[func(id uint64, length int) bool]
+	// kazForget is told when a small single-block slice leaves the pending set (nil when off).
+	kazForget atomic.Pointer[func(id uint64)]
 	// kazPackTotal counts staging-pack events (kaz_staging_pack_total{event}).
 	kazPackTotal *prometheus.CounterVec
 }

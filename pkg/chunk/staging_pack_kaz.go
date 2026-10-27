@@ -143,6 +143,46 @@ func (store *cachedStore) KazSetStagingPacker(p func(id uint64, length int) bool
 	store.kazPacker.Store(&p)
 }
 
+// KazSetStagingForget registers f, called with the slice id when the staged
+// block of a small single-block slice leaves the pending set (upload completed
+// or retired), so the vfs pack index can drop it.
+func (store *cachedStore) KazSetStagingForget(f func(id uint64)) {
+	if f == nil {
+		store.kazForget.Store(nil)
+		return
+	}
+	store.kazForget.Store(&f)
+}
+
+// kazForgetStaged tells the registered forget callback that key left the
+// pending set when it is block 0 of a single-block slice. The caller must not
+// hold pendingMutex.
+func (store *cachedStore) kazForgetStaged(key string) {
+	f := store.kazForget.Load()
+	if f == nil {
+		return
+	}
+	if id, length, ok := kazParseSingleBlockKey(key); ok && length < store.conf.BlockSize {
+		(*f)(id)
+	}
+}
+
+// KazStagedPending reports, for each ref, whether its staged block is pending,
+// waiting and never PUT, i.e. could still be packed. It takes pendingMutex once.
+func (store *cachedStore) KazStagedPending(refs []KazStagedRef) []bool {
+	res := make([]bool, len(refs))
+	store.pendingMutex.Lock()
+	defer store.pendingMutex.Unlock()
+	for i, ref := range refs {
+		if ref.Length <= 0 || ref.Length >= store.conf.BlockSize {
+			continue
+		}
+		item := store.pendingKeys[sliceForRead(ref.ID, ref.Length, store).key(0)]
+		res[i] = item != nil && item.kaz.state == kazStagingWait && !item.kaz.putStarted
+	}
+	return res
+}
+
 // KazStagingPackEvent adds n to kaz_staging_pack_total{event}.
 func (store *cachedStore) KazStagingPackEvent(event string, n int) {
 	if store.kazPackTotal != nil && n > 0 {
