@@ -141,7 +141,7 @@ func testWriteSlices(t *testing.T, m Meta) {
 				t.Fatalf("write: %s", st)
 			}
 		}
-		if n, st, _ := m.WriteSlices(ctx, b, 1, wb, mtime); n != len(wb) || st != 0 {
+		if n, st, _ := m.(KazSliceWriter).WriteSlices(ctx, b, 1, wb, mtime); n != len(wb) || st != 0 {
 			t.Fatalf("WriteSlices = %d, %s", n, st)
 		}
 		if la, lb := chunkLayout(t, m, a, 1, wa), chunkLayout(t, m, b, 1, wb); !reflect.DeepEqual(la, lb) {
@@ -166,7 +166,7 @@ func testWriteSlices(t *testing.T, m Meta) {
 	t.Run("single slice uses Write", func(t *testing.T) {
 		_, f := createIn(t, m, "single")
 		ws := sliceShapes(t, m, 1, 0)
-		if n, st, _ := m.WriteSlices(ctx, f, 0, ws, mtime); n != 1 || st != 0 {
+		if n, st, _ := m.(KazSliceWriter).WriteSlices(ctx, f, 0, ws, mtime); n != 1 || st != 0 {
 			t.Fatalf("WriteSlices = %d, %s", n, st)
 		}
 		if l := chunkLayout(t, m, f, 0, ws); len(l) != 1 || l[0].Id != 1 {
@@ -183,7 +183,7 @@ func testWriteSlices(t *testing.T, m Meta) {
 		m.getBase().loadQuotas()
 		_ = dir
 		ws := sliceShapes(t, m, 4, 0)
-		n, st, _ := m.WriteSlices(ctx, f, 0, ws, mtime)
+		n, st, _ := m.(KazSliceWriter).WriteSlices(ctx, f, 0, ws, mtime)
 		if n != 3 || st != syscall.EDQUOT {
 			t.Fatalf("WriteSlices = %d, %s; want 3, EDQUOT", n, st)
 		}
@@ -194,7 +194,7 @@ func testWriteSlices(t *testing.T, m Meta) {
 
 	t.Run("missing inode", func(t *testing.T) {
 		ws := sliceShapes(t, m, 3, 0)
-		if n, st, _ := m.WriteSlices(ctx, Ino(1<<40), 0, ws, mtime); n != 0 || st != syscall.ENOENT {
+		if n, st, _ := m.(KazSliceWriter).WriteSlices(ctx, Ino(1<<40), 0, ws, mtime); n != 0 || st != syscall.ENOENT {
 			t.Fatalf("WriteSlices = %d, %s; want 0, ENOENT", n, st)
 		}
 	})
@@ -202,7 +202,7 @@ func testWriteSlices(t *testing.T, m Meta) {
 	t.Run("directory inode", func(t *testing.T) {
 		dir, _ := createIn(t, m, "notfile")
 		ws := sliceShapes(t, m, 3, 0)
-		if n, st, _ := m.WriteSlices(ctx, dir, 0, ws, mtime); n != 0 || st != syscall.EPERM {
+		if n, st, _ := m.(KazSliceWriter).WriteSlices(ctx, dir, 0, ws, mtime); n != 0 || st != syscall.EPERM {
 			t.Fatalf("WriteSlices = %d, %s; want 0, EPERM", n, st)
 		}
 	})
@@ -215,7 +215,7 @@ func testWriteSlices(t *testing.T, m Meta) {
 		}
 		defer m.Close(ctx, f)
 		ws := sliceShapes(t, m, 4, 0)
-		if n, st, _ := m.WriteSlices(ctx, f, 0, ws, mtime); n != 4 || st != 0 {
+		if n, st, _ := m.(KazSliceWriter).WriteSlices(ctx, f, 0, ws, mtime); n != 4 || st != 0 {
 			t.Fatalf("WriteSlices = %d, %s", n, st)
 		}
 		// The open-file chunk cache must not keep the pre-batch slice list.
@@ -245,7 +245,7 @@ func TestWriteSlicesTKVDuplicate(t *testing.T) {
 	if st := m.Write(ctx, f, 0, ws[1].Off, ws[1].Slice, time.Now()); st != 0 {
 		t.Fatal(st)
 	}
-	if n, st, _ := m.WriteSlices(ctx, f, 0, ws, time.Now()); n != 3 || st != 0 {
+	if n, st, _ := m.(KazSliceWriter).WriteSlices(ctx, f, 0, ws, time.Now()); n != 3 || st != 0 {
 		t.Fatalf("WriteSlices = %d, %s", n, st)
 	}
 	var ss []Slice
@@ -309,7 +309,7 @@ func TestWriteSlicesNoRetryOnUnknownError(t *testing.T) {
 		fe := &failingBatchEngine{engine: orig, err: tc.err, singleErr: tc.singleErr}
 		b.en = fe
 		_, f := createIn(t, m, fmt.Sprint("retry-", int(tc.err), "-", int(tc.singleErr)))
-		n, st, uncertain := m.WriteSlices(Background(), f, 0, sliceShapes(t, m, 3, 0), time.Now())
+		n, st, uncertain := m.(KazSliceWriter).WriteSlices(Background(), f, 0, sliceShapes(t, m, 3, 0), time.Now())
 		if n != tc.wantN || st != tc.wantSt || uncertain != tc.wantUncertain || fe.single.Load() != tc.wantSingle {
 			t.Errorf("%s/%s: n=%d st=%s uncertain=%v single=%d; want %d %s %v %d", tc.err, tc.singleErr,
 				n, st, uncertain, fe.single.Load(), tc.wantN, tc.wantSt, tc.wantUncertain, tc.wantSingle)
@@ -409,7 +409,7 @@ func TestWriteSlicesTKVChangeLogFallsBack(t *testing.T) {
 	if st := bw.doWriteSlices(Background(), f, 0, sliceShapes(t, m, 3, 0), time.Now(), &n, &delta, &attr); st != errWriteSlicesFallback {
 		t.Fatalf("doWriteSlices with change log: st=%s, want the fallback errno", st)
 	}
-	if n, st, _ := m.WriteSlices(Background(), f, 0, sliceShapes(t, m, 3, 0), time.Now()); n != 3 || st != 0 {
+	if n, st, _ := m.(KazSliceWriter).WriteSlices(Background(), f, 0, sliceShapes(t, m, 3, 0), time.Now()); n != 3 || st != 0 {
 		t.Fatalf("WriteSlices = %d, %s", n, st)
 	}
 }

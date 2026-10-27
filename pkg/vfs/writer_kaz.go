@@ -124,7 +124,20 @@ func (c *chunkWriter) commitSlices(batch []*sliceWriter, mtime time.Time) (int, 
 			ws[i] = meta.SliceWrite{Off: s.off, Slice: meta.Slice{Id: s.id, Size: s.length, Off: s.soff, Len: s.slen}}
 			logger.Debugf("slice commit inode=%d chunk=%d slice=%d phase=metadata batch=%d", f.inode, c.indx, s.id, len(batch))
 		}
-		n, err, uncertain = f.w.m.WriteSlices(meta.Background(), f.inode, c.indx, ws, mtime)
+		if bw, ok := f.w.m.(meta.KazSliceWriter); ok {
+			n, err, uncertain = bw.WriteSlices(meta.Background(), f.inode, c.indx, ws, mtime)
+		} else {
+			// A Meta without KazSliceWriter commits the batch one slice at a time,
+			// like baseMeta.WriteSlices does for engines without batch support:
+			// slices after a failed one are not written, so the outcome is certain.
+			n = len(ws)
+			for i, w := range ws {
+				if err = f.w.m.Write(meta.Background(), f.inode, c.indx, w.Off, w.Slice, mtime); err != 0 {
+					n = i
+					break
+				}
+			}
+		}
 	}
 	if elapsed := time.Since(start); elapsed >= time.Second {
 		logger.Warnf("slow slice commit inode=%d chunk=%d slice=%d metadata=%s errno=%s batch=%d", f.inode, c.indx, batch[0].id, elapsed, err, len(batch))

@@ -89,7 +89,7 @@ func (m *gatedWriteMeta) WriteSlices(ctx meta.Context, inode Ino, indx uint32, s
 	if g != nil {
 		<-g
 	}
-	return m.Meta.WriteSlices(ctx, inode, indx, slices, mtime)
+	return m.Meta.(meta.KazSliceWriter).WriteSlices(ctx, inode, indx, slices, mtime)
 }
 
 // awaitCommitStart waits until a commit of chunk indx reaches the gated metadata layer.

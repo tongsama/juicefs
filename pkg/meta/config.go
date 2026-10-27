@@ -91,24 +91,7 @@ func DefaultConf() *Config {
 
 func (c *Config) SelfCheck() {
 	// kaz: validate the kaz settings and warn about modes that may disrupt the workload.
-	if err := c.ValidateCompactionScheduler(); err != nil {
-		logger.Warnf("%s; falling back to legacy compaction scheduler", err)
-		c.CompactionScheduler = "legacy"
-	}
-	if err := c.ValidateCompactionGC(); err != nil {
-		logger.Warnf("%s; falling back to legacy compaction GC", err)
-		c.CompactionGCMode = "legacy"
-	}
-	if err := c.ValidateKazCompactionPolicy(); err != nil {
-		logger.Warnf("%s; falling back to the upstream compaction triggers", err)
-		c.KazCompactionReadMin = 0
-	}
-	if err := c.ValidateKazBlockCompaction(); err != nil {
-		logger.Warnf("%s; falling back to upstream compaction", err)
-		c.KazCompactionMode, c.KazCompactionBlockHiddenRatio, c.KazCompactionBlockMaxSlices = "", 0, 0
-		c.KazCompactionDeltaTiers, c.KazCompactionDeltaMaxRecords, c.KazCompactionDeltaGap, c.KazCompactionDeltaMinFileSize = 0, 0, 0, 0
-		c.KazCompactionDeltaTrigger, c.KazCompactionDeltaBlockRatio = 0, 0
-	}
+	c.kazSelfCheck()
 	if c.MaxDeletes < 0 {
 		logger.Warnf("max-deletes=%d means synchronous object deletion in the caller, not unlimited deletion concurrency; this can delay compaction and writes. Use a positive max-deletes value for background deletion workers", c.MaxDeletes)
 	}
@@ -123,14 +106,6 @@ func (c *Config) SelfCheck() {
 		logger.Warnf("heartbeat should not be greater than 10 minutes")
 		c.Heartbeat = time.Minute * 10
 	}
-}
-
-// ValidateCompactionScheduler accepts only legacy and bounded advisory priority scheduling.
-func (c *Config) ValidateCompactionScheduler() error {
-	if c.CompactionScheduler == "" || c.CompactionScheduler == "legacy" || c.CompactionScheduler == "priority" {
-		return nil
-	}
-	return fmt.Errorf("invalid kaz-compaction-scheduler %q (want legacy or priority)", c.CompactionScheduler)
 }
 
 type Format struct {
@@ -366,19 +341,4 @@ func (f *Format) Decrypt() error {
 	decrypt(&f.SessionToken)
 	f.KeyEncrypted = false
 	return err
-}
-
-// ValidateCompactionGC rejects settings without durable-marker recovery and background deletion.
-func (c *Config) ValidateCompactionGC() error {
-	switch c.CompactionGCMode {
-	case "", "legacy":
-		return nil
-	case "deferred":
-		if c.MaxDeletes <= 0 || c.NoBGJob || c.ReadOnly {
-			return fmt.Errorf("deferred compaction GC requires positive max-deletes and writable session background recovery")
-		}
-		return nil
-	default:
-		return fmt.Errorf("invalid kaz-compaction-gc-mode %q (want legacy or deferred)", c.CompactionGCMode)
-	}
 }
