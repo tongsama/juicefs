@@ -277,8 +277,11 @@ func TestKazTryPackHook(t *testing.T) {
 		return ret
 	})
 	key := stageRetireSlice(t, store, 1, []byte("aaa"))
-	store.uploadStagingFile(key, "")
-	require.Equal(t, int64(0), objects.putCalls.Load())
+	store.pendingMutex.Lock()
+	path1 := store.pendingKeys[key].fpath
+	store.pendingMutex.Unlock()
+	store.uploadStagingFile(key, path1)
+	require.Equal(t, int64(1), objects.putCalls.Load()) // result true is ignored: still PUT when state is wait
 	require.Equal(t, []KazStagedRef{{ID: 1, Length: 3}}, calls)
 
 	ret = false
@@ -287,7 +290,7 @@ func TestKazTryPackHook(t *testing.T) {
 	path := store.pendingKeys[key].fpath
 	store.pendingMutex.Unlock()
 	store.uploadStagingFile(key, path)
-	require.Equal(t, int64(1), objects.putCalls.Load())
+	require.Equal(t, int64(2), objects.putCalls.Load())
 
 	// block number 1 and a full block are never offered to the packer.
 	calls = nil
@@ -324,4 +327,81 @@ func TestKazClaimIgnoresDelay(t *testing.T) {
 	claimed, absent := store.KazClaimStaged([]KazStagedRef{{ID: 1, Length: 3}})
 	require.Len(t, claimed, 1)
 	require.Empty(t, absent)
+}
+
+// kazDequeueUpload dequeues one pending item as an uploader does and uploads it.
+func kazDequeueUpload(t *testing.T, store *cachedStore) *pendingItem {
+	t.Helper()
+	item := <-store.pendingCh
+	store.uploadStagingFile(item.key, item.fpath)
+	return item
+}
+
+// TestKazHookReleasedNotPackedStillPut checks that a packer that releases without packing leaves one PUT.
+func TestKazHookReleasedNotPackedStillPut(t *testing.T) {
+	store, _, objects := newRetireFixture(t, 0)
+	store.KazSetStagingPacker(func(id uint64, length int) bool {
+		c, _ := store.KazClaimStaged([]KazStagedRef{{ID: id, Length: length}})
+		store.KazReleaseStaged([]uint64{id}, nil)
+		return len(c) > 0
+	})
+	stageRetireSlice(t, store, 1, []byte("aaa"))
+	kazDequeueUpload(t, store)
+	require.Equal(t, int64(1), objects.putCalls.Load())
+}
+
+// TestKazHookPackedNoPut checks that a packed item is not PUT and its trigger is freed.
+func TestKazHookPackedNoPut(t *testing.T) {
+	store, _, objects := newRetireFixture(t, 0)
+	store.KazSetStagingPacker(func(id uint64, length int) bool {
+		store.KazClaimStaged([]KazStagedRef{{ID: id, Length: length}})
+		store.KazReleaseStaged([]uint64{id}, map[uint64]bool{id: true})
+		return true
+	})
+	stageRetireSlice(t, store, 1, []byte("aaa"))
+	item := kazDequeueUpload(t, store)
+	require.Equal(t, int64(0), objects.putCalls.Load())
+	require.False(t, item.uploading.Load())
+}
+
+// TestKazTryPackOutsideUploadHours checks that the packer is not called outside the upload window.
+func TestKazTryPackOutsideUploadHours(t *testing.T) {
+	store, _, _ := newRetireFixture(t, time.Hour)
+	h := time.Now().Hour()
+	store.startHour, store.endHour = (h+1)%24, (h+2)%24
+	called := false
+	store.KazSetStagingPacker(func(uint64, int) bool { called = true; return true })
+	key := stageRetireSlice(t, store, 1, []byte("aaa"))
+	store.kazTryPack(key)
+	require.False(t, called)
+}
+
+// TestKazPutStagedNoDeadlock checks that KazPutStaged works while the only upload slot is held.
+func TestKazPutStagedNoDeadlock(t *testing.T) {
+	store, disk, objects := newRetireFixture(t, time.Hour)
+	disk.pending = make(chan pendingFile, 10) // the fixture has no flusher: keep cached pages in memory
+	store.currentUpload = make(chan struct{}, 1)
+	store.currentUpload <- struct{}{}
+	done := make(chan error, 1)
+	go func() { done <- store.KazPutStaged(7, []byte("hello"), 0) }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("KazPutStaged blocked on currentUpload")
+	}
+	key := sliceForRead(7, 5, store).key(0)
+	_, err := objects.ObjectStorage.Head(context.Background(), key)
+	require.NoError(t, err)
+	require.Error(t, store.KazPutStaged(8, nil, 0))
+	require.Error(t, store.KazPutStaged(8, make([]byte, 4097), 0))
+
+	// the read after packing must hit the cache, not object storage.
+	require.NoError(t, objects.ObjectStorage.Delete(context.Background(), key))
+	page := NewPage(make([]byte, 5))
+	defer page.Release()
+	n, err := store.NewReader(7, 5).ReadAt(context.Background(), page, 0)
+	require.NoError(t, err)
+	require.Equal(t, 5, n)
+	require.Equal(t, []byte("hello"), page.Data)
 }

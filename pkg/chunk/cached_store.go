@@ -1094,10 +1094,8 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 		<-store.currentUpload
 	}()
 
-	// kaz: let the staging packer take small single-block slices instead of a single PUT.
-	if store.kazTryPack(key) {
-		return
-	}
+	// kaz: offer small single-block slices to the staging packer; beginStagingUpload below decides by state.
+	store.kazTryPack(key)
 	// kaz: check the pending intent and keep the PUT and its cleanup visible to durable GC.
 	item := store.beginStagingUpload(key)
 	if item == nil {

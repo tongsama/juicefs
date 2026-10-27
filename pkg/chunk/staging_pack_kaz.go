@@ -17,9 +17,13 @@
 package chunk
 
 import (
+	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/juicedata/juicefs/pkg/object"
 )
 
 // This file holds the kaz staging-pack state of pending items.
@@ -165,24 +169,50 @@ func kazParseSingleBlockKey(key string) (id uint64, length int, ok bool) {
 	return id, l, true
 }
 
-// kazTryPack offers a small single-block key to the registered packer and
-// reports whether the packer took over (so no single-object PUT is needed).
-func (store *cachedStore) kazTryPack(key string) bool {
+// kazTryPack offers a small single-block key to the registered packer. It does
+// nothing outside the upload window or when the item is not a plain waiting one.
+// The packer's result is ignored: the caller always continues into
+// beginStagingUpload, which decides by the item's state (packed/claimed: no PUT).
+func (store *cachedStore) kazTryPack(key string) {
 	p := store.kazPacker.Load()
-	if p == nil {
-		return false
+	if p == nil || !store.canUpload() {
+		return
 	}
 	id, length, ok := kazParseSingleBlockKey(key)
 	if !ok || length >= store.conf.BlockSize {
-		return false
+		return
 	}
-	return (*p)(id, length)
+	store.pendingMutex.Lock()
+	item := store.pendingKeys[key]
+	eligible := item != nil && item.kaz.state == kazStagingWait && !item.kaz.putStarted && store.activeStaging[key] == 0
+	store.pendingMutex.Unlock()
+	if eligible {
+		(*p)(id, length)
+	}
+}
+
+// KazPutStaged puts the single-block object of slice id (length len(data), at most
+// BlockSize) synchronously and caches it for reads. It does not take a currentUpload
+// slot, so a packer running inside an uploader cannot deadlock on MaxUpload.
+func (store *cachedStore) KazPutStaged(id uint64, data []byte, tier uint8) error {
+	if len(data) == 0 || len(data) > store.conf.BlockSize {
+		return fmt.Errorf("invalid staged block length %d for slice %d", len(data), id)
+	}
+	key := sliceForRead(id, len(data), store).key(0)
+	block := NewOffPage(len(data))
+	copy(block.Data, data)
+	ctx := context.WithValue(context.Background(), object.TierKey{}, tier)
+	// A non-nil wSlice selects the synchronous path: MaxRetries+1 tries and read-cache population.
+	return store.upload(ctx, key, block, &wSlice{rSlice: rSlice{id: id, length: len(data), store: store}})
 }
 
 // KazClaimStaged claims the staged blocks of refs for packing. Items that are
 // waiting, never PUT and not busy become claimed (even when queued for upload or
 // still inside the upload delay) and their data is read from the staging file.
 // Ids without a pending item are returned in absent; other ids are in neither.
+// A returned slice may have been retired concurrently; the caller must drop ids
+// that are not in the chunk records. Every claimed id must later be released:
+// kazClaimedKeys entries are cleared only by KazReleaseStaged.
 func (store *cachedStore) KazClaimStaged(refs []KazStagedRef) (claimed []KazStagedData, absent []uint64) {
 	type claim struct {
 		ref  KazStagedRef
