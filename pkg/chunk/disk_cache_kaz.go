@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // kazDiskCache and kazNewDiskCache are the names kaz code uses for the local
@@ -30,10 +31,96 @@ type kazDiskCache = cacheStore
 
 var kazNewDiskCache = newCacheStore
 
-// flushPage writes data to path via a tmp file and rename without syncing it.
-// It keeps upstream's signature; kaz's durable variant is flushPageOpt.
-func (cache *kazDiskCache) flushPage(path string, data []byte, dropCache bool, tierID uint8) error {
-	return cache.flushPageOpt(path, data, dropCache, tierID, false)
+// flushPageOpt is a copy of upstream's flushPage with kaz's durable handling added.
+// With durable set, the data is synced before the rename publishes the name, and the
+// rename plus the directory chain are synced afterwards, so an OS crash cannot leave a
+// published block with missing contents or lose its name. When upstream changes
+// flushPage, apply the same fix here.
+func (cache *kazDiskCache) flushPageOpt(path string, data []byte, dropCache bool, tierID uint8, durable bool) (err error) {
+	if !cache.available() {
+		return errCacheDown
+	}
+
+	start := time.Now()
+	cache.m.cacheWrites.Add(1)
+	cache.m.cacheWriteBytes.Add(float64(len(data)))
+	defer func() {
+		cache.m.cacheWriteHist.Observe(time.Since(start).Seconds())
+	}()
+	dir := filepath.Dir(path)
+	cache.createDir(dir)
+	tmp := path + ".tmp"
+
+	var f *os.File
+	err = cache.checkErr(func() error {
+		f, err = os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE, cache.mode)
+		return err
+	})
+	if err != nil {
+		logger.Warnf("Can't create cache file %s: %s", tmp, err)
+		return err
+	}
+
+	defer func() {
+		if err != nil {
+			_ = cache.removeFile(tmp)
+		}
+	}()
+
+	if err = cache.writeFile(f, data); err != nil {
+		logger.Warnf("Write to cache file %s failed: %s", tmp, err)
+		_ = f.Close()
+		return
+	}
+	if cache.checksum != CsNone {
+		if err = cache.writeFile(f, checksum(data)); err != nil {
+			logger.Warnf("Write checksum to cache file %s failed: %s", tmp, err)
+			_ = f.Close()
+			return
+		}
+	}
+	if tierID != 0 {
+		// only staged file has a footer
+		footer := stageFooter{Tier: tierID}
+		var fData []byte
+		fData, err = (&footer).marshal(cache.checksum != CsNone)
+		if err != nil {
+			logger.Warnf("Marshal stage footer for cache file %s failed: %s", tmp, err)
+			_ = f.Close()
+			return
+		}
+		if err = cache.writeFile(f, fData); err != nil {
+			logger.Warnf("Write stage footer to cache file %s failed: %s", tmp, err)
+			_ = f.Close()
+			return
+		}
+	}
+	if durable {
+		if err = cache.checkErr(func() error { return syncStagingFile(f) }); err != nil {
+			logger.Warnf("Sync cache file %s failed: %s", tmp, err)
+			_ = f.Close()
+			return
+		}
+	}
+	if dropCache {
+		dropOSCache(f)
+	}
+	if err = cache.closeFile(f); err != nil {
+		logger.Warnf("Close cache file %s failed: %s", tmp, err)
+		return
+	}
+	if err = cache.renameFile(tmp, path); err != nil {
+		logger.Warnf("Rename cache file %s -> %s failed: %s", tmp, path, err)
+		return
+	}
+	if durable {
+		if err = cache.syncDirs(dir); err != nil {
+			logger.Warnf("Sync directory of cache file %s failed: %s", path, err)
+			// The name may not survive a crash; withdraw it so the caller falls back to a direct upload.
+			_ = cache.removeFile(path)
+		}
+	}
+	return
 }
 
 // kazPeeker is implemented by key indexes that can look up a key without

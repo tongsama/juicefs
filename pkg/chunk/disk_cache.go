@@ -513,10 +513,7 @@ func (cache *cacheStore) curFreeRatio() DiskFreeRatio {
 	return usage
 }
 
-// kaz: flushPageOpt is flushPage with a durable option. With durable set, the data is synced before the
-// rename publishes the name, and the rename plus the directory chain are synced afterwards, so an OS crash
-// cannot leave a published block with missing contents or lose its name.
-func (cache *cacheStore) flushPageOpt(path string, data []byte, dropCache bool, tierID uint8, durable bool) (err error) {
+func (cache *cacheStore) flushPage(path string, data []byte, dropCache bool, tierID uint8) (err error) {
 	if !cache.available() {
 		return errCacheDown
 	}
@@ -527,8 +524,7 @@ func (cache *cacheStore) flushPageOpt(path string, data []byte, dropCache bool, 
 	defer func() {
 		cache.m.cacheWriteHist.Observe(time.Since(start).Seconds())
 	}()
-	dir := filepath.Dir(path)
-	cache.createDir(dir)
+	cache.createDir(filepath.Dir(path))
 	tmp := path + ".tmp"
 
 	var f *os.File
@@ -575,13 +571,6 @@ func (cache *cacheStore) flushPageOpt(path string, data []byte, dropCache bool, 
 			return
 		}
 	}
-	if durable {
-		if err = cache.checkErr(func() error { return syncStagingFile(f) }); err != nil {
-			logger.Warnf("Sync cache file %s failed: %s", tmp, err)
-			_ = f.Close()
-			return
-		}
-	}
 	if dropCache {
 		dropOSCache(f)
 	}
@@ -591,14 +580,6 @@ func (cache *cacheStore) flushPageOpt(path string, data []byte, dropCache bool, 
 	}
 	if err = cache.renameFile(tmp, path); err != nil {
 		logger.Warnf("Rename cache file %s -> %s failed: %s", tmp, path, err)
-		return
-	}
-	if durable {
-		if err = cache.syncDirs(dir); err != nil {
-			logger.Warnf("Sync directory of cache file %s failed: %s", path, err)
-			// The name may not survive a crash; withdraw it so the caller falls back to a direct upload.
-			_ = cache.removeFile(path)
-		}
 	}
 	return
 }
