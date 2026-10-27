@@ -52,6 +52,12 @@ func (store *cachedStore) beginStagingUpload(key string) *pendingItem {
 	defer store.pendingMutex.Unlock()
 	item := store.pendingKeys[key]
 	if item != nil {
+		if item.kaz.state != kazStagingWait {
+			// Claimed or packed items are not uploaded individually.
+			item.uploading.Store(false)
+			return nil
+		}
+		item.kaz.putStarted = true
 		if store.activeStaging == nil {
 			store.activeStaging = make(map[string]int)
 		}
@@ -72,6 +78,7 @@ func (store *cachedStore) beginImmediateStaging(key, path string, added time.Tim
 	if !item.uploading.CompareAndSwap(false, true) {
 		return nil
 	}
+	item.kaz.putStarted = true
 	if store.activeStaging == nil {
 		store.activeStaging = make(map[string]int)
 	}

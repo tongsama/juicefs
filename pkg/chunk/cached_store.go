@@ -50,6 +50,7 @@ type pendingItem struct {
 	fpath     string    // full path of local file corresponding to the key
 	ts        time.Time // timestamp when this item is added
 	uploading atomic.Bool
+	kaz       kazPendingInfo // guarded by cachedStore.pendingMutex
 }
 
 // slice for read and remove
@@ -477,7 +478,8 @@ func (s *wSlice) upload(indx int) {
 					}
 				}
 				// Pending intent must be visible before metadata can commit and retire the slice.
-				s.store.addDelayedStaging(key, stagingPath, time.Now(), false)
+				// kaz: remember that this mount's writer created the pending item.
+				s.store.kazAddLocalStaging(key, stagingPath, time.Now())
 				s.errors <- nil
 				block.Release()
 				return
@@ -1149,7 +1151,8 @@ func (store *cachedStore) addDelayedStaging(key, stagingPath string, added time.
 	}
 	item := store.pendingKeys[key]
 	if item == nil {
-		item = &pendingItem{key, stagingPath, added, atomic.Bool{}}
+		// kaz: named fields so the added kaz field does not break the literal.
+		item = &pendingItem{key: key, fpath: stagingPath, ts: added}
 		store.pendingKeys[key] = item
 	}
 	store.pendingMutex.Unlock()
@@ -1192,6 +1195,10 @@ func (store *cachedStore) scanDelayedStaging() {
 	store.pendingMutex.Lock()
 	defer store.pendingMutex.Unlock()
 	for _, item := range store.pendingKeys {
+		// kaz: a claimed or packed item is not uploaded individually.
+		if item.kaz.state != kazStagingWait {
+			continue
+		}
 		store.pendingMutex.Unlock()
 		if item.ts.Before(cutoff) && item.uploading.CompareAndSwap(false, true) {
 			store.pendingCh <- item
