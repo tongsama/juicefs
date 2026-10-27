@@ -150,6 +150,8 @@ func (store *cachedStore) KazCacheState(key string) (segment string, cached bool
 // when the fetched block is kept: not when the block is not cacheable
 // (shouldCache) and not for a compaction read under kaz-2q, which is not
 // cached; otherwise each small read would GET the whole object again.
+// It only matters for an uncompressed volume: with lz4 or zstd the store is
+// not seekable, so ReadAt never uses a range GET and always fetches whole.
 func (store *cachedStore) kazWholeRead(ctx context.Context, bs int) bool {
 	return store.conf.KazWholeReadMax > 0 && bs <= store.conf.KazWholeReadMax &&
 		store.shouldCache(bs) && !store.kazCompactionRead(ctx)
