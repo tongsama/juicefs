@@ -1141,7 +1141,6 @@ func replaceErrno(txf func(tx *redis.Tx) error) func(tx *redis.Tx) error {
 	}
 }
 
-// txn serializes watched keys and separates local lock contention from transaction time.
 func (m *redisMeta) txn(ctx Context, txf func(tx *redis.Tx) error, keys ...string) (result error) {
 	if m.conf.ReadOnly {
 		return syscall.EROFS
@@ -1158,20 +1157,11 @@ func (m *redisMeta) txn(ctx Context, txf func(tx *redis.Tx) error, keys ...strin
 	start := time.Now()
 	defer func() { m.txDist.Observe(time.Since(start).Seconds()) }()
 
-	logger.Debugf("metadata transaction key=%s phase=lock_wait", keys[0])
-	lockStart := time.Now()
+	tr := newKazTxnTrace(keys[0], start) // kaz: lock-wait and slow-transaction diagnostics (trace_kaz.go)
 	m.txLock(h)
-	lockWait := time.Since(lockStart)
-	activeStart := time.Now()
-	var attempts int
-	defer func() {
-		if total := time.Since(start); total >= time.Second {
-			logger.Warnf("slow metadata transaction key=%s total=%s lock_wait=%s active=%s attempts=%d err=%v",
-				keys[0], total, lockWait, time.Since(activeStart), attempts, result)
-		}
-	}()
+	tr.lockAcquired()
+	defer func() { tr.done(result) }()
 	defer m.txUnlock(h)
-	logger.Debugf("metadata transaction key=%s phase=active lock_wait=%s", keys[0], lockWait)
 	// TODO: enable retry for some of idempotent transactions
 	var (
 		retryOnFailure = false
@@ -1187,7 +1177,7 @@ func (m *redisMeta) txn(ctx Context, txf func(tx *redis.Tx) error, keys ...strin
 			logger.Warnf("Transaction %s interrupted after %s, tried %d, keys: %v", method.name(ctx), time.Since(start), i+1, keys)
 			return syscall.EINTR
 		}
-		attempts = i + 1
+		tr.attempt()
 		err := m.rdb.Watch(ctx, replaceErrno(txf), keys...)
 		if eno, ok := err.(errNo); ok {
 			if eno == 0 {

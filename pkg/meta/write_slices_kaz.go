@@ -39,7 +39,6 @@ type SliceWrite struct {
 	Slice Slice
 }
 
-// Write commits a slice and diagnoses stalls without changing inode lock ordering.
 // compactionWanted reports whether a chunk whose slice count grew from prev to
 // now passed a count at which a single Write would request compaction
 // (every count ending in 99, or more than 350 slices).

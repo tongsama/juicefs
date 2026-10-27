@@ -175,8 +175,7 @@ func (m *baseMeta) runKazBlockCompaction(r kazChunkReplacer, inode Ino, indx uin
 	// Same slow-compaction warning as upstream, marked with mode=block or mode=delta.
 	defer func() {
 		if total := time.Since(start); total >= time.Second {
-			logger.Warnf("slow compaction inode=%d chunk=%d once=false force=%t slices=%d bytes=%d total=%s queue_wait=%s object=%s metadata=%s mode=%s",
-				inode, indx, force, sliceCount, compactSize, total, queueWait, objectTime, metadataTime, slowMode)
+			kazLogSlowCompaction(inode, indx, false, force, sliceCount, compactSize, total, queueWait, objectTime, metadataTime, slowMode)
 		}
 	}()
 	defer func() {
