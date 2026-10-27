@@ -39,10 +39,12 @@ const kazTestStart uint32 = 1_000_000
 func newKazTestIndex(t *testing.T, blocks int64, ghostRatio float64) (*kaz2QIndex, *uint32) {
 	t.Helper()
 	conf := &Config{
-		CacheEviction:          EvictionKaz2Q,
-		KazCacheProbationRatio: 0.4,
-		KazCachePromoteDelay:   10 * time.Minute,
-		KazCacheGhostRatio:     ghostRatio,
+		CacheEviction: EvictionKaz2Q,
+		KazChunkConfig: KazChunkConfig{
+			KazCacheProbationRatio: 0.4,
+			KazCachePromoteDelay:   10 * time.Minute,
+			KazCacheGhostRatio:     ghostRatio,
+		},
 	}
 	clock := kazTestStart
 	p := newKaz2QIndex(conf)
@@ -756,11 +758,13 @@ func TestKaz2QGhostHitEventsExportedAtZero(t *testing.T) {
 func newKazTestIndexB(t *testing.T, blocks int64, ghostRatio float64, unreadFirst bool) (*kaz2QIndex, *uint32) {
 	t.Helper()
 	conf := &Config{
-		CacheEviction:             EvictionKaz2Q,
-		KazCacheProbationRatio:    0.4,
-		KazCachePromoteDelay:      10 * time.Minute,
-		KazCacheGhostRatio:        ghostRatio,
-		KazCacheDemoteUnreadFirst: unreadFirst,
+		CacheEviction: EvictionKaz2Q,
+		KazChunkConfig: KazChunkConfig{
+			KazCacheProbationRatio:    0.4,
+			KazCachePromoteDelay:      10 * time.Minute,
+			KazCacheGhostRatio:        ghostRatio,
+			KazCacheDemoteUnreadFirst: unreadFirst,
+		},
 	}
 	clock := kazTestStart
 	p := newKaz2QIndex(conf)

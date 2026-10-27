@@ -567,7 +567,6 @@ type Config struct {
 	DownloadLimit          int64 // bytes per second
 	Writeback              bool
 	WritebackThresholdSize int
-	StagingNoSync          bool // skip fdatasync/directory fsync of staged writeback blocks (unsafe on OS crash)
 	UploadDelay            time.Duration
 	UploadHours            string
 	HashPrefix             bool
@@ -579,32 +578,9 @@ type Config struct {
 	BufferSize             uint64
 	Readahead              int
 	Prefetch               int
-	// FinishCanceledGet keeps a full-block GET running after its reader is canceled,
-	// and stores the block in the disk cache instead of discarding the download.
-	FinishCanceledGet bool
-	// GetHeaderTimeout bounds only the wait for the response headers of a full-block GET
-	// (0 disables it). GetTimeout still bounds the whole GET, headers and body together.
-	GetHeaderTimeout time.Duration
 
-	// kaz-2q cache eviction options (used only when CacheEviction is kaz-2q).
-	// KazCacheProbationRatio is the share of the cache capacity for newly cached blocks (0 < x < 1).
-	KazCacheProbationRatio float64
-	// KazCachePromoteDelay is the correlated-reference period before a block can be promoted.
-	KazCachePromoteDelay time.Duration
-	// KazCacheGhostRatio is the evicted-key list capacity as a multiple of the cache capacity (0 disables).
-	KazCacheGhostRatio float64
-	// KazCacheStateInterval is the save interval of the kaz-cache-state.v1 file.
-	KazCacheStateInterval time.Duration
-	// KazCacheCompactionPlacement selects the segment of a compaction output (inherit, probation, replace, share).
-	KazCacheCompactionPlacement string
-	// KazCacheCompactionPlacementShareRatio is the protected share threshold of the share placement (0 < x <= 1).
-	KazCacheCompactionPlacementShareRatio float64
-	// KazCacheDemoteUnreadFirst demotes protected blocks without the read mark before those with it.
-	KazCacheDemoteUnreadFirst bool
-	// KazCacheCompactionHotAge keeps protected compaction outputs younger than this out of protected placement (0 disables).
-	KazCacheCompactionHotAge time.Duration
-	// KazWholeReadMax makes a cache-enabled read of a block of at most this many bytes fetch the whole object instead of a range (0 disables).
-	KazWholeReadMax int
+	// kaz: settings of the kaz features (config_kaz.go).
+	KazChunkConfig
 }
 
 func (c *Config) SelfCheck(uuid string) {
@@ -719,24 +695,22 @@ func (c *Config) CacheEnabled() bool {
 }
 
 type cachedStore struct {
-	storage           object.ObjectStorage
-	bcache            CacheManager
-	fetcher           *prefetcher
-	conf              Config
-	group             *Controller
-	currentUpload     chan struct{}
-	currentDownload   chan struct{}
-	pendingCh         chan *pendingItem
-	pendingKeys       map[string]*pendingItem
-	activeStaging     map[string]int // Protected by pendingMutex; bounded by currentUpload slots.
-	activeStageWrites map[string]int // Actual stage callbacks, including callbacks surviving their timeout.
-	pendingMutex      sync.Mutex
-	startHour         int
-	endHour           int
-	compressor        compress.Compressor
-	seekable          bool
-	upLimit           *ratelimit.Bucket
-	downLimit         *ratelimit.Bucket
+	storage         object.ObjectStorage
+	bcache          CacheManager
+	fetcher         *prefetcher
+	conf            Config
+	group           *Controller
+	currentUpload   chan struct{}
+	currentDownload chan struct{}
+	pendingCh       chan *pendingItem
+	pendingKeys     map[string]*pendingItem
+	pendingMutex    sync.Mutex
+	startHour       int
+	endHour         int
+	compressor      compress.Compressor
+	seekable        bool
+	upLimit         *ratelimit.Bucket
+	downLimit       *ratelimit.Bucket
 
 	cacheHits           prometheus.Counter
 	cacheMiss           prometheus.Counter
@@ -749,15 +723,8 @@ type cachedStore struct {
 	stageBlockDelay     prometheus.Counter
 	stageBlockErrors    prometheus.Counter
 
-	// detachedFetches bounds the GETs kept running for canceled readers (FinishCanceledGet).
-	detachedFetches     chan struct{}
-	canceledGetFinished prometheus.Counter
-	canceledGetDropped  prometheus.Counter
-	getHeaderTimeouts   prometheus.Counter
-
-	// headerTimedOut remembers keys recently cut by GetHeaderTimeout (key -> time).
-	headerTimedOutMu sync.Mutex
-	headerTimedOut   map[string]time.Time
+	// kaz: state of the kaz features (config_kaz.go).
+	kazStoreState
 }
 
 func logRequest(typeStr, key, param, reqID string, err error, used time.Duration) {
@@ -925,19 +892,17 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		config.PutTimeout = time.Second * 60
 	}
 	store := &cachedStore{
-		storage:           storage,
-		conf:              config,
-		currentUpload:     make(chan struct{}, config.MaxUpload),
-		currentDownload:   make(chan struct{}, config.MaxDownload),
-		detachedFetches:   make(chan struct{}, max(1, config.MaxDownload/2)),
-		compressor:        compressor,
-		seekable:          compressor.CompressBound(0) == 0,
-		pendingCh:         make(chan *pendingItem, 100*config.MaxUpload),
-		pendingKeys:       make(map[string]*pendingItem),
-		activeStaging:     make(map[string]int),
-		activeStageWrites: make(map[string]int),
-		group:             NewController(),
+		storage:         storage,
+		conf:            config,
+		currentUpload:   make(chan struct{}, config.MaxUpload),
+		currentDownload: make(chan struct{}, config.MaxDownload),
+		compressor:      compressor,
+		seekable:        compressor.CompressBound(0) == 0,
+		pendingCh:       make(chan *pendingItem, 100*config.MaxUpload),
+		pendingKeys:     make(map[string]*pendingItem),
+		group:           NewController(),
 	}
+	store.kazInitState(config)
 	if config.UploadLimit > 0 {
 		// there are overheads coming from HTTP/TCP/IP
 		store.upLimit = ratelimit.NewBucketWithRate(float64(config.UploadLimit)*0.85, config.UploadLimit/10)

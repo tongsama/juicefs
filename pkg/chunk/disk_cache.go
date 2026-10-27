@@ -105,9 +105,9 @@ type cacheStore struct {
 	// newBlockCooldown reduces the initial access time for newly cached staged blocks.
 	// This helps prevent a surge of writes from evicting active read blocks.
 	stagedBlockCooldown time.Duration
-	stagingSync         bool // make staged blocks durable before acknowledging writeback
-	durableMu           sync.Mutex
-	durableDirs         map[string]struct{} // staging dirs whose entries in their parents were synced by this process
+
+	// kaz: staging durability state (disk_cache_kaz.go).
+	kazDiskState
 }
 
 func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64, pendingPages int, config *Config, uploader func(key, path string, force bool) bool) *cacheStore {
@@ -141,8 +141,6 @@ func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64
 		uploader:            uploader,
 		opTs:                make(map[time.Duration]func() error),
 		stagedBlockCooldown: config.CacheExpire / 2,
-		stagingSync:         !config.StagingNoSync,
-		durableDirs:         make(map[string]struct{}),
 	}
 	c.stateLock = sync.Mutex{}
 	if config.Writeback {
@@ -160,7 +158,7 @@ func newCacheStore(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64
 		c.dir, humanize.FtoaWithDigits(float64((1-usage.br)*100), 1), humanize.FtoaWithDigits(float64((1-usage.fr)*100), 1))
 
 	c.setLimitByFreeRatio(usage, c.freeRatio)
-	c.kazAttach(c.capacity)
+	c.kazAttach(config)
 
 	c.createLockFile()
 	go c.checkLockFile()

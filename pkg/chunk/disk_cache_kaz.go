@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -140,13 +141,31 @@ func kazLookupNoTouch(keys KeyIndex, k cacheKey) *cacheItem {
 	return keys.get(k)
 }
 
-// kazAttach gives a kaz-2q index the effective store capacity (after the
+// kazDiskState holds the cacheStore state added by kaz for staging
+// durability. It is embedded in cacheStore and initialized by kazAttach; it
+// holds a lock, so it must not be copied.
+type kazDiskState struct {
+	stagingSync bool // make staged blocks durable before acknowledging writeback
+	durableMu   sync.Mutex
+	durableDirs map[string]struct{} // staging dirs whose entries in their parents were synced by this process
+}
+
+// kazAttach initializes the kaz state of a new store from config and attaches
+// the kaz-2q index (kazAttach2Q). newCacheStore calls it once after the
+// capacity is limited by the free ratio, before the store goroutines start.
+func (cache *kazDiskCache) kazAttach(config *Config) {
+	cache.stagingSync = !config.StagingNoSync
+	cache.durableDirs = make(map[string]struct{})
+	cache.kazAttach2Q(cache.capacity)
+}
+
+// kazAttach2Q gives a kaz-2q index the effective store capacity (after the
 // free-ratio limit; it sizes the protected limit and the evicted-key list
 // cap) and the shared metrics, imports the state file (so that the first
 // scan restores the segments) and starts the periodic state saver. It does
 // nothing for other eviction policies. It must run before the store
 // goroutines start.
-func (cache *kazDiskCache) kazAttach(capacity int64) {
+func (cache *kazDiskCache) kazAttach2Q(capacity int64) {
 	idx, ok := cache.keys.(*kaz2QIndex)
 	if !ok {
 		return

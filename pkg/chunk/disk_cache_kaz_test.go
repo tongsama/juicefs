@@ -55,7 +55,7 @@ func newKazTestStore(t *testing.T, m *cacheManagerMetrics) (*kazDiskCache, *kaz2
 	conf.CacheScanInterval = -1
 	s := newTestCacheStore(t.TempDir(), &conf, nil)
 	s.m = m
-	s.kazAttach(s.capacity)
+	s.kazAttach2Q(s.capacity)
 	idx, ok := s.keys.(*kaz2QIndex)
 	require.True(t, ok, "kaz-2q store must use kaz2QIndex")
 	clock := kazTestStart
@@ -361,7 +361,7 @@ func TestKaz2QMetricsReattach(t *testing.T) {
 	s.add(kazStoreKey(1), kazStoreBlock, *clock)
 	km := m.kaz2Q
 	require.Equal(t, 1.0, testutil.ToFloat64(km.blocks.WithLabelValues("probation")))
-	s.kazAttach(s.capacity)
+	s.kazAttach2Q(s.capacity)
 	require.Equal(t, 1.0, testutil.ToFloat64(km.blocks.WithLabelValues("probation")))
 	require.Equal(t, float64(kazStoreBlock), testutil.ToFloat64(km.bytes.WithLabelValues("probation")))
 }
