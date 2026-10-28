@@ -85,7 +85,7 @@ func kazDropRecords(t *testing.T, r kazChunkReplacer, inode Ino, cur []*slice, i
 			rest = append(rest, s)
 		}
 	}
-	require.Zero(t, r.doKazReplaceChunk(inode, 0, kazMarshal(cur), kazMarshal(rest), removed, nil, nil, 0))
+	require.Zero(t, r.doKazReplaceChunk(inode, 0, kazMarshal(cur), kazMarshal(rest), removed, nil, nil, 0, nil))
 	return rest
 }
 
@@ -236,7 +236,7 @@ func TestKazDeltaCompactionConcurrentCommit(t *testing.T) {
 					swapErr = st
 					return
 				}
-				if st := r.doKazReplaceChunk(inode, 0, kazMarshal(ss[:1]), marshalSlice(0, x, 16*kazEB, 0, 16*kazEB), ss[:1], []kazCreated{{Slice{Id: x, Size: 16 * kazEB, Len: 16 * kazEB}, 1}}, nil, 0); st != 0 {
+				if st := r.doKazReplaceChunk(inode, 0, kazMarshal(ss[:1]), marshalSlice(0, x, 16*kazEB, 0, 16*kazEB), ss[:1], []kazCreated{{Slice{Id: x, Size: 16 * kazEB, Len: 16 * kazEB}, 1}}, nil, 0, nil); st != 0 {
 					swapErr = st
 				}
 			}

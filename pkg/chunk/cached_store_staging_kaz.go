@@ -52,6 +52,13 @@ func (store *cachedStore) beginStagingUpload(key string) *pendingItem {
 	defer store.pendingMutex.Unlock()
 	item := store.pendingKeys[key]
 	if item != nil {
+		if item.kaz.state != kazStagingWait {
+			// Claimed or packed items are not uploaded individually.
+			item.uploading.Store(false)
+			return nil
+		}
+		item.kaz.putStarted = true
+		store.kazForgetUnuploaded(key)
 		if store.activeStaging == nil {
 			store.activeStaging = make(map[string]int)
 		}
@@ -72,6 +79,8 @@ func (store *cachedStore) beginImmediateStaging(key, path string, added time.Tim
 	if !item.uploading.CompareAndSwap(false, true) {
 		return nil
 	}
+	item.kaz.putStarted = true
+	store.kazForgetUnuploaded(key)
 	if store.activeStaging == nil {
 		store.activeStaging = make(map[string]int)
 	}
@@ -107,10 +116,15 @@ func (store *cachedStore) finishStagingUpload(key string, item *pendingItem, ble
 	}
 	store.bcache.uploaded(key, blen)
 	store.pendingMutex.Lock()
-	if store.pendingKeys[key] == item {
+	removed := store.pendingKeys[key] == item
+	if removed {
 		delete(store.pendingKeys, key)
 	}
 	store.pendingMutex.Unlock()
+	if removed {
+		// kaz: the uploaded slice can no longer be packed.
+		store.kazForgetStaged(key)
+	}
 	if err := store.bcache.removeStage(key); err != nil {
 		logger.Warnf("failed to remove stage %s after upload: %s", key, err)
 	}
@@ -135,10 +149,21 @@ func (store *cachedStore) Retire(id uint64, length int) error {
 	keys := kazSliceKeys(id, length, store)
 	var err error
 	busy := false
+	var marked, removed []string
+	first := true
 	cancel := func() {
 		store.pendingMutex.Lock()
 		defer store.pendingMutex.Unlock()
 		for _, key := range keys {
+			if first {
+				// kaz: remember keys whose PUT never started, so the later DELETE can be skipped.
+				if store.kazMarkUnuploaded(key) {
+					marked = append(marked, key)
+				}
+			}
+			if store.pendingKeys[key] != nil {
+				removed = append(removed, key)
+			}
 			delete(store.pendingKeys, key)
 			if store.activeStaging[key] > 0 || store.activeStageWrites[key] > 0 {
 				busy = true
@@ -146,14 +171,27 @@ func (store *cachedStore) Retire(id uint64, length int) error {
 		}
 	}
 	cancel()
+	first = false
+	// kaz: retired slices leave the staging pack index (outside pendingMutex).
+	for _, key := range removed {
+		store.kazForgetStaged(key)
+	}
+	removed = nil
 	for _, key := range keys {
 		err = errors.Join(err, store.retireCache(key))
 	}
 	// A scanner can register and start between initial cancellation and local unlink.
 	// Rechecking after unlink sees that I/O; later admission rejects the absent stage file.
 	cancel()
+	for _, key := range removed {
+		store.kazForgetStaged(key)
+	}
 	if busy {
 		err = errors.Join(err, ErrSliceUploadInFlight)
+	}
+	// kaz: keep the DELETE (safe side) unless every unlink succeeded and nothing is in flight.
+	if err != nil {
+		store.kazUnmarkUnuploaded(marked)
 	}
 	return err
 }

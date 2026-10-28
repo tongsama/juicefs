@@ -53,6 +53,8 @@ var kazGuardNonDefaultArgs = []string{
 	"--kaz-compaction-delta-trigger", "60",
 	"--kaz-compaction-delta-block-ratio", "0.7",
 	"--kaz-finish-canceled-get",
+	"--kaz-staging-pack",
+	"--kaz-skip-unuploaded-delete",
 	"--kaz-writeback-fsync=false",
 	"--kaz-slice-flush-wait", "7s",
 	"--kaz-slice-flush-idle", "2s",

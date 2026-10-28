@@ -78,6 +78,9 @@ func kazNormalizeWriterConf(conf *Config) {
 	if conf.SliceFlushIdle <= 0 {
 		conf.SliceFlushIdle = defaultSliceFlushIdle
 	}
+	if conf.KazStagingPack && conf.kazPack == nil {
+		conf.kazPack = &kazPackState{}
+	}
 }
 
 // freeze records why a writable slice stops growing; the caller holds the file lock.
@@ -161,6 +164,8 @@ func (c *chunkWriter) commitSlices(batch []*sliceWriter, mtime time.Time) (int, 
 	for _, s := range batch[:end] {
 		f.w.reader.Invalidate(f.inode, uint64(c.indx)*meta.ChunkSize+uint64(s.off), uint64(s.slen))
 	}
+	// Slices that are, or may be, in the chunk records can be packed (staging_pack_kaz.go).
+	f.w.kazRememberStaged(f.inode, c.indx, batch[:end])
 	return n, err, uncertain
 }
 

@@ -41,7 +41,7 @@ func TestKazReplaceChunkParity(t *testing.T) {
 			var c uint64
 			require.Zero(t, e.NewSlice(Background(), &c))
 			replaced := append(kazMarshal(ss[:1]), marshalSlice(0, c, 4096, 0, 4096)...)
-			require.Zero(t, r.doKazReplaceChunk(inode, 0, kazMarshal(ss[:3]), replaced, ss[1:3], []kazCreated{{Slice{Id: c, Size: 4096, Len: 4096}, 1}}, nil, 0))
+			require.Zero(t, r.doKazReplaceChunk(inode, 0, kazMarshal(ss[:3]), replaced, ss[1:3], []kazCreated{{Slice{Id: c, Size: 4096, Len: 4096}, 1}}, nil, 0, nil))
 			got := e.records(t, inode)
 			require.Equal(t, []uint64{a, c, tail}, kazIDs(got))
 
@@ -50,7 +50,7 @@ func TestKazReplaceChunkParity(t *testing.T) {
 			require.Equal(t, map[uint64]int{b1: 1, b2: 1}, e.deletedIDs())
 
 			// The created slice holds exactly one reference: dropping its record frees it.
-			require.Zero(t, r.doKazReplaceChunk(inode, 0, kazMarshal(got), append(kazMarshal(got[:1]), kazMarshal(got[2:])...), got[1:2], nil, nil, 0))
+			require.Zero(t, r.doKazReplaceChunk(inode, 0, kazMarshal(got), append(kazMarshal(got[:1]), kazMarshal(got[2:])...), got[1:2], nil, nil, 0, nil))
 			require.Equal(t, []uint64{a, tail}, kazIDs(e.records(t, inode)))
 			require.NoError(t, e.en.doCleanupSlices(Background(), nil))
 			require.Equal(t, map[uint64]int{b1: 1, b2: 1, c: 1}, e.deletedIDs())
@@ -73,7 +73,7 @@ func TestKazReplaceChunkChanged(t *testing.T) {
 			stale[4] ^= 0xff // a different slice id in the first record
 			var c uint64
 			require.Zero(t, e.NewSlice(Background(), &c))
-			st := r.doKazReplaceChunk(inode, 0, stale, marshalSlice(0, c, 150, 0, 150), ss, []kazCreated{{Slice{Id: c, Size: 150, Len: 150}, 1}}, nil, 0)
+			st := r.doKazReplaceChunk(inode, 0, stale, marshalSlice(0, c, 150, 0, 150), ss, []kazCreated{{Slice{Id: c, Size: 150, Len: 150}, 1}}, nil, 0, nil)
 			require.Equal(t, syscall.EINVAL, st)
 			require.Equal(t, kazIDs(ss), kazIDs(e.records(t, inode)))
 			require.NoError(t, e.en.doCleanupSlices(Background(), nil))
@@ -98,7 +98,7 @@ func TestKazReplaceChunkDelayed(t *testing.T) {
 			for _, s := range ss {
 				delayed = append(delayed, e.encodeDelayedSlice(s.id, s.size)...)
 			}
-			require.Zero(t, r.doKazReplaceChunk(inode, 0, kazMarshal(ss), marshalSlice(0, c, 150, 0, 150), ss, []kazCreated{{Slice{Id: c, Size: 150, Len: 150}, 1}}, delayed, c))
+			require.Zero(t, r.doKazReplaceChunk(inode, 0, kazMarshal(ss), marshalSlice(0, c, 150, 0, 150), ss, []kazCreated{{Slice{Id: c, Size: 150, Len: 150}, 1}}, delayed, c, nil))
 			require.NoError(t, e.en.doCleanupSlices(Background(), nil))
 			require.Empty(t, e.deletedIDs())
 			_, err := e.en.doCleanupDelayedSlices(Background(), time.Now().Add(time.Hour).Unix())
@@ -126,7 +126,7 @@ func kazSharedSetup(t *testing.T, backend string, refs int) (*kazBlockEnv, kazCh
 	replaced := append(kazMarshal(ss[:1]), marshalSlice(100, c, 150, 0, 50)...)
 	replaced = append(replaced, marshalSlice(3000, c, 150, 50, 50)...)
 	replaced = append(replaced, marshalSlice(6000, c, 150, 100, 50)...)
-	st := r.doKazReplaceChunk(inode, 0, kazMarshal(ss), replaced, ss[1:], []kazCreated{{Slice{Id: c, Size: 150, Len: 150}, refs}}, nil, 0)
+	st := r.doKazReplaceChunk(inode, 0, kazMarshal(ss), replaced, ss[1:], []kazCreated{{Slice{Id: c, Size: 150, Len: 150}, refs}}, nil, 0, nil)
 	require.Zero(t, st)
 	return e, r, inode, c, e.records(t, inode)
 }
@@ -134,7 +134,7 @@ func kazSharedSetup(t *testing.T, backend string, refs int) (*kazBlockEnv, kazCh
 // dropRecord removes record i of the chunk through the replacer, as a later compaction would.
 func kazDropRecord(t *testing.T, r kazChunkReplacer, inode Ino, cur []*slice, i int, delayed []byte, delayedKey uint64) []*slice {
 	rest := append(append([]*slice{}, cur[:i]...), cur[i+1:]...)
-	require.Zero(t, r.doKazReplaceChunk(inode, 0, kazMarshal(cur), kazMarshal(rest), cur[i:i+1], nil, delayed, delayedKey))
+	require.Zero(t, r.doKazReplaceChunk(inode, 0, kazMarshal(cur), kazMarshal(rest), cur[i:i+1], nil, delayed, delayedKey, nil))
 	return rest
 }
 
@@ -177,7 +177,7 @@ func TestKazReplaceChunkSharedRefsChanged(t *testing.T) {
 			require.Zero(t, e.NewSlice(Background(), &c))
 			replaced := append(marshalSlice(0, c, 150, 0, 50), marshalSlice(60, c, 150, 50, 50)...)
 			replaced = append(replaced, marshalSlice(120, c, 150, 100, 50)...)
-			st := r.doKazReplaceChunk(inode, 0, stale, replaced, ss, []kazCreated{{Slice{Id: c, Size: 150, Len: 150}, 3}}, nil, 0)
+			st := r.doKazReplaceChunk(inode, 0, stale, replaced, ss, []kazCreated{{Slice{Id: c, Size: 150, Len: 150}, 3}}, nil, 0, nil)
 			require.Equal(t, syscall.EINVAL, st)
 			require.Equal(t, kazIDs(ss), kazIDs(e.records(t, inode)))
 			require.NoError(t, e.en.doCleanupSlices(Background(), nil))

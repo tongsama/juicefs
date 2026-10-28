@@ -33,7 +33,11 @@ type kazChunkReplacer interface {
 	// when they still match, creates a reference for each created slice and either
 	// records delayed (trash, keyed by delayedKey) or drops one reference of each
 	// removed record. It returns EINVAL when the chunk no longer starts with origin.
-	doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []kazCreated, delayed []byte, delayedKey uint64) syscall.Errno
+	// On success, and only when delayed is nil (trash off), onDead (if not nil) is
+	// called for each removed slice that lost its last reference, right after the
+	// engine queues that slice's deletion; a slice still referenced elsewhere
+	// (clone, copy_file_range, or another record) is not reported.
+	doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []kazCreated, delayed []byte, delayedKey uint64, onDead func(id uint64, size uint32)) syscall.Errno
 }
 
 // kazCreated is a slice made by a compaction together with the number of
@@ -160,7 +164,7 @@ func (m *baseMeta) runKazBlockCompaction(r kazChunkReplacer, inode Ino, indx uin
 			time.Sleep(time.Millisecond * 10)
 			m.Lock()
 		}
-	} else if len(m.compacting) > 10 || m.compacting[k] {
+	} else if len(m.compacting)-m.kazPacking > 10 || m.compacting[k] {
 		m.Unlock()
 		return false
 	}
@@ -329,7 +333,7 @@ func (m *baseMeta) runKazBlockCompaction(r kazChunkReplacer, inode Ino, indx uin
 		firstID = created[0].Id
 	}
 	phaseStart = time.Now()
-	st = r.doKazReplaceChunk(inode, indx, origin, replaced, plan.removed, created, delayed, delayedKey)
+	st = r.doKazReplaceChunk(inode, indx, origin, replaced, plan.removed, created, delayed, delayedKey, nil)
 	metadataTime = time.Since(phaseStart)
 	logger.Debugf("compaction inode=%d chunk=%d slice=%d phase=done errno=%s", inode, indx, firstID, st)
 	mode, event := "partial", "partial"

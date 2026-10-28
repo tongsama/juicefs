@@ -26,7 +26,7 @@ import (
 )
 
 // doKazReplaceChunk follows redisMeta.doCompactChunk with a list of new records.
-func (m *redisMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []kazCreated, delayed []byte, delayedKey uint64) syscall.Errno {
+func (m *redisMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced []byte, removed []*slice, created []kazCreated, delayed []byte, delayedKey uint64, onDead func(id uint64, size uint32)) syscall.Errno {
 	var rs []*redis.IntCmd // trash disabled: check reference of slices
 	if delayed == nil {
 		rs = make([]*redis.IntCmd, len(removed))
@@ -91,6 +91,10 @@ func (m *redisMeta) doKazReplaceChunk(inode Ino, indx uint32, origin, replaced [
 			for i, s := range removed {
 				if s.id > 0 && rs[i].Err() == nil && rs[i].Val() < 0 {
 					m.enqueueCompactionDelete(s.id, s.size)
+					// kaz: tell the caller which slices lost their last reference
+					if onDead != nil {
+						onDead(s.id, s.size)
+					}
 				}
 			}
 		}
